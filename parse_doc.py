@@ -35,6 +35,50 @@ if POST_TABLE_DIR.exists():
 from post_table.fix_ocr_table import fix_markdown_file  # noqa: E402
 
 
+def apply_post_table_correction(doc_output_dir: Path) -> tuple[int, int]:
+    """
+    对单个文档输出目录中的 Markdown 文件执行表格 OCR 后处理。
+
+    MinerU 不同 backend 的输出目录结构不同：
+      - pipeline: doc_output_dir/auto/
+      - vlm-*: doc_output_dir/vlm_*/
+      - hybrid-*: doc_output_dir/hybrid_*/
+      - office: doc_output_dir/office/
+
+    返回：
+        (fixed_count, skip_count)
+    """
+    if not doc_output_dir.is_dir():
+        print(f"  ⏭️  跳过（输出目录不存在）: {doc_output_dir}")
+        return 0, 1
+
+    output_subdirs = [
+        subdir
+        for subdir in sorted(doc_output_dir.iterdir())
+        if subdir.is_dir() and subdir.name != ".ipynb_checkpoints"
+    ]
+
+    if not output_subdirs:
+        print(f"  ⏭️  跳过（没有输出子目录）: {doc_output_dir}")
+        return 0, 1
+
+    fixed_count = 0
+    skip_count = 0
+    for output_subdir in output_subdirs:
+        md_files = sorted(output_subdir.rglob("*.md"))
+        if not md_files:
+            print(f"  ⏭️  跳过（markdown 不存在）: {output_subdir}")
+            skip_count += 1
+            continue
+
+        for md_path in md_files:
+            fix_markdown_file(str(md_path))  # output_path=None -> 覆盖原文件
+            print(f"  ✅ 已修正: {md_path.name}  ({md_path.parent.name})")
+            fixed_count += 1
+
+    return fixed_count, skip_count
+
+
 def main():
     # 模型下载源设为 modelscope（国内镜像）
     os.environ.setdefault("MINERU_MODEL_SOURCE", "modelscope")
@@ -170,14 +214,11 @@ def main():
         fixed_count = 0
         skip_count = 0
         for pdf_name in pdf_file_names:
-            md_path = Path(output_dir) / pdf_name / "auto" / f"{pdf_name}.md"
-            if md_path.exists():
-                fix_markdown_file(str(md_path))  # output_path=None → 覆盖原文件
-                print(f"  ✅ 已修正: {md_path.name}  ({md_path.parent.parent.name})")
-                fixed_count += 1
-            else:
-                print(f"  ⏭️  跳过（markdown 不存在）: {md_path}")
-                skip_count += 1
+            doc_fixed_count, doc_skip_count = apply_post_table_correction(
+                Path(output_dir) / pdf_name
+            )
+            fixed_count += doc_fixed_count
+            skip_count += doc_skip_count
         print(f"后处理完成：修正 {fixed_count} 个文件，跳过 {skip_count} 个文件")
     except Exception as e:
         print(f"解析失败: {e}")
