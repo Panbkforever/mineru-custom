@@ -1,0 +1,55 @@
+# Python cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.pytest_cache/
+
+# AutoDL / local hidden files
+.Trash-0/
+.autodl/
+.DS_Store
+
+# nested git backup
+MinerU/.git.backup_autodl/
+
+# virtual environments
+.venv/
+venv/
+env/
+MinerU/.venv/
+
+# data / runtime outputs
+data/
+dataset/
+datasets/
+checkpoints/
+weights/
+models/
+runs/
+outputs/
+logs/
+work_dirs/
+mineru_output/
+pdfs/
+
+# large model / binary artifacts
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+*.bin
+*.so
+
+# env files
+.env
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+*.bin
+*.so
+
+# env files
+.env
