@@ -123,8 +123,12 @@ def main():
         help="禁用表格解析"
     )
     parser.add_argument(
-        "--no-images", action="store_true",  # 默认提取图片
-        help="不输出图片"
+        "--image-analysis", action="store_true",
+        help="启用 VLM 图片/图表内容分析（默认关闭，避免输出原文没有的 details 内容）"
+    )
+    parser.add_argument(
+        "--no-images", action="store_true",
+        help="兼容旧参数：禁用 VLM 图片/图表内容分析"
     )
 
     args = parser.parse_args()  # 解析参数
@@ -198,7 +202,7 @@ def main():
             f_dump_content_list=True,           # 是否输出内容列表 JSON
             start_page_id=args.start_page,      # 起始页码
             end_page_id=args.end_page,          # 结束页码
-            image_analysis=not args.no_images,  # 是否提取并分析图片
+            image_analysis=args.image_analysis and not args.no_images,  # 是否分析图片/图表内容
         )
         print("-" * 50)
         print(f"解析完成！结果已保存至: {output_dir}")
