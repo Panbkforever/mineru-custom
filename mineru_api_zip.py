@@ -77,6 +77,12 @@ OUTPUT_DIR = Path("/root/autodl-tmp/mineru_output")
 #   - "hybrid-auto-engine": 混合模式（VLM + Pipeline），公式识别用 VLM，其他用 Pipeline
 #   - "hybrid-vllm-engine": 混合模式 + vLLM 后端
 MINERU_BACKEND = os.environ.get("MINERU_BACKEND", "pipeline")
+IMAGE_ANALYSIS = os.environ.get("MINERU_IMAGE_ANALYSIS", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 # 等待 MinerU 产出的最大秒数
 MAX_WAIT_SECONDS = 1800   # 30 分钟
@@ -196,7 +202,7 @@ def run_mineru_pdf(pdf_path: Path) -> Path:
         f_dump_content_list=True,
         start_page_id=0,
         end_page_id=None,
-        image_analysis=True,
+        image_analysis=IMAGE_ANALYSIS,
     )
 
     target_outdir = OUTPUT_DIR / safe_stem
@@ -286,6 +292,7 @@ def index():
         "method": "POST",
         "config": {
             "backend": MINERU_BACKEND,
+            "image_analysis": IMAGE_ANALYSIS,
             "available_backends": [
                 "pipeline (传统 OCR + 布局检测，速度快)",
                 "vlm-auto-engine (VLM 自动选择，精度高)",
@@ -398,7 +405,7 @@ def run_mineru_image(image_path: Path) -> Path:
         f_dump_content_list=True,
         start_page_id=0,
         end_page_id=None,
-        image_analysis=True,
+        image_analysis=IMAGE_ANALYSIS,
     )
 
     target_outdir = OUTPUT_DIR / safe_stem
