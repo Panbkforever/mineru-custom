@@ -7,12 +7,15 @@ or used from the command line to test the effect on a middle-json file.
 
 Core idea:
 1. Explicit header/footer/page-number/discarded blocks are moved to discarded_blocks.
-2. Repeated short text in the top or bottom page band is treated as running
+2. If a PDF path is provided, thick horizontal rules are detected on each page.
+   Text above the upper rule and below the lower rule is treated as page
+   header/footer material.
+3. Repeated short text in the top or bottom page band is treated as running
    header/footer and moved to discarded_blocks.
-3. Page-number-like text near the page bottom is moved to discarded_blocks.
-4. First-page bottom legal notices, such as TI datasheet trademark/copyright
+4. Page-number-like text near the page bottom is moved to discarded_blocks.
+5. First-page bottom legal notices, such as TI datasheet trademark/copyright
    notices, are treated as cover-page footer material and removed.
-5. Large visual blocks, tables, images, equations, captions and footnotes are
+6. Large visual blocks, tables, images, equations, captions and footnotes are
    left untouched by default.
 """
 
@@ -103,6 +106,17 @@ FIRST_PAGE_NOTICE_KEYWORDS = {
 
 @dataclass
 class FilterConfig:
+    enable_line_boundary_filter: bool = True
+    line_render_scale: float = 2.0
+    line_dark_threshold: int = 80
+    line_min_width_ratio: float = 0.55
+    line_min_row_dark_ratio: float = 0.35
+    line_min_thickness_px: int = 2
+    line_max_thickness_px: int = 18
+    line_top_search_ratio: float = 0.30
+    line_bottom_search_start_ratio: float = 0.55
+    line_bottom_search_end_ratio: float = 0.96
+    line_padding_ratio: float = 0.003
     top_ratio: float = 0.075
     bottom_ratio: float = 0.075
     min_repeat_pages: int = 2
@@ -116,14 +130,23 @@ class FilterConfig:
     mark_reason_field: str = "_header_footer_filter_reason"
 
 
+@dataclass
+class LineBoundary:
+    top_y: float | None = None
+    bottom_y: float | None = None
+
+
 def filter_headers_and_footers(
     pdf_info_list: list[dict[str, Any]],
+    pdf_path: str | Path | None = None,
     config: FilterConfig | None = None,
 ) -> dict[str, int]:
     """Move likely headers/footers/page numbers into each page's discarded_blocks.
 
     Args:
         pdf_info_list: MinerU middle-json page list. The function mutates it.
+        pdf_path: Optional source PDF path. When available, the filter first
+            detects thick horizontal rules and uses them as content boundaries.
         config: Filtering thresholds.
 
     Returns:
@@ -133,6 +156,7 @@ def filter_headers_and_footers(
     cfg = config or FilterConfig()
     repeated_texts = _find_repeated_margin_texts(pdf_info_list, cfg)
     first_page_notice_pages = _find_first_page_bottom_notice_pages(pdf_info_list, cfg)
+    line_boundaries = detect_line_boundaries(pdf_info_list, pdf_path, cfg)
     stats = Counter()
 
     for page_index, page_info in enumerate(pdf_info_list):
@@ -151,6 +175,7 @@ def filter_headers_and_footers(
                     page_index=page_index,
                     repeated_texts=repeated_texts,
                     first_page_notice_pages=first_page_notice_pages,
+                    line_boundary=line_boundaries.get(page_index),
                     cfg=cfg,
                 )
                 if should_discard:
@@ -164,6 +189,159 @@ def filter_headers_and_footers(
 
     stats["total_removed"] = sum(value for key, value in stats.items() if key != "total_removed")
     return dict(stats)
+
+
+def detect_line_boundaries(
+    pdf_info_list: list[dict[str, Any]],
+    pdf_path: str | Path | None,
+    cfg: FilterConfig | None = None,
+) -> dict[int, LineBoundary]:
+    """Detect thick horizontal rules that bound the real content area.
+
+    Datasheets often use a bold rule below the page header and another bold
+    rule above the page footer. The text outside those two rules should be
+    excluded from Markdown even when the layout model labels it as normal text.
+
+    This function is deliberately optional. If the PDF cannot be rendered or no
+    reliable rules are found, it returns an empty mapping and the caller falls
+    back to text/repetition based filtering.
+    """
+    cfg = cfg or FilterConfig()
+    if not cfg.enable_line_boundary_filter or not pdf_path:
+        return {}
+
+    pdf_path = Path(pdf_path)
+    if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
+        return {}
+
+    try:
+        import numpy as np
+        import pypdfium2 as pdfium
+    except Exception:
+        return {}
+
+    boundaries: dict[int, LineBoundary] = {}
+    try:
+        pdf = pdfium.PdfDocument(str(pdf_path))
+    except Exception:
+        return {}
+
+    page_count = min(len(pdf), len(pdf_info_list))
+    for page_index in range(page_count):
+        page_width, page_height = _page_size(pdf_info_list[page_index])
+        if page_width <= 0 or page_height <= 0:
+            continue
+
+        try:
+            page = pdf[page_index]
+            bitmap = page.render(scale=cfg.line_render_scale)
+            pil_image = bitmap.to_pil().convert("L")
+            gray = np.asarray(pil_image)
+        except Exception:
+            continue
+
+        image_height, image_width = gray.shape[:2]
+        top_rule_px = _detect_horizontal_rule_y(
+            gray=gray,
+            search_start_px=0,
+            search_end_px=int(image_height * cfg.line_top_search_ratio),
+            cfg=cfg,
+        )
+        bottom_rule_px = _detect_horizontal_rule_y(
+            gray=gray,
+            search_start_px=int(image_height * cfg.line_bottom_search_start_ratio),
+            search_end_px=int(image_height * cfg.line_bottom_search_end_ratio),
+            cfg=cfg,
+        )
+
+        top_rule_y = _pixel_y_to_page_y(top_rule_px, image_height, page_height)
+        bottom_rule_y = _pixel_y_to_page_y(bottom_rule_px, image_height, page_height)
+        if top_rule_y is None and bottom_rule_y is None:
+            continue
+        if top_rule_y is not None and bottom_rule_y is not None and top_rule_y >= bottom_rule_y:
+            continue
+
+        boundaries[page_index] = LineBoundary(top_y=top_rule_y, bottom_y=bottom_rule_y)
+
+    return boundaries
+
+
+def _detect_horizontal_rule_y(
+    gray: Any,
+    search_start_px: int,
+    search_end_px: int,
+    cfg: FilterConfig,
+) -> int | None:
+    image_height, image_width = gray.shape[:2]
+    search_start_px = max(0, min(search_start_px, image_height))
+    search_end_px = max(search_start_px, min(search_end_px, image_height))
+    if search_end_px <= search_start_px:
+        return None
+
+    candidate_rows = []
+    min_run_width = int(image_width * cfg.line_min_width_ratio)
+    for row_y in range(search_start_px, search_end_px):
+        dark_row = gray[row_y] <= cfg.line_dark_threshold
+        dark_ratio = float(dark_row.mean())
+        if dark_ratio < cfg.line_min_row_dark_ratio:
+            continue
+        if _longest_true_run(dark_row) >= min_run_width:
+            candidate_rows.append(row_y)
+
+    if not candidate_rows:
+        return None
+
+    bands = _merge_consecutive_rows(candidate_rows)
+    valid_bands = [
+        band
+        for band in bands
+        if cfg.line_min_thickness_px <= (band[1] - band[0] + 1) <= cfg.line_max_thickness_px
+    ]
+    if not valid_bands:
+        return None
+
+    # Prefer the strongest-looking rule: the longest/thickest band. This avoids
+    # choosing short glyph strokes that happen to be dark and horizontal.
+    best_band = max(valid_bands, key=lambda band: (band[1] - band[0] + 1, band[1]))
+    return int((best_band[0] + best_band[1]) / 2)
+
+
+def _longest_true_run(values: Any) -> int:
+    longest = 0
+    current = 0
+    for value in values:
+        if bool(value):
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
+
+
+def _merge_consecutive_rows(rows: list[int]) -> list[tuple[int, int]]:
+    if not rows:
+        return []
+
+    bands = []
+    start = previous = rows[0]
+    for row in rows[1:]:
+        if row == previous + 1:
+            previous = row
+            continue
+        bands.append((start, previous))
+        start = previous = row
+    bands.append((start, previous))
+    return bands
+
+
+def _pixel_y_to_page_y(
+    pixel_y: int | None,
+    image_height: int,
+    page_height: float,
+) -> float | None:
+    if pixel_y is None or image_height <= 0:
+        return None
+    return float(pixel_y) / float(image_height) * page_height
 
 
 def _find_repeated_margin_texts(
@@ -258,17 +436,12 @@ def _should_discard_block(
     page_index: int,
     repeated_texts: set[str],
     first_page_notice_pages: set[int],
+    line_boundary: LineBoundary | None,
     cfg: FilterConfig,
 ) -> tuple[bool, str]:
     block_type = str(block.get("type") or block.get("block_type") or "").lower()
     if block_type in EXPLICIT_DISCARD_TYPES:
         return True, f"explicit_type:{block_type}"
-
-    if block_type in PROTECTED_TYPES:
-        return False, ""
-
-    if block_type not in TEXT_LIKE_TYPES:
-        return False, ""
 
     page_width, page_height = _page_size(page_info)
     if page_width <= 0 or page_height <= 0:
@@ -276,6 +449,19 @@ def _should_discard_block(
 
     bbox = _block_bbox(block)
     if not bbox:
+        return False, ""
+
+    # A detected horizontal-rule boundary is a stronger signal than block type.
+    # It removes the whole visual/text region outside the content frame, including
+    # small header icons or footer marks that should not appear in Markdown.
+    line_reason = _line_boundary_discard_reason(bbox, page_width, page_height, line_boundary, cfg)
+    if line_reason:
+        return True, line_reason
+
+    if block_type in PROTECTED_TYPES:
+        return False, ""
+
+    if block_type not in TEXT_LIKE_TYPES:
         return False, ""
 
     text = _normalize_text(_block_text(block))
@@ -306,6 +492,27 @@ def _should_discard_block(
         return True, f"aggressive_{band}_margin"
 
     return False, ""
+
+
+def _line_boundary_discard_reason(
+    bbox: list[float],
+    page_width: float,
+    page_height: float,
+    line_boundary: LineBoundary | None,
+    cfg: FilterConfig,
+) -> str:
+    if line_boundary is None:
+        return ""
+
+    _x0, y0, _x1, y1 = _bbox_to_page_units(bbox, page_width, page_height)
+    center_y = (y0 + y1) / 2.0
+    padding = page_height * cfg.line_padding_ratio
+
+    if line_boundary.top_y is not None and center_y < line_boundary.top_y - padding:
+        return "above_top_horizontal_rule"
+    if line_boundary.bottom_y is not None and center_y > line_boundary.bottom_y + padding:
+        return "below_bottom_horizontal_rule"
+    return ""
 
 
 def _page_size(page_info: dict[str, Any]) -> tuple[float, float]:
@@ -466,6 +673,16 @@ def main() -> int:
     parser.add_argument("--bottom-ratio", type=float, default=FilterConfig.bottom_ratio)
     parser.add_argument("--min-repeat-pages", type=int, default=FilterConfig.min_repeat_pages)
     parser.add_argument(
+        "--pdf",
+        type=Path,
+        help="Optional source PDF path. Enables thick horizontal-rule boundary filtering.",
+    )
+    parser.add_argument(
+        "--no-line-boundary-filter",
+        action="store_true",
+        help="Disable PDF-rendered horizontal-rule boundary detection.",
+    )
+    parser.add_argument(
         "--aggressive-margin-drop",
         action="store_true",
         help="Also drop small text blocks in page margins even if they are not repeated.",
@@ -481,10 +698,12 @@ def main() -> int:
 
     stats = filter_headers_and_footers(
         pdf_info_list,
-        FilterConfig(
+        pdf_path=args.pdf,
+        config=FilterConfig(
             top_ratio=args.top_ratio,
             bottom_ratio=args.bottom_ratio,
             min_repeat_pages=args.min_repeat_pages,
+            enable_line_boundary_filter=not args.no_line_boundary_filter,
             aggressive_margin_drop=args.aggressive_margin_drop,
         ),
     )

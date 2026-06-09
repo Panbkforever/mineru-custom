@@ -75,9 +75,17 @@ def _guess_union_make(output_subdir: Path):
     return None
 
 
-def apply_header_footer_filter(doc_output_dir: Path) -> tuple[int, int]:
+def apply_header_footer_filter(
+    doc_output_dir: Path,
+    source_pdf_path: Path | None = None,
+) -> tuple[int, int]:
     """
     对单个文档输出目录执行页眉页脚过滤，并重建 Markdown。
+
+    如果传入 source_pdf_path，会优先渲染 PDF 检测上下粗横线：
+      - 上方粗横线以上视为页眉区
+      - 下方粗横线以下视为页脚区
+    检测不到横线时自动回退到重复文本/页码/首页声明规则。
 
     返回：
         (filtered_md_count, skip_count)
@@ -114,7 +122,10 @@ def apply_header_footer_filter(doc_output_dir: Path) -> tuple[int, int]:
             try:
                 middle_json = json.loads(middle_path.read_text(encoding="utf-8"))
                 pdf_info = HEADER_FOOTER_FILTER.load_pdf_info_list(middle_json)
-                stats = HEADER_FOOTER_FILTER.filter_headers_and_footers(pdf_info)
+                stats = HEADER_FOOTER_FILTER.filter_headers_and_footers(
+                    pdf_info,
+                    pdf_path=source_pdf_path,
+                )
 
                 md_path = output_subdir / f"{middle_path.name[:-len('_middle.json')]}.md"
                 image_dir = "images"
@@ -278,6 +289,7 @@ def main():
     pdf_file_names = []   # 文件名列表（不含后缀），用于输出目录命名
     pdf_bytes_list = []   # 文件二进制内容列表
     p_lang_list = []      # 文档语言列表
+    source_files = []     # 实际读取成功的源文件，用于后处理阶段定位原始 PDF
 
     for f in files:
         try:
@@ -285,6 +297,7 @@ def main():
             pdf_file_names.append(f.stem)  # f.stem = 去掉后缀的文件名
             pdf_bytes_list.append(pdf_bytes)
             p_lang_list.append(args.lang)  # 每份文档都用相同语言
+            source_files.append(f)
         except Exception as e:
             print(f"  读取失败 {f.name}: {e}")
             continue
@@ -328,9 +341,11 @@ def main():
         print("页眉页脚过滤...")
         header_footer_count = 0
         header_footer_skip_count = 0
-        for pdf_name in pdf_file_names:
+        for pdf_name, source_file in zip(pdf_file_names, source_files):
+            source_pdf_path = source_file if source_file.suffix.lower() == ".pdf" else None
             doc_filtered_count, doc_skip_count = apply_header_footer_filter(
-                Path(output_dir) / pdf_name
+                Path(output_dir) / pdf_name,
+                source_pdf_path=source_pdf_path,
             )
             header_footer_count += doc_filtered_count
             header_footer_skip_count += doc_skip_count

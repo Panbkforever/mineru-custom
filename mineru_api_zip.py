@@ -207,13 +207,14 @@ def guess_union_make(output_subdir: Path):
     return None
 
 
-def apply_header_footer_filter(output_dir: Path):
+def apply_header_footer_filter(output_dir: Path, source_pdf_path: Path | None = None):
     """
     基于 middle_json 过滤页眉页脚，并重建最终 Markdown。
 
     注意：
       1. 必须放在 post_table 表格 OCR 后处理之前，否则重建 Markdown 会覆盖表格修正。
       2. content_list 暂时保留 MinerU 原始输出，方便排查结构化识别结果。
+      3. 如果传入 source_pdf_path，会优先检测 PDF 页面上下粗横线作为正文边界。
     """
     if HEADER_FOOTER_FILTER is None:
         logging.warning("Header/footer filter unavailable, skipping")
@@ -238,7 +239,10 @@ def apply_header_footer_filter(output_dir: Path):
             try:
                 middle_json = json.loads(middle_path.read_text(encoding="utf-8"))
                 pdf_info = HEADER_FOOTER_FILTER.load_pdf_info_list(middle_json)
-                stats = HEADER_FOOTER_FILTER.filter_headers_and_footers(pdf_info)
+                stats = HEADER_FOOTER_FILTER.filter_headers_and_footers(
+                    pdf_info,
+                    pdf_path=source_pdf_path,
+                )
 
                 md_path = output_subdir / f"{middle_path.name[:-len('_middle.json')]}.md"
                 md_content = make_func(pdf_info, MakeMode.MM_MD, "images")
@@ -319,7 +323,7 @@ def run_mineru_pdf(pdf_path: Path) -> Path:
     wait_for_output(target_outdir)
 
     # 先重建去掉页眉页脚的 Markdown，再做表格 OCR 修正。
-    apply_header_footer_filter(target_outdir)
+    apply_header_footer_filter(target_outdir, source_pdf_path=pdf_path)
 
     # 应用 post_table 后处理修正
     apply_post_table_correction(target_outdir)
