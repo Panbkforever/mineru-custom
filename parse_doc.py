@@ -12,6 +12,8 @@ MinerU 文档解析脚本
 """
 
 import argparse  # 命令行参数解析
+import importlib.util  # 动态加载 modify 下的独立过滤脚本
+import json       # 读写 middle_json
 import os        # 环境变量设置
 import sys       # sys.path / sys.exit
 from pathlib import Path  # 路径操作
@@ -22,6 +24,116 @@ if MINERU_HOME.exists():
     sys.path.insert(0, str(MINERU_HOME))
 
 from mineru.cli.common import do_parse, read_fn  # do_parse: 主解析函数, read_fn: 文件读取
+from mineru.utils.enum_class import MakeMode  # Markdown 重建模式
+from mineru.backend.pipeline.pipeline_middle_json_mkcontent import union_make as pipeline_union_make
+from mineru.backend.vlm.vlm_middle_json_mkcontent import union_make as vlm_union_make
+from mineru.backend.office.office_middle_json_mkcontent import union_make as office_union_make
+
+# =====================================================================
+# [新增] 页眉页脚过滤模块
+# 功能：MinerU 的版面分类有时只有 abandon/discarded，或把页眉页脚误判为正文。
+#       这里在解析完成后读取 middle_json，把明确类型或重复出现在页边的
+#       页眉、页脚、页码移动到 discarded_blocks，再重建最终 Markdown。
+# 注意：该过滤只重建 .md；content_list 保持 MinerU 原始输出，便于排查和追溯。
+# =====================================================================
+HEADER_FOOTER_FILTER_PATH = Path("/root/autodl-tmp/modify/Filter_ headers_and_footers.py")
+if not HEADER_FOOTER_FILTER_PATH.exists():
+    HEADER_FOOTER_FILTER_PATH = Path(__file__).resolve().parent / "modify/Filter_ headers_and_footers.py"
+
+
+def _load_header_footer_filter():
+    if not HEADER_FOOTER_FILTER_PATH.exists():
+        print(f"  ⏭️  跳过页眉页脚过滤（脚本不存在）: {HEADER_FOOTER_FILTER_PATH}")
+        return None
+
+    spec = importlib.util.spec_from_file_location(
+        "header_footer_filter",
+        HEADER_FOOTER_FILTER_PATH,
+    )
+    if spec is None or spec.loader is None:
+        print(f"  ⏭️  跳过页眉页脚过滤（脚本无法加载）: {HEADER_FOOTER_FILTER_PATH}")
+        return None
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+HEADER_FOOTER_FILTER = _load_header_footer_filter()
+
+
+def _guess_union_make(output_subdir: Path):
+    """根据 MinerU 输出子目录判断应该用哪套 Markdown 生成逻辑。"""
+    name = output_subdir.name
+    if name in {"auto", "ocr", "txt"}:
+        return pipeline_union_make
+    if name.startswith("vlm") or name.startswith("hybrid"):
+        return vlm_union_make
+    if name == "office":
+        return office_union_make
+    return None
+
+
+def apply_header_footer_filter(doc_output_dir: Path) -> tuple[int, int]:
+    """
+    对单个文档输出目录执行页眉页脚过滤，并重建 Markdown。
+
+    返回：
+        (filtered_md_count, skip_count)
+    """
+    if HEADER_FOOTER_FILTER is None:
+        return 0, 1
+
+    if not doc_output_dir.is_dir():
+        print(f"  ⏭️  跳过页眉页脚过滤（输出目录不存在）: {doc_output_dir}")
+        return 0, 1
+
+    filtered_count = 0
+    skip_count = 0
+    output_subdirs = [
+        subdir
+        for subdir in sorted(doc_output_dir.iterdir())
+        if subdir.is_dir() and subdir.name != ".ipynb_checkpoints"
+    ]
+
+    for output_subdir in output_subdirs:
+        make_func = _guess_union_make(output_subdir)
+        if make_func is None:
+            print(f"  ⏭️  跳过页眉页脚过滤（未知输出模式）: {output_subdir}")
+            skip_count += 1
+            continue
+
+        middle_files = sorted(output_subdir.glob("*_middle.json"))
+        if not middle_files:
+            print(f"  ⏭️  跳过页眉页脚过滤（middle_json 不存在）: {output_subdir}")
+            skip_count += 1
+            continue
+
+        for middle_path in middle_files:
+            try:
+                middle_json = json.loads(middle_path.read_text(encoding="utf-8"))
+                pdf_info = HEADER_FOOTER_FILTER.load_pdf_info_list(middle_json)
+                stats = HEADER_FOOTER_FILTER.filter_headers_and_footers(pdf_info)
+
+                md_path = output_subdir / f"{middle_path.name[:-len('_middle.json')]}.md"
+                image_dir = "images"
+                md_content = make_func(pdf_info, MakeMode.MM_MD, image_dir)
+
+                middle_path.write_text(
+                    json.dumps(middle_json, ensure_ascii=False, indent=4),
+                    encoding="utf-8",
+                )
+                md_path.write_text(md_content or "", encoding="utf-8")
+
+                removed = stats.get("total_removed", 0)
+                print(f"  ✅ 页眉页脚过滤: {md_path.name}  ({output_subdir.name}, 移除 {removed} 个 block)")
+                filtered_count += 1
+            except Exception as e:
+                print(f"  ⚠️  页眉页脚过滤失败: {middle_path} -> {e}")
+                skip_count += 1
+
+    return filtered_count, skip_count
 
 # =====================================================================
 # [新增] 表格 OCR 后处理模块
@@ -206,6 +318,23 @@ def main():
         )
         print("-" * 50)
         print(f"解析完成！结果已保存至: {output_dir}")
+
+        # =====================================================================
+        # [新增] 页眉页脚过滤
+        # 先基于 middle_json 移除页边重复文本/页码，再重建最终 Markdown。
+        # 必须放在表格 OCR 后处理之前，否则重建 Markdown 会覆盖表格修正结果。
+        # =====================================================================
+        print("\n" + "=" * 50)
+        print("页眉页脚过滤...")
+        header_footer_count = 0
+        header_footer_skip_count = 0
+        for pdf_name in pdf_file_names:
+            doc_filtered_count, doc_skip_count = apply_header_footer_filter(
+                Path(output_dir) / pdf_name
+            )
+            header_footer_count += doc_filtered_count
+            header_footer_skip_count += doc_skip_count
+        print(f"页眉页脚过滤完成：处理 {header_footer_count} 个文件，跳过 {header_footer_skip_count} 个文件")
 
         # =====================================================================
         # [新增] 解析完成后自动执行表格 OCR 后处理

@@ -23,6 +23,7 @@ import shutil
 import logging
 import tempfile
 import zipfile
+import importlib.util
 from pathlib import Path
 
 from flask import Flask, request, jsonify, send_file
@@ -39,6 +40,43 @@ os.environ.setdefault("MINERU_MODEL_SOURCE", "modelscope")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 from mineru.cli.common import do_parse, read_fn  # noqa: E402
+from mineru.utils.enum_class import MakeMode  # noqa: E402
+from mineru.backend.pipeline.pipeline_middle_json_mkcontent import union_make as pipeline_union_make  # noqa: E402
+from mineru.backend.vlm.vlm_middle_json_mkcontent import union_make as vlm_union_make  # noqa: E402
+from mineru.backend.office.office_middle_json_mkcontent import union_make as office_union_make  # noqa: E402
+
+# =========================
+# 页眉页脚过滤模块
+# =========================
+# 说明：
+# MinerU 的区域分类不一定总能给出明确 header/footer，有些页眉页脚会被当成正文。
+# 这里在 do_parse 完成后读取 middle_json，将明确类型或页边重复文本/页码移入
+# discarded_blocks，再重建最终 Markdown。该步骤只影响 .md，便于最终结果去掉页眉页脚。
+HEADER_FOOTER_FILTER_PATH = Path("/root/autodl-tmp/modify/Filter_ headers_and_footers.py")
+if not HEADER_FOOTER_FILTER_PATH.exists():
+    HEADER_FOOTER_FILTER_PATH = Path(__file__).resolve().parent / "modify/Filter_ headers_and_footers.py"
+
+
+def load_header_footer_filter():
+    if not HEADER_FOOTER_FILTER_PATH.exists():
+        logging.warning("Header/footer filter script not found: %s", HEADER_FOOTER_FILTER_PATH)
+        return None
+
+    spec = importlib.util.spec_from_file_location(
+        "header_footer_filter",
+        HEADER_FOOTER_FILTER_PATH,
+    )
+    if spec is None or spec.loader is None:
+        logging.warning("Header/footer filter script cannot be loaded: %s", HEADER_FOOTER_FILTER_PATH)
+        return None
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+HEADER_FOOTER_FILTER = load_header_footer_filter()
 
 # =========================
 # post_table 后处理模块导入
@@ -157,6 +195,78 @@ def wait_for_output(outdir: Path, timeout: int = MAX_WAIT_SECONDS) -> Path:
         time.sleep(POLL_INTERVAL)
 
 
+def guess_union_make(output_subdir: Path):
+    """根据 MinerU 输出子目录判断使用哪套 Markdown 生成逻辑。"""
+    name = output_subdir.name
+    if name in {"auto", "ocr", "txt"}:
+        return pipeline_union_make
+    if name.startswith("vlm") or name.startswith("hybrid"):
+        return vlm_union_make
+    if name == "office":
+        return office_union_make
+    return None
+
+
+def apply_header_footer_filter(output_dir: Path):
+    """
+    基于 middle_json 过滤页眉页脚，并重建最终 Markdown。
+
+    注意：
+      1. 必须放在 post_table 表格 OCR 后处理之前，否则重建 Markdown 会覆盖表格修正。
+      2. content_list 暂时保留 MinerU 原始输出，方便排查结构化识别结果。
+    """
+    if HEADER_FOOTER_FILTER is None:
+        logging.warning("Header/footer filter unavailable, skipping")
+        return
+
+    if not output_dir.is_dir():
+        logging.warning("Output dir not found, skipping header/footer filter: %s", output_dir)
+        return
+
+    processed = 0
+    removed_total = 0
+    for output_subdir in sorted(output_dir.iterdir()):
+        if not output_subdir.is_dir() or output_subdir.name == ".ipynb_checkpoints":
+            continue
+
+        make_func = guess_union_make(output_subdir)
+        if make_func is None:
+            logging.info("Unknown output mode, skipping header/footer filter: %s", output_subdir)
+            continue
+
+        for middle_path in sorted(output_subdir.glob("*_middle.json")):
+            try:
+                middle_json = json.loads(middle_path.read_text(encoding="utf-8"))
+                pdf_info = HEADER_FOOTER_FILTER.load_pdf_info_list(middle_json)
+                stats = HEADER_FOOTER_FILTER.filter_headers_and_footers(pdf_info)
+
+                md_path = output_subdir / f"{middle_path.name[:-len('_middle.json')]}.md"
+                md_content = make_func(pdf_info, MakeMode.MM_MD, "images")
+
+                middle_path.write_text(
+                    json.dumps(middle_json, ensure_ascii=False, indent=4),
+                    encoding="utf-8",
+                )
+                md_path.write_text(md_content or "", encoding="utf-8")
+
+                processed += 1
+                removed_total += stats.get("total_removed", 0)
+                logging.info(
+                    "Header/footer filtered: %s (%s, removed %d block(s))",
+                    md_path.name,
+                    output_subdir.name,
+                    stats.get("total_removed", 0),
+                )
+            except Exception as e:
+                logging.warning("Header/footer filter failed for %s: %s", middle_path, e)
+
+    logging.info(
+        "Header/footer filter complete: processed=%d, removed_blocks=%d",
+        processed,
+        removed_total,
+    )
+
+
 def run_mineru_pdf(pdf_path: Path) -> Path:
     """
     使用 MinerU Python API 解析 PDF：
@@ -207,6 +317,9 @@ def run_mineru_pdf(pdf_path: Path) -> Path:
 
     target_outdir = OUTPUT_DIR / safe_stem
     wait_for_output(target_outdir)
+
+    # 先重建去掉页眉页脚的 Markdown，再做表格 OCR 修正。
+    apply_header_footer_filter(target_outdir)
 
     # 应用 post_table 后处理修正
     apply_post_table_correction(target_outdir)
@@ -293,6 +406,7 @@ def index():
         "config": {
             "backend": MINERU_BACKEND,
             "image_analysis": IMAGE_ANALYSIS,
+            "header_footer_filter": HEADER_FOOTER_FILTER is not None,
             "available_backends": [
                 "pipeline (传统 OCR + 布局检测，速度快)",
                 "vlm-auto-engine (VLM 自动选择，精度高)",
@@ -410,6 +524,9 @@ def run_mineru_image(image_path: Path) -> Path:
 
     target_outdir = OUTPUT_DIR / safe_stem
     wait_for_output(target_outdir)
+
+    # 先重建去掉页眉页脚的 Markdown，再做表格 OCR 修正。
+    apply_header_footer_filter(target_outdir)
 
     # 应用 post_table 后处理修正
     apply_post_table_correction(target_outdir)
