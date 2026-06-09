@@ -10,7 +10,9 @@ Core idea:
 2. Repeated short text in the top or bottom page band is treated as running
    header/footer and moved to discarded_blocks.
 3. Page-number-like text near the page bottom is moved to discarded_blocks.
-4. Large visual blocks, tables, images, equations, captions and footnotes are
+4. First-page bottom legal notices, such as TI datasheet trademark/copyright
+   notices, are treated as cover-page footer material and removed.
+5. Large visual blocks, tables, images, equations, captions and footnotes are
    left untouched by default.
 """
 
@@ -84,6 +86,20 @@ PAGE_NUMBER_PATTERNS = [
     re.compile(r"^\s*第\s*\d{1,4}\s*页\s*(共\s*\d{1,4}\s*页)?\s*$"),
 ]
 
+FIRST_PAGE_NOTICE_KEYWORDS = {
+    "please be aware",
+    "important notice",
+    "standard warranty",
+    "critical applications",
+    "texas instruments",
+    "semiconductor products",
+    "disclaimers",
+    "all trademarks",
+    "production data",
+    "publication date",
+    "copyright",
+}
+
 
 @dataclass
 class FilterConfig:
@@ -94,6 +110,8 @@ class FilterConfig:
     max_margin_block_height_ratio: float = 0.045
     max_margin_block_width_ratio: float = 0.90
     protect_first_page_top: bool = True
+    first_page_notice_bottom_ratio: float = 0.26
+    first_page_notice_min_keyword_hits: int = 2
     aggressive_margin_drop: bool = False
     mark_reason_field: str = "_header_footer_filter_reason"
 
@@ -114,6 +132,7 @@ def filter_headers_and_footers(
 
     cfg = config or FilterConfig()
     repeated_texts = _find_repeated_margin_texts(pdf_info_list, cfg)
+    first_page_notice_pages = _find_first_page_bottom_notice_pages(pdf_info_list, cfg)
     stats = Counter()
 
     for page_index, page_info in enumerate(pdf_info_list):
@@ -131,6 +150,7 @@ def filter_headers_and_footers(
                     page_info=page_info,
                     page_index=page_index,
                     repeated_texts=repeated_texts,
+                    first_page_notice_pages=first_page_notice_pages,
                     cfg=cfg,
                 )
                 if should_discard:
@@ -180,6 +200,49 @@ def _find_repeated_margin_texts(
     }
 
 
+def _find_first_page_bottom_notice_pages(
+    pdf_info_list: list[dict[str, Any]],
+    cfg: FilterConfig,
+) -> set[int]:
+    """Detect cover-page-only legal notice regions.
+
+    Some datasheets put a unique legal/trademark/copyright block at the bottom
+    of page 1. It is not repeated, so the normal running-footer rule cannot
+    catch it. We only enable the special removal when multiple legal-notice
+    keywords are found in the first page bottom band.
+    """
+    if not pdf_info_list:
+        return set()
+
+    page_info = pdf_info_list[0]
+    page_width, page_height = _page_size(page_info)
+    if page_width <= 0 or page_height <= 0:
+        return set()
+
+    bottom_text_parts = []
+    for block in _iter_candidate_blocks(page_info):
+        if _is_protected_type(block):
+            continue
+
+        bbox = _block_bbox(block)
+        if not bbox or not _in_first_page_notice_band(bbox, page_width, page_height, cfg):
+            continue
+
+        text = _normalize_text(_block_text(block))
+        if text:
+            bottom_text_parts.append(text)
+
+    bottom_text = " ".join(bottom_text_parts)
+    keyword_hits = {
+        keyword
+        for keyword in FIRST_PAGE_NOTICE_KEYWORDS
+        if keyword in bottom_text
+    }
+    if len(keyword_hits) >= cfg.first_page_notice_min_keyword_hits:
+        return {0}
+    return set()
+
+
 def _iter_candidate_blocks(page_info: dict[str, Any]) -> Iterable[dict[str, Any]]:
     for block_key in ("preproc_blocks", "para_blocks"):
         blocks = page_info.get(block_key)
@@ -194,6 +257,7 @@ def _should_discard_block(
     page_info: dict[str, Any],
     page_index: int,
     repeated_texts: set[str],
+    first_page_notice_pages: set[int],
     cfg: FilterConfig,
 ) -> tuple[bool, str]:
     block_type = str(block.get("type") or block.get("block_type") or "").lower()
@@ -217,6 +281,12 @@ def _should_discard_block(
     text = _normalize_text(_block_text(block))
     if not text:
         return False, ""
+
+    if (
+        page_index in first_page_notice_pages
+        and _in_first_page_notice_band(bbox, page_width, page_height, cfg)
+    ):
+        return True, "first_page_bottom_notice"
 
     band = _margin_band(bbox, page_width, page_height, cfg)
     if not band:
@@ -306,6 +376,16 @@ def _is_small_margin_block(
         block_height <= page_height * cfg.max_margin_block_height_ratio
         and block_width <= page_width * cfg.max_margin_block_width_ratio
     )
+
+
+def _in_first_page_notice_band(
+    bbox: list[float],
+    page_width: float,
+    page_height: float,
+    cfg: FilterConfig,
+) -> bool:
+    _x0, y0, _x1, _y1 = _bbox_to_page_units(bbox, page_width, page_height)
+    return y0 >= page_height * (1.0 - cfg.first_page_notice_bottom_ratio)
 
 
 def _bbox_to_page_units(
