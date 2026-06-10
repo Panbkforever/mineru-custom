@@ -609,6 +609,11 @@ def fix_markdown_file(input_path: str, output_path: Optional[str] = None) -> str
     from post_table.expand_rowspan import expand_colspan
     fixed_content = expand_colspan(fixed_content)
 
+    # 第五步：修复 tms320c6211b Terminal Functions 表格的前两列合并错误
+    # 该问题发生在 colspan 展开之后：部分续表的前两列本应是
+    # SIGNAL NAME / NO.，但模型输出为重复的 "SIGNAL PIN"。
+    fixed_content = tms320c6211b_TerminalFunctions_table(fixed_content)
+
     out_path = output_path or input_path
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(fixed_content)
@@ -781,6 +786,226 @@ def fix_html_table(html: str) -> str:
         return tr_html.replace(tr_content, new_content, 1)
 
     return tr_pattern.sub(_fix_row, html)
+
+
+# =============================================================================
+# 指定数据手册表格结构修复
+# =============================================================================
+
+TERMINAL_FUNCTIONS_PIN_RE = re.compile(r"^(.+?)\s+([A-Z]{1,2}\d{1,2})$")
+TERMINAL_FUNCTIONS_TYPE_RE = re.compile(
+    r"^(I|O|S|GND|A|I/O/Z|O/Z|I/O|A¶|A§|—|-)$",
+    re.IGNORECASE,
+)
+
+
+def _html_cell_plain_text(inner_html: str) -> str:
+    """提取单元格纯文本，仅用于规则判断，不用于最终输出。"""
+    text = re.sub(r"<[^>]+>", "", inner_html)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _parse_html_table_cells(html: str) -> list[list[dict]]:
+    """
+    将 HTML 表格解析成可回写的 cell 结构。
+
+    每个单元格保留 open/inner/close 三段。后续只替换 inner，
+    不改动 <td> / <th> 标签属性，避免破坏表格结构。
+    """
+    rows: list[list[dict]] = []
+    tr_pattern = re.compile(r"<tr[^>]*>(.*?)</tr>", re.DOTALL | re.IGNORECASE)
+    cell_pattern = re.compile(
+        r"(<t[dh][^>]*>)(.*?)(</t[dh]>)",
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    for tr_match in tr_pattern.finditer(html):
+        tr_content = tr_match.group(1)
+        row = []
+        for cell_match in cell_pattern.finditer(tr_content):
+            row.append({
+                "open": cell_match.group(1),
+                "inner": cell_match.group(2),
+                "close": cell_match.group(3),
+            })
+        if row:
+            rows.append(row)
+    return rows
+
+
+def _is_terminal_functions_section_row(cells: list[dict]) -> bool:
+    """
+    判断是否为 Terminal Functions 表格的分组标题行。
+
+    这类行是正常的 colspan 展开结果，例如：
+        EMIF - ADDRESS | EMIF - ADDRESS | ... | EMIF - ADDRESS
+
+    用户需要保留这种展开重复，所以不能把它拆成两列。
+    """
+    texts = [_html_cell_plain_text(cell["inner"]) for cell in cells]
+    non_empty = [text for text in texts if text]
+    if len(non_empty) < 3:
+        return False
+    return len(set(non_empty)) == 1
+
+
+def _looks_like_terminal_functions_bad_table(rows: list[list[dict]]) -> bool:
+    """
+    判断是否为 tms320c6211b Terminal Functions 的坏表。
+
+    触发条件故意设得比较强：
+      1. 表头至少 5 列，前两列表头包含 SIGNAL / NAME / NO
+      2. 多数数据行前两列完全相同
+      3. 第 3 列像 TYPE，第 4 列像 IPD/IPU 或为空
+
+    只有满足这些条件才修复，避免影响普通表格。
+    """
+    if not rows or len(rows[0]) < 5:
+        return False
+
+    header = [_html_cell_plain_text(cell["inner"]).lower() for cell in rows[0]]
+    first_two_headers = re.sub(r"\s+", " ", " ".join(header[:2]))
+    if not all(keyword in first_two_headers for keyword in ("signal", "name", "no")):
+        return False
+
+    candidate_rows = 0
+    duplicated_rows = 0
+    type_like_rows = 0
+
+    for cells in rows[1:]:
+        if len(cells) < 5 or _is_terminal_functions_section_row(cells):
+            continue
+
+        col0 = _html_cell_plain_text(cells[0]["inner"])
+        col1 = _html_cell_plain_text(cells[1]["inner"])
+        col2 = _html_cell_plain_text(cells[2]["inner"])
+        col3 = _html_cell_plain_text(cells[3]["inner"])
+        if not col0 or not col1:
+            continue
+
+        candidate_rows += 1
+        if col0 == col1:
+            duplicated_rows += 1
+        if TERMINAL_FUNCTIONS_TYPE_RE.match(col2) and (not col3 or col3 in {"IPD", "IPU"}):
+            type_like_rows += 1
+
+    if candidate_rows < 3:
+        return False
+
+    return (
+        duplicated_rows / candidate_rows >= 0.6
+        and type_like_rows / candidate_rows >= 0.6
+    )
+
+
+def _fix_terminal_functions_table_html(html: str) -> str:
+    """
+    修复单个 Terminal Functions HTML 表格中前两列重复的问题。
+
+    错误形态：
+        HOLDA J18 | HOLDA J18 | O | IPU | ...
+
+    修复为：
+        HOLDA | J18 | O | IPU | ...
+
+    分组标题行保持不动：
+        EMIF - ADDRESS | EMIF - ADDRESS | ...
+    """
+    rows = _parse_html_table_cells(html)
+    if not _looks_like_terminal_functions_bad_table(rows):
+        return html
+
+    tr_pattern = re.compile(r"(<tr[^>]*>)(.*?)(</tr>)", re.DOTALL | re.IGNORECASE)
+    cell_pattern = re.compile(
+        r"(<t[dh][^>]*>)(.*?)(</t[dh]>)",
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    rebuilt_parts: list[str] = []
+    last_end = 0
+    row_index = 0
+    fixed_count = 0
+
+    for tr_match in tr_pattern.finditer(html):
+        rebuilt_parts.append(html[last_end:tr_match.start()])
+
+        tr_open = tr_match.group(1)
+        tr_content = tr_match.group(2)
+        tr_close = tr_match.group(3)
+        cells = rows[row_index] if row_index < len(rows) else []
+        row_index += 1
+
+        # 跳过表头、短行、分组标题行。
+        if row_index == 1 or len(cells) < 5 or _is_terminal_functions_section_row(cells):
+            rebuilt_parts.append(tr_match.group(0))
+            last_end = tr_match.end()
+            continue
+
+        col0 = _html_cell_plain_text(cells[0]["inner"])
+        col1 = _html_cell_plain_text(cells[1]["inner"])
+        col2 = _html_cell_plain_text(cells[2]["inner"])
+        col3 = _html_cell_plain_text(cells[3]["inner"])
+        split_match = TERMINAL_FUNCTIONS_PIN_RE.match(col0)
+
+        if not (
+            split_match
+            and col0 == col1
+            and TERMINAL_FUNCTIONS_TYPE_RE.match(col2)
+            and (not col3 or col3 in {"IPD", "IPU"})
+        ):
+            rebuilt_parts.append(tr_match.group(0))
+            last_end = tr_match.end()
+            continue
+
+        signal_name = split_match.group(1).strip()
+        pin_no = split_match.group(2).strip()
+        cell_idx = 0
+
+        def _replace_first_two_cells(cell_match: re.Match) -> str:
+            nonlocal cell_idx
+            cell_idx += 1
+            if cell_idx == 1:
+                return cell_match.group(1) + signal_name + cell_match.group(3)
+            if cell_idx == 2:
+                return cell_match.group(1) + pin_no + cell_match.group(3)
+            return cell_match.group(0)
+
+        new_content = cell_pattern.sub(_replace_first_two_cells, tr_content)
+        rebuilt_parts.append(tr_open + new_content + tr_close)
+        fixed_count += 1
+        last_end = tr_match.end()
+
+    rebuilt_parts.append(html[last_end:])
+    if fixed_count:
+        logger.info("tms320c6211b Terminal Functions 表格修复: 拆分前两列 %d 行", fixed_count)
+    return "".join(rebuilt_parts)
+
+
+def tms320c6211b_TerminalFunctions_table(md_content: str) -> str:
+    """
+    修复 tms320c6211b 数据手册 Terminal Functions 续表的前两列合并错误。
+
+    命名按“文件名_表名_table”组织，便于以后继续追加同类专项修复。
+
+    背景：
+        真实列结构是 SIGNAL NAME / NO. / TYPE / IPD-IPU / DESCRIPTION。
+        个别续表会被模型解析成前两列重复的 "SIGNAL PIN"，例如：
+            HOLDA J18 | HOLDA J18 | O | IPU | ...
+
+    处理：
+        只在强匹配 Terminal Functions 坏表特征时触发；
+        只修复数据行；
+        分组标题行的 colspan 展开重复保持不动。
+    """
+    def _fix_html_block(match: re.Match) -> str:
+        return _fix_terminal_functions_table_html(match.group(0))
+
+    return re.sub(
+        r"<table[^>]*>.*?</table>",
+        _fix_html_block,
+        md_content,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
 
 
 # =============================================================================
