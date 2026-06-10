@@ -114,7 +114,7 @@ OUTPUT_DIR = Path("/root/autodl-tmp/mineru_output")
 #   - "vlm-vllm-engine": VLM vLLM 后端（需要额外安装 vllm）
 #   - "hybrid-auto-engine": 混合模式（VLM + Pipeline），公式识别用 VLM，其他用 Pipeline
 #   - "hybrid-vllm-engine": 混合模式 + vLLM 后端
-MINERU_BACKEND = os.environ.get("MINERU_BACKEND", "pipeline")
+MINERU_BACKEND = os.environ.get("MINERU_BACKEND", "hybrid-auto-engine")
 IMAGE_ANALYSIS = os.environ.get("MINERU_IMAGE_ANALYSIS", "false").lower() in {
     "1",
     "true",
