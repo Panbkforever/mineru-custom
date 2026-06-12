@@ -126,6 +126,14 @@ def apply_header_footer_filter(
                     pdf_info,
                     pdf_path=source_pdf_path,
                 )
+                # MIN/MAX 表格坐标校正：
+                # 仅对含成对 MIN/MAX 表头且网格完整的表格生效。
+                # 使用 PDF 原生文字坐标确认值应落入哪个单元格，
+                # 只移动原 HTML 值，不替换 VLM 已识别出的文字内容。
+                min_max_stats = correct_min_max_tables_in_middle_json(
+                    middle_json,
+                    source_pdf_path,
+                )
 
                 md_path = output_subdir / f"{middle_path.name[:-len('_middle.json')]}.md"
                 image_dir = "images"
@@ -138,7 +146,12 @@ def apply_header_footer_filter(
                 md_path.write_text(md_content or "", encoding="utf-8")
 
                 removed = stats.get("total_removed", 0)
-                print(f"  ✅ 页眉页脚过滤: {md_path.name}  ({output_subdir.name}, 移除 {removed} 个 block)")
+                corrected_rows = min_max_stats.get("rows_corrected", 0)
+                print(
+                    f"  ✅ 页眉页脚/表格坐标校正: {md_path.name} "
+                    f"({output_subdir.name}, 移除 {removed} 个 block, "
+                    f"修正 MIN/MAX 错位 {corrected_rows} 行)"
+                )
                 filtered_count += 1
             except Exception as e:
                 print(f"  ⚠️  页眉页脚过滤失败: {middle_path} -> {e}")
@@ -156,6 +169,9 @@ POST_TABLE_DIR = Path("/root/autodl-tmp/post_table")
 if POST_TABLE_DIR.exists():
     sys.path.insert(0, str(POST_TABLE_DIR.parent))
 from post_table.fix_ocr_table import fix_markdown_file  # noqa: E402
+from post_table.min_max_coordinate_correct import (  # noqa: E402
+    correct_min_max_tables_in_middle_json,
+)
 
 
 def apply_post_table_correction(doc_output_dir: Path) -> tuple[int, int]:

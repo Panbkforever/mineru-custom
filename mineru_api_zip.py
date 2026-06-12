@@ -84,10 +84,14 @@ HEADER_FOOTER_FILTER = load_header_footer_filter()
 sys.path.insert(0, str(Path("/root/autodl-tmp")))
 try:
     from post_table.fix_ocr_table import fix_markdown_file as fix_table_ocr
+    from post_table.min_max_coordinate_correct import (
+        correct_min_max_tables_in_middle_json,
+    )
     POST_TABLE_AVAILABLE = True
     logging.info("post_table module loaded successfully")
 except ImportError as e:
     POST_TABLE_AVAILABLE = False
+    correct_min_max_tables_in_middle_json = None
     logging.warning("post_table module not available: %s", e)
 
 # =========================
@@ -243,6 +247,16 @@ def apply_header_footer_filter(output_dir: Path, source_pdf_path: Path | None = 
                     pdf_info,
                     pdf_path=source_pdf_path,
                 )
+                # 仅对有成对 MIN/MAX 表头且表格网格完整的表格进行坐标校正。
+                # PDF 原生文字坐标只负责确认值的位置，最终保留 VLM 原 HTML 内容。
+                min_max_stats = (
+                    correct_min_max_tables_in_middle_json(
+                        middle_json,
+                        source_pdf_path,
+                    )
+                    if correct_min_max_tables_in_middle_json is not None
+                    else {}
+                )
 
                 md_path = output_subdir / f"{middle_path.name[:-len('_middle.json')]}.md"
                 md_content = make_func(pdf_info, MakeMode.MM_MD, "images")
@@ -256,10 +270,12 @@ def apply_header_footer_filter(output_dir: Path, source_pdf_path: Path | None = 
                 processed += 1
                 removed_total += stats.get("total_removed", 0)
                 logging.info(
-                    "Header/footer filtered: %s (%s, removed %d block(s))",
+                    "Header/footer and MIN/MAX alignment processed: %s "
+                    "(%s, removed %d block(s), corrected %d row(s))",
                     md_path.name,
                     output_subdir.name,
                     stats.get("total_removed", 0),
+                    min_max_stats.get("rows_corrected", 0),
                 )
             except Exception as e:
                 logging.warning("Header/footer filter failed for %s: %s", middle_path, e)
