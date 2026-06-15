@@ -138,7 +138,13 @@ def _correct_one_table(
     if len(rows) < 3:
         return expanded_html, False, 0, 0
 
-    horizontal_lines = _detect_horizontal_lines(page, bbox, cv2, np)
+    horizontal_lines = _detect_horizontal_lines(
+        page,
+        bbox,
+        cv2,
+        np,
+        expected_count=len(rows) + 1,
+    )
 
     header_row_index, value_column_indexes = _find_min_max_header(rows)
     if header_row_index < 0:
@@ -307,6 +313,18 @@ def _correct_single_pdf_value_duplicated_in_html(
             row_y1=row_y1,
             page_height=page_height,
         )
+        if not value_centers:
+            # OCR/VLM may confuse footnote symbols with letters (for example
+            # 2P§ -> 2PS). Geometry can still prove whether the PDF contains
+            # one spanning value or two independent MIN/MAX values.
+            value_centers = _find_pdf_text_run_centers(
+                text_page=text_page,
+                left=min_center - gap / 2.0,
+                right=max_center + gap / 2.0,
+                row_y0=row_y0,
+                row_y1=row_y1,
+                page_height=page_height,
+            )
         if len(value_centers) != 1:
             continue
 
@@ -321,6 +339,51 @@ def _correct_single_pdf_value_duplicated_in_html(
             cells[max_column]["inner"] = max_value
         changed = True
     return changed
+
+
+def _find_pdf_text_run_centers(
+    text_page: Any,
+    left: float,
+    right: float,
+    row_y0: float,
+    row_y1: float,
+    page_height: float,
+) -> list[float]:
+    """Return horizontal centers of independent text runs inside one row."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        page_text = text_page.get_text_range()
+
+    boxes = []
+    for char_index, char in enumerate(page_text):
+        if char.isspace():
+            continue
+        try:
+            char_left, bottom, char_right, top = text_page.get_charbox(char_index)
+        except Exception:
+            continue
+        center_x = (char_left + char_right) / 2.0
+        center_y = page_height - (top + bottom) / 2.0
+        if left <= center_x <= right and row_y0 <= center_y <= row_y1:
+            boxes.append((char_left, char_right))
+    if not boxes:
+        return []
+
+    boxes.sort()
+    widths = sorted(max(0.1, x1 - x0) for x0, x1 in boxes)
+    median_width = widths[len(widths) // 2]
+    max_inline_gap = max(3.0, median_width * 2.2)
+
+    runs = []
+    run_left, run_right = boxes[0]
+    for char_left, char_right in boxes[1:]:
+        if char_left - run_right <= max_inline_gap:
+            run_right = max(run_right, char_right)
+            continue
+        runs.append((run_left, run_right))
+        run_left, run_right = char_left, char_right
+    runs.append((run_left, run_right))
+    return [(run_left + run_right) / 2.0 for run_left, run_right in runs]
 
 
 def _split_merged_min_max_columns(
@@ -584,7 +647,13 @@ def _alternating_min_max(labels: list[str]) -> bool:
     )
 
 
-def _detect_horizontal_lines(page: Any, bbox: list[float], cv2: Any, np: Any) -> list[float]:
+def _detect_horizontal_lines(
+    page: Any,
+    bbox: list[float],
+    cv2: Any,
+    np: Any,
+    expected_count: int | None = None,
+) -> list[float]:
     scale = 4.0
     image = np.asarray(page.render(scale=scale).to_pil().convert("L"))
     x0, y0, x1, y1 = bbox
@@ -596,15 +665,72 @@ def _detect_horizontal_lines(page: Any, bbox: list[float], cv2: Any, np: Any) ->
         return []
 
     binary = cv2.threshold(crop, 180, 255, cv2.THRESH_BINARY_INV)[1]
-    kernel_width = max(20, int(crop.shape[1] * 0.55))
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, 1))
-    horizontal = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-    projection = (horizontal > 0).mean(axis=1)
-    candidate_rows = np.where(projection >= 0.5)[0].tolist()
+    candidates = [
+        _detect_lines_in_horizontal_segment(
+            binary,
+            x_start_ratio=0.0,
+            x_end_ratio=1.0,
+            kernel_ratio=0.55,
+            projection_threshold=0.5,
+            table_top=y0,
+            scale=scale,
+            cv2=cv2,
+            np=np,
+        ),
+        # Tables with int/ext subrows often draw their intermediate rules only
+        # through the condition and MIN/MAX columns. Detect that right-hand
+        # region separately so expanded rowspan rows receive physical bands.
+        _detect_lines_in_horizontal_segment(
+            binary,
+            x_start_ratio=0.70,
+            x_end_ratio=0.92,
+            kernel_ratio=0.35,
+            projection_threshold=0.45,
+            table_top=y0,
+            scale=scale,
+            cv2=cv2,
+            np=np,
+        ),
+    ]
 
+    if expected_count:
+        exact = [lines for lines in candidates if len(lines) == expected_count]
+        if exact:
+            return exact[0]
+        return min(
+            candidates,
+            key=lambda lines: (abs(len(lines) - expected_count), -len(lines)),
+        )
+    return max(candidates, key=len)
+
+
+def _detect_lines_in_horizontal_segment(
+    binary: Any,
+    x_start_ratio: float,
+    x_end_ratio: float,
+    kernel_ratio: float,
+    projection_threshold: float,
+    table_top: float,
+    scale: float,
+    cv2: Any,
+    np: Any,
+) -> list[float]:
+    width = binary.shape[1]
+    segment = binary[
+        :,
+        max(0, int(width * x_start_ratio)):min(width, int(width * x_end_ratio)),
+    ]
+    if segment.size == 0:
+        return []
+
+    kernel_width = max(12, int(segment.shape[1] * kernel_ratio))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, 1))
+    horizontal = cv2.morphologyEx(segment, cv2.MORPH_OPEN, kernel)
+    projection = (horizontal > 0).mean(axis=1)
+    candidate_rows = np.where(projection >= projection_threshold)[0].tolist()
     groups = _merge_consecutive(candidate_rows)
     return [
-        y0 + ((start + end) / 2.0) / scale
+        table_top + ((start + end) / 2.0) / scale
         for start, end in groups
         if 1 <= end - start + 1 <= 20
     ]
