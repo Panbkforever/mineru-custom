@@ -849,53 +849,84 @@ def _is_terminal_functions_section_row(cells: list[dict]) -> bool:
     return len(set(non_empty)) == 1
 
 
-def _looks_like_terminal_functions_bad_table(rows: list[list[dict]]) -> bool:
+def _has_signal_name_no_header(rows: list[list[dict]]) -> bool:
     """
-    判断是否为 tms320c6211b Terminal Functions 的坏表。
+    判断表格是否具有标准化后的两行 SIGNAL NAME / NO. 表头：
 
-    触发条件故意设得比较强：
-      1. 表头至少 5 列，前两列表头包含 SIGNAL / NAME / NO
-      2. 多数数据行前两列完全相同
-      3. 第 3 列像 TYPE，第 4 列像 IPD/IPU 或为空
+        SIGNAL | SIGNAL | ...
+        NAME   | NO.    | ...
 
-    只有满足这些条件才修复，避免影响普通表格。
+    只要命中该表头，就允许后续逐行检查并拆分重复的 SIGNAL/PIN 单元格。
+    不再依赖固定 5 列、TYPE 列或 IPD/IPU 列，因此同样支持 4 列表格。
     """
-    if not rows or len(rows[0]) < 5:
+    if len(rows) < 2 or len(rows[0]) < 2 or len(rows[1]) < 2:
         return False
 
-    header = [_html_cell_plain_text(cell["inner"]).lower() for cell in rows[0]]
-    first_two_headers = re.sub(r"\s+", " ", " ".join(header[:2]))
-    if not all(keyword in first_two_headers for keyword in ("signal", "name", "no")):
-        return False
+    first_row = [
+        _html_cell_plain_text(cell["inner"]).upper().rstrip(".")
+        for cell in rows[0][:2]
+    ]
+    second_row = [
+        _html_cell_plain_text(cell["inner"]).upper().rstrip(".")
+        for cell in rows[1][:2]
+    ]
+    return first_row == ["SIGNAL", "SIGNAL"] and second_row == ["NAME", "NO"]
 
-    candidate_rows = 0
-    duplicated_rows = 0
-    type_like_rows = 0
 
-    for cells in rows[1:]:
-        if len(cells) < 5 or _is_terminal_functions_section_row(cells):
-            continue
+def _normalize_signal_name_no_header(html: str) -> str:
+    """
+    将模型合并输出的 SIGNAL NAME NO. 表头改成两行逻辑表头。
 
-        col0 = _html_cell_plain_text(cells[0]["inner"])
-        col1 = _html_cell_plain_text(cells[1]["inner"])
-        col2 = _html_cell_plain_text(cells[2]["inner"])
-        col3 = _html_cell_plain_text(cells[3]["inner"])
-        if not col0 or not col1:
-            continue
+    输入：
+        SIGNAL NAME NO. | SIGNAL NAME NO. | TYPE | DESCRIPTION
 
-        candidate_rows += 1
-        if col0 == col1:
-            duplicated_rows += 1
-        if TERMINAL_FUNCTIONS_TYPE_RE.match(col2) and (not col3 or col3 in {"IPD", "IPU"}):
-            type_like_rows += 1
+    输出：
+        SIGNAL | SIGNAL | TYPE | DESCRIPTION
+        NAME   | NO.    | TYPE | DESCRIPTION
 
-    if candidate_rows < 3:
-        return False
+    后面的列按 rowspan 展开语义复制到两行，保持整张表列数一致。
+    """
+    rows = _parse_html_table_cells(html)
+    if not rows or len(rows[0]) < 2:
+        return html
 
-    return (
-        duplicated_rows / candidate_rows >= 0.6
-        and type_like_rows / candidate_rows >= 0.6
+    if _has_signal_name_no_header(rows):
+        return html
+
+    first_two = [
+        _html_cell_plain_text(cell["inner"]).upper().replace(".", "")
+        for cell in rows[0][:2]
+    ]
+    if not all(
+        all(keyword in text for keyword in ("SIGNAL", "NAME", "NO"))
+        for text in first_two
+    ):
+        return html
+
+    tr_match = re.search(
+        r"(<tr[^>]*>)(.*?)(</tr>)",
+        html,
+        flags=re.DOTALL | re.IGNORECASE,
     )
+    if tr_match is None:
+        return html
+
+    header_cells = rows[0]
+    first_row_cells = []
+    second_row_cells = []
+    for index, cell in enumerate(header_cells):
+        if index == 0:
+            first_inner, second_inner = "SIGNAL", "NAME"
+        elif index == 1:
+            first_inner, second_inner = "SIGNAL", "NO."
+        else:
+            first_inner = second_inner = cell["inner"]
+        first_row_cells.append(cell["open"] + first_inner + cell["close"])
+        second_row_cells.append(cell["open"] + second_inner + cell["close"])
+
+    first_row = tr_match.group(1) + "".join(first_row_cells) + tr_match.group(3)
+    second_row = tr_match.group(1) + "".join(second_row_cells) + tr_match.group(3)
+    return html[:tr_match.start()] + first_row + second_row + html[tr_match.end():]
 
 
 def _fix_terminal_functions_table_html(html: str) -> str:
@@ -911,8 +942,9 @@ def _fix_terminal_functions_table_html(html: str) -> str:
     分组标题行保持不动：
         EMIF - ADDRESS | EMIF - ADDRESS | ...
     """
+    html = _normalize_signal_name_no_header(html)
     rows = _parse_html_table_cells(html)
-    if not _looks_like_terminal_functions_bad_table(rows):
+    if not _has_signal_name_no_header(rows):
         return html
 
     tr_pattern = re.compile(r"(<tr[^>]*>)(.*?)(</tr>)", re.DOTALL | re.IGNORECASE)
@@ -935,24 +967,17 @@ def _fix_terminal_functions_table_html(html: str) -> str:
         cells = rows[row_index] if row_index < len(rows) else []
         row_index += 1
 
-        # 跳过表头、短行、分组标题行。
-        if row_index == 1 or len(cells) < 5 or _is_terminal_functions_section_row(cells):
+        # 跳过两行标准表头、短行、分组标题行。
+        if row_index <= 2 or len(cells) < 2 or _is_terminal_functions_section_row(cells):
             rebuilt_parts.append(tr_match.group(0))
             last_end = tr_match.end()
             continue
 
         col0 = _html_cell_plain_text(cells[0]["inner"])
         col1 = _html_cell_plain_text(cells[1]["inner"])
-        col2 = _html_cell_plain_text(cells[2]["inner"])
-        col3 = _html_cell_plain_text(cells[3]["inner"])
         split_match = TERMINAL_FUNCTIONS_PIN_RE.match(col0)
 
-        if not (
-            split_match
-            and col0 == col1
-            and TERMINAL_FUNCTIONS_TYPE_RE.match(col2)
-            and (not col3 or col3 in {"IPD", "IPU"})
-        ):
+        if not (split_match and col0 == col1):
             rebuilt_parts.append(tr_match.group(0))
             last_end = tr_match.end()
             continue
@@ -983,19 +1008,21 @@ def _fix_terminal_functions_table_html(html: str) -> str:
 
 def tms320c6211b_TerminalFunctions_table(md_content: str) -> str:
     """
-    修复 tms320c6211b 数据手册 Terminal Functions 续表的前两列合并错误。
+    修复 SIGNAL NAME / NO. 表格的表头和前两列合并错误。
 
     命名按“文件名_表名_table”组织，便于以后继续追加同类专项修复。
 
-    背景：
-        真实列结构是 SIGNAL NAME / NO. / TYPE / IPD-IPU / DESCRIPTION。
-        个别续表会被模型解析成前两列重复的 "SIGNAL PIN"，例如：
-            HOLDA J18 | HOLDA J18 | O | IPU | ...
+    命中规则：
+        先将合并的 SIGNAL NAME NO. 表头标准化为：
+            SIGNAL | SIGNAL
+            NAME   | NO.
+        只要表格具有这个表头就命中，不限制 4 列或 5 列，也不要求
+        存在 IPD/IPU 列。
 
-    处理：
-        只在强匹配 Terminal Functions 坏表特征时触发；
-        只修复数据行；
-        分组标题行的 colspan 展开重复保持不动。
+    数据行处理：
+        前两列重复的 "SIGNAL PIN"，例如：
+            HOLDA J18 | HOLDA J18 | O | IPU | ...
+        拆分为 HOLDA | J18。分组标题行的展开重复保持不动。
     """
     def _fix_html_block(match: re.Match) -> str:
         return _fix_terminal_functions_table_html(match.group(0))
