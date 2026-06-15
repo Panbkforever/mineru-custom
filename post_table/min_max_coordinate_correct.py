@@ -1,13 +1,13 @@
 """
-Use PDF-native text coordinates to correct shifted values in MIN/MAX tables.
+Use PDF-native text coordinates to correct shifted values in limit tables.
 
 The VLM may recognize all values correctly but place one value in the wrong
 HTML cell, especially in sparse multi-level MIN/MAX tables. This module only
 changes a row when all of the following are true:
 
-1. The table header contains separate or VLM-merged MIN/MAX columns.
+1. The table header contains MIN/MAX or MIN/TYP|NOM/MAX columns.
 2. The rendered table has enough horizontal rules to identify its data rows.
-3. PDF-native text finds matching MIN/MAX headers and recognized values.
+3. PDF-native text finds matching value headers and recognized values.
 4. Existing columns are only relocated; merged columns are split conservatively.
 
 The original HTML value strings are preserved; PDF text is used only as a
@@ -30,6 +30,7 @@ CELL_RE = re.compile(
     r"(<t[dh][^>]*>)(.*?)(</t[dh]>)",
     re.DOTALL | re.IGNORECASE,
 )
+VALUE_HEADER_LABELS = {"MIN", "TYP", "NOM", "MAX"}
 
 
 @dataclass
@@ -104,9 +105,14 @@ def correct_min_max_tables_in_middle_json(
                 span["html"] = correction_cache[cache_key]
                 continue
 
-            expanded_html = expand_colspan(expand_rowspan(table_html))
+            rowspan_expanded_html = expand_rowspan(table_html)
+            explicit_colspans = _find_explicit_colspan_ranges(
+                rowspan_expanded_html
+            )
+            expanded_html = expand_colspan(rowspan_expanded_html)
             corrected_html, matched, split_columns, corrected_rows = _correct_one_table(
                 expanded_html=expanded_html,
+                explicit_colspans=explicit_colspans,
                 bbox=[float(v) for v in bbox],
                 page=page,
                 text_page=text_page,
@@ -132,6 +138,7 @@ def correct_min_max_tables_in_middle_json(
 
 def _correct_one_table(
     expanded_html: str,
+    explicit_colspans: list[list[tuple[int, int]]],
     bbox: list[float],
     page: Any,
     text_page: Any,
@@ -151,7 +158,7 @@ def _correct_one_table(
         expected_count=len(rows) + 1,
     )
 
-    header_row_index, value_column_indexes = _find_min_max_header(rows)
+    header_row_index, value_column_indexes = _find_value_header(rows)
     if header_row_index < 0:
         return _split_merged_min_max_columns(
             rows=rows,
@@ -171,17 +178,22 @@ def _correct_one_table(
     if len(value_column_indexes) < 2:
         return expanded_html, False, 0, 0
 
-    labels = [_plain_text(rows[header_row_index][i]["inner"]).upper() for i in value_column_indexes]
-    if not _alternating_min_max(labels):
+    labels = [
+        _plain_text(rows[header_row_index][i]["inner"]).upper()
+        for i in value_column_indexes
+    ]
+    value_groups = _value_header_groups(labels)
+    if not value_groups:
         return expanded_html, False, 0, 0
 
     header_y0, header_y1, data_bands = row_bands
-    pdf_headers = _find_pdf_min_max_headers(
+    pdf_headers = _find_pdf_value_headers(
         text_page,
         bbox,
         page_height,
         header_y0,
         header_y1,
+        labels=set(labels),
     )
     if [item[0] for item in pdf_headers] != labels:
         return expanded_html, False, 0, 0
@@ -205,18 +217,27 @@ def _correct_one_table(
         data_index = row_index - header_row_index - 1
         row_y0, row_y1 = data_bands[data_index]
 
-        if _correct_single_pdf_value_duplicated_in_html(
+        row_explicit_colspans = (
+            explicit_colspans[row_index]
+            if row_index < len(explicit_colspans)
+            else []
+        )
+        row_corrected = _correct_single_pdf_value_duplicated_in_html(
             cells=cells,
             value_column_indexes=value_column_indexes,
             html_values=html_values,
             centers=centers,
+            value_groups=value_groups,
+            explicit_colspans=row_explicit_colspans,
             text_page=text_page,
             row_y0=row_y0,
             row_y1=row_y1,
             page_height=page_height,
-        ):
+        )
+        if row_corrected:
             corrected_rows += 1
-            continue
+            html_values = [cells[i]["inner"] for i in value_column_indexes]
+            html_mask = [bool(_plain_text(value)) for value in html_values]
 
         pdf_values = [
             _extract_pdf_cell_text(
@@ -252,7 +273,8 @@ def _correct_one_table(
         relocated = [next(value_iter) if occupied else "" for occupied in pdf_mask]
         for column_index, value in zip(value_column_indexes, relocated):
             cells[column_index]["inner"] = value
-        corrected_rows += 1
+        if not row_corrected:
+            corrected_rows += 1
 
     if corrected_rows == 0:
         return expanded_html, True, 0, 0
@@ -288,62 +310,130 @@ def _correct_single_pdf_value_duplicated_in_html(
     value_column_indexes: list[int],
     html_values: list[str],
     centers: list[float],
+    value_groups: list[tuple[int, int]],
+    explicit_colspans: list[tuple[int, int]],
     text_page: Any,
     row_y0: float,
     row_y1: float,
     page_height: float,
 ) -> bool:
     changed = False
-    for pair_start in range(0, len(value_column_indexes), 2):
-        min_column = value_column_indexes[pair_start]
-        max_column = value_column_indexes[pair_start + 1]
-        min_value = html_values[pair_start]
-        max_value = html_values[pair_start + 1]
-        plain_value = _plain_text(min_value)
-        if (
-            not plain_value
-            or _normalize_value(plain_value) != _normalize_value(_plain_text(max_value))
-        ):
-            continue
+    for group_start, group_end in value_groups:
+        group_positions = list(range(group_start, group_end))
+        normalized_positions: dict[str, list[int]] = {}
+        for position in group_positions:
+            normalized = _normalize_value(_plain_text(html_values[position]))
+            if normalized:
+                normalized_positions.setdefault(normalized, []).append(position)
 
-        min_center = centers[pair_start]
-        max_center = centers[pair_start + 1]
-        gap = max_center - min_center
-        value_centers = _find_pdf_value_centers(
-            text_page=text_page,
-            value=plain_value,
-            left=min_center - gap / 2.0,
-            right=max_center + gap / 2.0,
-            row_y0=row_y0,
-            row_y1=row_y1,
-            page_height=page_height,
-        )
-        if not value_centers:
-            # OCR/VLM may confuse footnote symbols with letters (for example
-            # 2P§ -> 2PS). Geometry can still prove whether the PDF contains
-            # one spanning value or two independent MIN/MAX values.
-            value_centers = _find_pdf_text_run_centers(
+        for duplicate_positions in normalized_positions.values():
+            if len(duplicate_positions) < 2:
+                continue
+
+            duplicate_columns = [
+                value_column_indexes[position]
+                for position in duplicate_positions
+            ]
+            plain_value = _plain_text(html_values[duplicate_positions[0]])
+            group_centers = centers[group_start:group_end]
+            if len(group_centers) < 2:
+                continue
+            left_gap = group_centers[1] - group_centers[0]
+            right_gap = group_centers[-1] - group_centers[-2]
+            value_centers = _find_pdf_value_centers(
                 text_page=text_page,
-                left=min_center - gap / 2.0,
-                right=max_center + gap / 2.0,
+                value=plain_value,
+                left=group_centers[0] - left_gap / 2.0,
+                right=group_centers[-1] + right_gap / 2.0,
                 row_y0=row_y0,
                 row_y1=row_y1,
                 page_height=page_height,
             )
-        if len(value_centers) != 1:
-            continue
+            if not value_centers:
+                # OCR/VLM may confuse footnote symbols with letters. Geometry
+                # can still prove whether the PDF contains one text run.
+                value_centers = _find_pdf_text_run_centers(
+                    text_page=text_page,
+                    left=group_centers[0] - left_gap / 2.0,
+                    right=group_centers[-1] + right_gap / 2.0,
+                    row_y0=row_y0,
+                    row_y1=row_y1,
+                    page_height=page_height,
+                )
+            if len(value_centers) != 1:
+                continue
 
-        # One PDF text object cannot represent two independent cell values.
-        # Assign it to the nearest logical column; an exact center tie defaults
-        # to MIN, which is the conventional placement for a single requirement.
-        if abs(value_centers[0] - min_center) <= abs(value_centers[0] - max_center):
-            cells[min_column]["inner"] = min_value
-            cells[max_column]["inner"] = ""
-        else:
-            cells[min_column]["inner"] = ""
-            cells[max_column]["inner"] = max_value
-        changed = True
+            if _preserve_explicit_value_span(
+                value=plain_value,
+                duplicate_columns=duplicate_columns,
+                group_columns=[
+                    value_column_indexes[position]
+                    for position in group_positions
+                ],
+                explicit_colspans=explicit_colspans,
+                value_center=value_centers[0],
+                group_centers=group_centers,
+            ):
+                continue
+
+            target_position = min(
+                duplicate_positions,
+                key=lambda position: abs(
+                    centers[position] - value_centers[0]
+                ),
+            )
+            target_value = html_values[target_position]
+            for position in duplicate_positions:
+                column_index = value_column_indexes[position]
+                cells[column_index]["inner"] = (
+                    target_value if position == target_position else ""
+                )
+            changed = True
     return changed
+
+
+def _preserve_explicit_value_span(
+    value: str,
+    duplicate_columns: list[int],
+    group_columns: list[int],
+    explicit_colspans: list[tuple[int, int]],
+    value_center: float,
+    group_centers: list[float],
+) -> bool:
+    if (
+        len(duplicate_columns) != len(group_columns)
+        or len(group_columns) < 2
+    ):
+        return False
+
+    left = min(group_columns)
+    right = max(group_columns) + 1
+    explicitly_spanned = any(
+        span_left <= left and span_right >= right
+        for span_left, span_right in explicit_colspans
+    )
+    if not explicitly_spanned:
+        return False
+
+    # In a three-column group, the span midpoint is also the TYP/NOM center.
+    # Preserve only values that semantically describe a shared condition.
+    normalized = _normalize_value(value)
+    shared_condition = (
+        normalized in {"0", "-", "na", "n/a"}
+        or bool(re.match(r"^(nc|see|same|notapplicable)", normalized))
+        or not bool(re.search(r"\d", normalized))
+    )
+    if len(group_columns) >= 3 and shared_condition:
+        return True
+
+    group_midpoint = (group_centers[0] + group_centers[-1]) / 2.0
+    tolerance = (group_centers[-1] - group_centers[0]) * 0.12
+    if abs(value_center - group_midpoint) > tolerance:
+        # A VLM colspan whose text is visibly aligned to MIN or MAX is false.
+        return False
+
+    # With two columns, their midpoint is not a valid single-column center.
+    return len(group_columns) == 2
 
 
 def _find_pdf_text_run_centers(
@@ -413,12 +503,13 @@ def _split_merged_min_max_columns(
     data_lines = horizontal_lines[-(data_row_count + 1):]
     header_y0 = horizontal_lines[0]
     header_y1 = data_lines[0]
-    pdf_headers = _find_pdf_min_max_headers(
+    pdf_headers = _find_pdf_value_headers(
         text_page,
         bbox,
         page_height,
         header_y0,
         header_y1,
+        labels={"MIN", "MAX"},
     )
     labels = [item[0] for item in pdf_headers]
     if len(pdf_headers) != len(merged_indexes) * 2 or not _alternating_min_max(labels):
@@ -546,13 +637,58 @@ def _replace_text_spaces_with_nbsp(value: str) -> str:
     return "".join(parts)
 
 
-def _find_min_max_header(rows: list[list[dict[str, str]]]) -> tuple[int, list[int]]:
+def _find_value_header(rows: list[list[dict[str, str]]]) -> tuple[int, list[int]]:
     for row_index, cells in enumerate(rows):
         labels = [_plain_text(cell["inner"]).upper() for cell in cells]
-        indexes = [i for i, label in enumerate(labels) if label in {"MIN", "MAX"}]
-        if len(indexes) >= 2:
+        indexes = [
+            i for i, label in enumerate(labels)
+            if label in VALUE_HEADER_LABELS
+        ]
+        selected_labels = [labels[index] for index in indexes]
+        if _value_header_groups(selected_labels):
             return row_index, indexes
     return -1, []
+
+
+def _value_header_groups(labels: list[str]) -> list[tuple[int, int]]:
+    """Split MIN[/TYP|NOM]/MAX columns into independent value groups."""
+    groups: list[tuple[int, int]] = []
+    start = 0
+    while start < len(labels):
+        if labels[start] != "MIN":
+            return []
+        end = start + 1
+        while end < len(labels) and labels[end] in {"TYP", "NOM"}:
+            end += 1
+        if end >= len(labels) or labels[end] != "MAX":
+            return []
+        groups.append((start, end + 1))
+        start = end + 1
+    return groups
+
+
+def _find_explicit_colspan_ranges(
+    table_html: str,
+) -> list[list[tuple[int, int]]]:
+    """Record source colspan ranges before expand_colspan removes the evidence."""
+    result: list[list[tuple[int, int]]] = []
+    for tr_match in TR_RE.finditer(table_html):
+        logical_column = 0
+        row_ranges: list[tuple[int, int]] = []
+        for cell_match in CELL_RE.finditer(tr_match.group(2)):
+            colspan_match = re.search(
+                r'colspan\s*=\s*["\']?(\d+)["\']?',
+                cell_match.group(1),
+                re.IGNORECASE,
+            )
+            colspan = int(colspan_match.group(1)) if colspan_match else 1
+            if colspan > 1:
+                row_ranges.append(
+                    (logical_column, logical_column + colspan)
+                )
+            logical_column += colspan
+        result.append(row_ranges)
+    return result
 
 
 def _find_merged_min_max_header(
@@ -799,12 +935,13 @@ def _detect_lines_in_horizontal_segment(
     ]
 
 
-def _find_pdf_min_max_headers(
+def _find_pdf_value_headers(
     text_page: Any,
     bbox: list[float],
     page_height: float,
     row_y0: float,
     row_y1: float,
+    labels: set[str] | None = None,
 ) -> list[tuple[str, float]]:
     # pypdfium2 的 bounded 全文顺序与 get_charbox() 的字符索引一致。
     # 显式 range 模式在部分 PDF 中使用不同的换行/字符计数，反而会让
@@ -813,7 +950,10 @@ def _find_pdf_min_max_headers(
         warnings.simplefilter("ignore", UserWarning)
         text = text_page.get_text_range()
     results: list[tuple[str, float]] = []
-    for label in ("MIN", "MAX"):
+    labels = labels or {"MIN", "MAX"}
+    for label in ("MIN", "TYP", "NOM", "MAX"):
+        if label not in labels:
+            continue
         start = 0
         while True:
             index = text.find(label, start)
