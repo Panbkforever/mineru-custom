@@ -134,6 +134,13 @@ def apply_header_footer_filter(
                     middle_json,
                     source_pdf_path,
                 )
+                # 按 PDF 原始字符纵坐标恢复单元格内真实换行。
+                # 仅在完整单元格文本可匹配到连续多条视觉文本行时插入 <br>，
+                # 不根据文本长度猜测换行。
+                line_break_stats = restore_cell_line_breaks_in_middle_json(
+                    middle_json,
+                    source_pdf_path,
+                )
 
                 md_path = output_subdir / f"{middle_path.name[:-len('_middle.json')]}.md"
                 image_dir = "images"
@@ -149,12 +156,14 @@ def apply_header_footer_filter(
                 corrected_rows = min_max_stats.get("rows_corrected", 0)
                 split_columns = min_max_stats.get("columns_added", 0)
                 nowrap_cells = min_max_stats.get("nowrap_cells", 0)
+                restored_breaks = line_break_stats.get("breaks_added", 0)
                 print(
                     f"  ✅ 页眉页脚/表格坐标校正: {md_path.name} "
                     f"({output_subdir.name}, 移除 {removed} 个 block, "
                     f"拆分 MIN/MAX 合并列 {split_columns} 个, "
                     f"修正 MIN/MAX 错位 {corrected_rows} 行, "
-                    f"保持数值单行 {nowrap_cells} 格)"
+                    f"保持数值单行 {nowrap_cells} 格, "
+                    f"恢复单元格换行 {restored_breaks} 处)"
                 )
                 filtered_count += 1
             except Exception as e:
@@ -175,6 +184,9 @@ if POST_TABLE_DIR.exists():
 from post_table.fix_ocr_table import fix_markdown_file  # noqa: E402
 from post_table.min_max_coordinate_correct import (  # noqa: E402
     correct_min_max_tables_in_middle_json,
+)
+from post_table.restore_cell_line_breaks import (  # noqa: E402
+    restore_cell_line_breaks_in_middle_json,
 )
 
 

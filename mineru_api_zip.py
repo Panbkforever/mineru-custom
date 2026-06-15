@@ -87,11 +87,15 @@ try:
     from post_table.min_max_coordinate_correct import (
         correct_min_max_tables_in_middle_json,
     )
+    from post_table.restore_cell_line_breaks import (
+        restore_cell_line_breaks_in_middle_json,
+    )
     POST_TABLE_AVAILABLE = True
     logging.info("post_table module loaded successfully")
 except ImportError as e:
     POST_TABLE_AVAILABLE = False
     correct_min_max_tables_in_middle_json = None
+    restore_cell_line_breaks_in_middle_json = None
     logging.warning("post_table module not available: %s", e)
 
 # =========================
@@ -258,6 +262,14 @@ def apply_header_footer_filter(output_dir: Path, source_pdf_path: Path | None = 
                     if correct_min_max_tables_in_middle_json is not None
                     else {}
                 )
+                line_break_stats = (
+                    restore_cell_line_breaks_in_middle_json(
+                        middle_json,
+                        source_pdf_path,
+                    )
+                    if restore_cell_line_breaks_in_middle_json is not None
+                    else {}
+                )
 
                 md_path = output_subdir / f"{middle_path.name[:-len('_middle.json')]}.md"
                 md_content = make_func(pdf_info, MakeMode.MM_MD, "images")
@@ -273,13 +285,15 @@ def apply_header_footer_filter(output_dir: Path, source_pdf_path: Path | None = 
                 logging.info(
                     "Header/footer and MIN/MAX alignment processed: %s "
                     "(%s, removed %d block(s), split %d merged column(s), "
-                    "corrected %d row(s), protected %d nowrap cell(s))",
+                    "corrected %d row(s), protected %d nowrap cell(s), "
+                    "restored %d cell break(s))",
                     md_path.name,
                     output_subdir.name,
                     stats.get("total_removed", 0),
                     min_max_stats.get("columns_added", 0),
                     min_max_stats.get("rows_corrected", 0),
                     min_max_stats.get("nowrap_cells", 0),
+                    line_break_stats.get("breaks_added", 0),
                 )
             except Exception as e:
                 logging.warning("Header/footer filter failed for %s: %s", middle_path, e)
