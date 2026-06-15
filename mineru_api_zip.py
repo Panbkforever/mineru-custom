@@ -247,8 +247,9 @@ def apply_header_footer_filter(output_dir: Path, source_pdf_path: Path | None = 
                     pdf_info,
                     pdf_path=source_pdf_path,
                 )
-                # 仅对有成对 MIN/MAX 表头且表格网格完整的表格进行坐标校正。
-                # PDF 原生文字坐标只负责确认值的位置，最终保留 VLM 原 HTML 内容。
+                # 对网格完整的表格修正 MIN/MAX 数值错位，并将 VLM 合并成
+                # 单格的 MIN MAX 拆回两个逻辑列。PDF 坐标只负责定位，
+                # 最终仍保留 VLM 原 HTML 内容。
                 min_max_stats = (
                     correct_min_max_tables_in_middle_json(
                         middle_json,
@@ -271,10 +272,12 @@ def apply_header_footer_filter(output_dir: Path, source_pdf_path: Path | None = 
                 removed_total += stats.get("total_removed", 0)
                 logging.info(
                     "Header/footer and MIN/MAX alignment processed: %s "
-                    "(%s, removed %d block(s), corrected %d row(s))",
+                    "(%s, removed %d block(s), split %d merged column(s), "
+                    "corrected %d row(s))",
                     md_path.name,
                     output_subdir.name,
                     stats.get("total_removed", 0),
+                    min_max_stats.get("columns_added", 0),
                     min_max_stats.get("rows_corrected", 0),
                 )
             except Exception as e:

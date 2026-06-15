@@ -5,10 +5,10 @@ The VLM may recognize all values correctly but place one value in the wrong
 HTML cell, especially in sparse multi-level MIN/MAX tables. This module only
 changes a row when all of the following are true:
 
-1. The expanded table header contains alternating MIN/MAX columns.
-2. The rendered table has a complete horizontal grid matching the HTML rows.
-3. PDF-native text extraction finds the same non-empty value sequence as HTML.
-4. Only the occupied MIN/MAX column positions differ.
+1. The table header contains separate or VLM-merged MIN/MAX columns.
+2. The rendered table has enough horizontal rules to identify its data rows.
+3. PDF-native text finds matching MIN/MAX headers and recognized values.
+4. Existing columns are only relocated; merged columns are split conservatively.
 
 The original HTML value strings are preserved; PDF text is used only as a
 coordinate reference for relocating them.
@@ -36,6 +36,8 @@ CELL_RE = re.compile(
 class MinMaxCorrectionStats:
     tables_checked: int = 0
     tables_matched: int = 0
+    tables_split: int = 0
+    columns_added: int = 0
     rows_corrected: int = 0
 
 
@@ -102,7 +104,7 @@ def correct_min_max_tables_in_middle_json(
                 continue
 
             expanded_html = expand_colspan(expand_rowspan(table_html))
-            corrected_html, matched, corrected_rows = _correct_one_table(
+            corrected_html, matched, split_columns, corrected_rows = _correct_one_table(
                 expanded_html=expanded_html,
                 bbox=[float(v) for v in bbox],
                 page=page,
@@ -113,6 +115,9 @@ def correct_min_max_tables_in_middle_json(
             )
             if matched:
                 stats.tables_matched += 1
+            if split_columns:
+                stats.tables_split += 1
+                stats.columns_added += split_columns
             stats.rows_corrected += corrected_rows
             correction_cache[cache_key] = corrected_html
             span["html"] = corrected_html
@@ -128,22 +133,30 @@ def _correct_one_table(
     page_height: float,
     cv2: Any,
     np: Any,
-) -> tuple[str, bool, int]:
+) -> tuple[str, bool, int, int]:
     rows = _parse_expanded_rows(expanded_html)
     if len(rows) < 3:
-        return expanded_html, False, 0
+        return expanded_html, False, 0, 0
+
+    horizontal_lines = _detect_horizontal_lines(page, bbox, cv2, np)
 
     header_row_index, value_column_indexes = _find_min_max_header(rows)
-    if header_row_index < 0 or len(value_column_indexes) < 2:
-        return expanded_html, False, 0
+    if header_row_index < 0:
+        return _split_merged_min_max_columns(
+            rows=rows,
+            bbox=bbox,
+            text_page=text_page,
+            page_height=page_height,
+            horizontal_lines=horizontal_lines,
+        )
+    if len(horizontal_lines) != len(rows) + 1:
+        return expanded_html, False, 0, 0
+    if len(value_column_indexes) < 2:
+        return expanded_html, False, 0, 0
 
     labels = [_plain_text(rows[header_row_index][i]["inner"]).upper() for i in value_column_indexes]
     if not _alternating_min_max(labels):
-        return expanded_html, False, 0
-
-    horizontal_lines = _detect_horizontal_lines(page, bbox, cv2, np)
-    if len(horizontal_lines) != len(rows) + 1:
-        return expanded_html, False, 0
+        return expanded_html, False, 0, 0
 
     header_y0 = horizontal_lines[header_row_index]
     header_y1 = horizontal_lines[header_row_index + 1]
@@ -155,12 +168,12 @@ def _correct_one_table(
         header_y1,
     )
     if [item[0] for item in pdf_headers] != labels:
-        return expanded_html, False, 0
+        return expanded_html, False, 0, 0
 
     centers = [item[1] for item in pdf_headers]
     x_ranges = _column_ranges_from_centers(centers, bbox[0], bbox[2])
     if len(x_ranges) != len(value_column_indexes):
-        return expanded_html, False, 0
+        return expanded_html, False, 0, 0
 
     corrected_rows = 0
     for row_index in range(header_row_index + 1, len(rows)):
@@ -212,8 +225,90 @@ def _correct_one_table(
         corrected_rows += 1
 
     if corrected_rows == 0:
-        return expanded_html, True, 0
-    return _rebuild_table(rows), True, corrected_rows
+        return expanded_html, True, 0, 0
+    return _rebuild_table(rows), True, 0, corrected_rows
+
+
+def _split_merged_min_max_columns(
+    rows: list[list[dict[str, str]]],
+    bbox: list[float],
+    text_page: Any,
+    page_height: float,
+    horizontal_lines: list[float],
+) -> tuple[str, bool, int, int]:
+    """Split cells where VLM collapsed one MIN/MAX pair into one HTML column."""
+    header_row_index, merged_indexes = _find_merged_min_max_header(rows)
+    if header_row_index < 0:
+        return _rebuild_table(rows), False, 0, 0
+
+    data_row_count = len(rows) - header_row_index - 1
+    if data_row_count <= 0 or len(horizontal_lines) < data_row_count + 2:
+        return _rebuild_table(rows), False, 0, 0
+
+    # Expanded rowspan headers may occupy one physical band even though they
+    # appear as several HTML rows. The final N+1 horizontal intervals always
+    # belong to the N data rows; everything above them is the header band.
+    data_lines = horizontal_lines[-(data_row_count + 1):]
+    header_y0 = horizontal_lines[0]
+    header_y1 = data_lines[0]
+    pdf_headers = _find_pdf_min_max_headers(
+        text_page,
+        bbox,
+        page_height,
+        header_y0,
+        header_y1,
+    )
+    labels = [item[0] for item in pdf_headers]
+    if len(pdf_headers) != len(merged_indexes) * 2 or not _alternating_min_max(labels):
+        return _rebuild_table(rows), False, 0, 0
+
+    centers = [item[1] for item in pdf_headers]
+    split_rows: list[list[dict[str, str]]] = []
+    corrected_rows = 0
+
+    for row_index, cells in enumerate(rows):
+        new_cells: list[dict[str, str]] = []
+        row_changed = False
+        merged_set = set(merged_indexes)
+        for column_index, cell in enumerate(cells):
+            if column_index not in merged_set:
+                new_cells.append(cell)
+                continue
+
+            group_index = merged_indexes.index(column_index)
+            min_center, max_center = centers[group_index * 2:group_index * 2 + 2]
+
+            if row_index < header_row_index:
+                left_inner = right_inner = cell["inner"]
+            elif row_index == header_row_index:
+                prefix = _merged_header_prefix(cell["inner"])
+                left_inner = f"{prefix} MIN".strip()
+                right_inner = f"{prefix} MAX".strip()
+            else:
+                data_index = row_index - header_row_index - 1
+                left_inner, right_inner = _place_merged_value(
+                    cell["inner"],
+                    text_page=text_page,
+                    left=min_center - (max_center - min_center) / 2.0,
+                    right=max_center + (max_center - min_center) / 2.0,
+                    min_center=min_center,
+                    max_center=max_center,
+                    row_y0=data_lines[data_index],
+                    row_y1=data_lines[data_index + 1],
+                    page_height=page_height,
+                )
+                if _plain_text(cell["inner"]):
+                    row_changed = True
+
+            new_cells.extend([
+                _clone_cell(cell, left_inner),
+                _clone_cell(cell, right_inner),
+            ])
+        split_rows.append(new_cells)
+        if row_changed:
+            corrected_rows += 1
+
+    return _rebuild_table(split_rows), True, len(merged_indexes), corrected_rows
 
 
 def _parse_expanded_rows(table_html: str) -> list[list[dict[str, str]]]:
@@ -238,6 +333,130 @@ def _find_min_max_header(rows: list[list[dict[str, str]]]) -> tuple[int, list[in
         if len(indexes) >= 2:
             return row_index, indexes
     return -1, []
+
+
+def _find_merged_min_max_header(
+    rows: list[list[dict[str, str]]],
+) -> tuple[int, list[int]]:
+    for row_index, cells in enumerate(rows):
+        indexes = [
+            index
+            for index, cell in enumerate(cells)
+            if re.search(r"MIN\s*MAX", _plain_text(cell["inner"]), re.IGNORECASE)
+        ]
+        if indexes:
+            return row_index, indexes
+    return -1, []
+
+
+def _merged_header_prefix(value: str) -> str:
+    text = _plain_text(value)
+    return re.sub(r"MIN\s*MAX.*$", "", text, flags=re.IGNORECASE).strip()
+
+
+def _clone_cell(cell: dict[str, str], inner: str) -> dict[str, str]:
+    return {
+        "open": cell["open"],
+        "inner": inner,
+        "close": cell["close"],
+    }
+
+
+def _place_merged_value(
+    html_value: str,
+    text_page: Any,
+    left: float,
+    right: float,
+    min_center: float,
+    max_center: float,
+    row_y0: float,
+    row_y1: float,
+    page_height: float,
+) -> tuple[str, str]:
+    if not _plain_text(html_value):
+        return "", ""
+
+    value_center = _find_pdf_value_center(
+        text_page=text_page,
+        value=_plain_text(html_value),
+        left=left,
+        right=right,
+        row_y0=row_y0,
+        row_y1=row_y1,
+        page_height=page_height,
+    )
+    if value_center is None:
+        # Keep the recognized value even when native PDF text cannot be matched.
+        return html_value, ""
+
+    pair_midpoint = (min_center + max_center) / 2.0
+    center_tolerance = (max_center - min_center) * 0.18
+    if abs(value_center - pair_midpoint) <= center_tolerance:
+        # A value centered across the unsplit pair semantically spans MIN/MAX.
+        return html_value, html_value
+    if value_center < pair_midpoint:
+        return html_value, ""
+    return "", html_value
+
+
+def _find_pdf_value_center(
+    text_page: Any,
+    value: str,
+    left: float,
+    right: float,
+    row_y0: float,
+    row_y1: float,
+    page_height: float,
+) -> float | None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        page_text = text_page.get_text_range()
+
+    normalized_text, char_indexes = _normalized_text_with_indexes(page_text)
+    needle = _normalize_value(value)
+    if not needle:
+        return None
+
+    start = 0
+    while True:
+        match_index = normalized_text.find(needle, start)
+        if match_index < 0:
+            return None
+        original_indexes = char_indexes[match_index:match_index + len(needle)]
+        boxes = []
+        for char_index in original_indexes:
+            try:
+                char_left, bottom, char_right, top = text_page.get_charbox(char_index)
+            except Exception:
+                boxes = []
+                break
+            boxes.append((
+                char_left,
+                page_height - top,
+                char_right,
+                page_height - bottom,
+            ))
+        if boxes:
+            x0 = min(box[0] for box in boxes)
+            x1 = max(box[2] for box in boxes)
+            y0 = min(box[1] for box in boxes)
+            y1 = max(box[3] for box in boxes)
+            center_x = (x0 + x1) / 2.0
+            center_y = (y0 + y1) / 2.0
+            if left <= center_x <= right and row_y0 <= center_y <= row_y1:
+                return center_x
+        start = match_index + 1
+
+
+def _normalized_text_with_indexes(value: str) -> tuple[str, list[int]]:
+    normalized_chars = []
+    indexes = []
+    for index, char in enumerate(value):
+        normalized = _normalize_value(char)
+        for normalized_char in normalized:
+            normalized_chars.append(normalized_char)
+            indexes.append(index)
+    return "".join(normalized_chars), indexes
 
 
 def _alternating_min_max(labels: list[str]) -> bool:
