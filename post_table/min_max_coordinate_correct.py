@@ -149,7 +149,13 @@ def _correct_one_table(
             page_height=page_height,
             horizontal_lines=horizontal_lines,
         )
-    if len(horizontal_lines) != len(rows) + 1:
+    row_bands = _resolve_row_bands(
+        rows=rows,
+        header_row_index=header_row_index,
+        horizontal_lines=horizontal_lines,
+        bbox=bbox,
+    )
+    if row_bands is None:
         return expanded_html, False, 0, 0
     if len(value_column_indexes) < 2:
         return expanded_html, False, 0, 0
@@ -158,8 +164,7 @@ def _correct_one_table(
     if not _alternating_min_max(labels):
         return expanded_html, False, 0, 0
 
-    header_y0 = horizontal_lines[header_row_index]
-    header_y1 = horizontal_lines[header_row_index + 1]
+    header_y0, header_y1, data_bands = row_bands
     pdf_headers = _find_pdf_min_max_headers(
         text_page,
         bbox,
@@ -186,8 +191,22 @@ def _correct_one_table(
         if not any(html_mask):
             continue
 
-        row_y0 = horizontal_lines[row_index]
-        row_y1 = horizontal_lines[row_index + 1]
+        data_index = row_index - header_row_index - 1
+        row_y0, row_y1 = data_bands[data_index]
+
+        if _correct_single_pdf_value_duplicated_in_html(
+            cells=cells,
+            value_column_indexes=value_column_indexes,
+            html_values=html_values,
+            centers=centers,
+            text_page=text_page,
+            row_y0=row_y0,
+            row_y1=row_y1,
+            page_height=page_height,
+        ):
+            corrected_rows += 1
+            continue
+
         pdf_values = [
             _extract_pdf_cell_text(
                 text_page,
@@ -227,6 +246,81 @@ def _correct_one_table(
     if corrected_rows == 0:
         return expanded_html, True, 0, 0
     return _rebuild_table(rows), True, 0, corrected_rows
+
+
+def _resolve_row_bands(
+    rows: list[list[dict[str, str]]],
+    header_row_index: int,
+    horizontal_lines: list[float],
+    bbox: list[float],
+) -> tuple[float, float, list[tuple[float, float]]] | None:
+    data_row_count = len(rows) - header_row_index - 1
+    if data_row_count <= 0 or len(horizontal_lines) < data_row_count + 1:
+        return None
+
+    data_lines = horizontal_lines[-(data_row_count + 1):]
+    data_bands = list(zip(data_lines, data_lines[1:]))
+    header_y1 = data_lines[0]
+
+    # Some MinerU table bboxes start just below the physical top border, so
+    # OpenCV finds only len(rows) lines instead of len(rows) + 1. The bbox top
+    # still safely bounds the complete multi-row header.
+    header_y0 = horizontal_lines[0] if horizontal_lines else bbox[1]
+    header_y0 = min(header_y0, bbox[1] + 2.5)
+    if header_y1 <= header_y0:
+        return None
+    return header_y0, header_y1, data_bands
+
+
+def _correct_single_pdf_value_duplicated_in_html(
+    cells: list[dict[str, str]],
+    value_column_indexes: list[int],
+    html_values: list[str],
+    centers: list[float],
+    text_page: Any,
+    row_y0: float,
+    row_y1: float,
+    page_height: float,
+) -> bool:
+    changed = False
+    for pair_start in range(0, len(value_column_indexes), 2):
+        min_column = value_column_indexes[pair_start]
+        max_column = value_column_indexes[pair_start + 1]
+        min_value = html_values[pair_start]
+        max_value = html_values[pair_start + 1]
+        plain_value = _plain_text(min_value)
+        if (
+            not plain_value
+            or _normalize_value(plain_value) != _normalize_value(_plain_text(max_value))
+        ):
+            continue
+
+        min_center = centers[pair_start]
+        max_center = centers[pair_start + 1]
+        gap = max_center - min_center
+        value_centers = _find_pdf_value_centers(
+            text_page=text_page,
+            value=plain_value,
+            left=min_center - gap / 2.0,
+            right=max_center + gap / 2.0,
+            row_y0=row_y0,
+            row_y1=row_y1,
+            page_height=page_height,
+        )
+        if len(value_centers) != 1:
+            continue
+
+        # One PDF text object cannot represent two independent cell values.
+        # Assign it to the nearest logical column; an exact center tie defaults
+        # to MIN, which is the conventional placement for a single requirement.
+        if abs(value_centers[0] - min_center) <= abs(value_centers[0] - max_center):
+            cells[min_column]["inner"] = min_value
+            cells[max_column]["inner"] = ""
+        else:
+            cells[min_column]["inner"] = ""
+            cells[max_column]["inner"] = max_value
+        changed = True
+    return changed
 
 
 def _split_merged_min_max_columns(
@@ -408,6 +502,27 @@ def _find_pdf_value_center(
     row_y1: float,
     page_height: float,
 ) -> float | None:
+    centers = _find_pdf_value_centers(
+        text_page=text_page,
+        value=value,
+        left=left,
+        right=right,
+        row_y0=row_y0,
+        row_y1=row_y1,
+        page_height=page_height,
+    )
+    return centers[0] if centers else None
+
+
+def _find_pdf_value_centers(
+    text_page: Any,
+    value: str,
+    left: float,
+    right: float,
+    row_y0: float,
+    row_y1: float,
+    page_height: float,
+) -> list[float]:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         page_text = text_page.get_text_range()
@@ -415,13 +530,14 @@ def _find_pdf_value_center(
     normalized_text, char_indexes = _normalized_text_with_indexes(page_text)
     needle = _normalize_value(value)
     if not needle:
-        return None
+        return []
 
+    centers = []
     start = 0
     while True:
         match_index = normalized_text.find(needle, start)
         if match_index < 0:
-            return None
+            return centers
         original_indexes = char_indexes[match_index:match_index + len(needle)]
         boxes = []
         for char_index in original_indexes:
@@ -444,7 +560,7 @@ def _find_pdf_value_center(
             center_x = (x0 + x1) / 2.0
             center_y = (y0 + y1) / 2.0
             if left <= center_x <= right and row_y0 <= center_y <= row_y1:
-                return center_x
+                centers.append(center_x)
         start = match_index + 1
 
 
