@@ -148,11 +148,13 @@ def apply_header_footer_filter(
                 removed = stats.get("total_removed", 0)
                 corrected_rows = min_max_stats.get("rows_corrected", 0)
                 split_columns = min_max_stats.get("columns_added", 0)
+                nowrap_cells = min_max_stats.get("nowrap_cells", 0)
                 print(
                     f"  ✅ 页眉页脚/表格坐标校正: {md_path.name} "
                     f"({output_subdir.name}, 移除 {removed} 个 block, "
                     f"拆分 MIN/MAX 合并列 {split_columns} 个, "
-                    f"修正 MIN/MAX 错位 {corrected_rows} 行)"
+                    f"修正 MIN/MAX 错位 {corrected_rows} 行, "
+                    f"保持数值单行 {nowrap_cells} 格)"
                 )
                 filtered_count += 1
             except Exception as e:

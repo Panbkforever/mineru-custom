@@ -273,12 +273,13 @@ def apply_header_footer_filter(output_dir: Path, source_pdf_path: Path | None = 
                 logging.info(
                     "Header/footer and MIN/MAX alignment processed: %s "
                     "(%s, removed %d block(s), split %d merged column(s), "
-                    "corrected %d row(s))",
+                    "corrected %d row(s), protected %d nowrap cell(s))",
                     md_path.name,
                     output_subdir.name,
                     stats.get("total_removed", 0),
                     min_max_stats.get("columns_added", 0),
                     min_max_stats.get("rows_corrected", 0),
+                    min_max_stats.get("nowrap_cells", 0),
                 )
             except Exception as e:
                 logging.warning("Header/footer filter failed for %s: %s", middle_path, e)

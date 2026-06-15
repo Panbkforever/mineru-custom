@@ -39,6 +39,7 @@ class MinMaxCorrectionStats:
     tables_split: int = 0
     columns_added: int = 0
     rows_corrected: int = 0
+    nowrap_cells: int = 0
 
 
 def correct_min_max_tables_in_middle_json(
@@ -113,12 +114,16 @@ def correct_min_max_tables_in_middle_json(
                 cv2=cv2,
                 np=np,
             )
+            corrected_html, nowrap_cells = _protect_numeric_value_spacing(
+                corrected_html
+            )
             if matched:
                 stats.tables_matched += 1
             if split_columns:
                 stats.tables_split += 1
                 stats.columns_added += split_columns
             stats.rows_corrected += corrected_rows
+            stats.nowrap_cells += nowrap_cells
             correction_cache[cache_key] = corrected_html
             span["html"] = corrected_html
 
@@ -481,6 +486,64 @@ def _parse_expanded_rows(table_html: str) -> list[list[dict[str, str]]]:
         if row:
             rows.append(row)
     return rows
+
+
+def _protect_numeric_value_spacing(table_html: str) -> tuple[str, int]:
+    """Prevent short MIN/TYP/NOM/MAX expressions from wrapping at spaces."""
+    rows = _parse_expanded_rows(table_html)
+    if len(rows) < 2:
+        return table_html, 0
+
+    header_row_index = -1
+    value_indexes: list[int] = []
+    value_labels = {"MIN", "TYP", "NOM", "MAX"}
+    for row_index, cells in enumerate(rows):
+        labels = [_plain_text(cell["inner"]).upper() for cell in cells]
+        indexes = [
+            index for index, label in enumerate(labels)
+            if label in value_labels
+        ]
+        if indexes:
+            header_row_index = row_index
+            value_indexes = indexes
+
+    if header_row_index < 0:
+        return table_html, 0
+
+    changed = 0
+    for cells in rows[header_row_index + 1:]:
+        for column_index in value_indexes:
+            if column_index >= len(cells):
+                continue
+            inner = cells[column_index]["inner"]
+            plain = _plain_text(inner)
+            if not _is_short_numeric_expression(plain):
+                continue
+            protected = _replace_text_spaces_with_nbsp(inner)
+            if protected != inner:
+                cells[column_index]["inner"] = protected
+                changed += 1
+
+    if changed == 0:
+        return table_html, 0
+    return _rebuild_table(rows), changed
+
+
+def _is_short_numeric_expression(value: str) -> bool:
+    if not value or len(value) > 40 or not re.search(r"\s", value):
+        return False
+    if len(value.split()) > 8:
+        return False
+    # Value columns contain compact limits/formulas. Require at least one
+    # digit or arithmetic operator so ordinary prose is never made nowrap.
+    return bool(re.search(r"\d|[+\-*/=]", value))
+
+
+def _replace_text_spaces_with_nbsp(value: str) -> str:
+    parts = re.split(r"(<[^>]+>)", value)
+    for index in range(0, len(parts), 2):
+        parts[index] = re.sub(r"[ \t\r\n]+", "&nbsp;", parts[index])
+    return "".join(parts)
 
 
 def _find_min_max_header(rows: list[list[dict[str, str]]]) -> tuple[int, list[int]]:
