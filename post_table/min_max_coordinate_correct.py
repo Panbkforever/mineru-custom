@@ -41,6 +41,7 @@ class MinMaxCorrectionStats:
     columns_added: int = 0
     rows_corrected: int = 0
     nowrap_cells: int = 0
+    pin_attribute_rows_repaired: int = 0
 
 
 def correct_min_max_tables_in_middle_json(
@@ -123,6 +124,10 @@ def correct_min_max_tables_in_middle_json(
             corrected_html, nowrap_cells = _protect_numeric_value_spacing(
                 corrected_html
             )
+            (
+                corrected_html,
+                pin_attribute_rows_repaired,
+            ) = _repair_pin_attributes_continuation_rows(corrected_html)
             if matched:
                 stats.tables_matched += 1
             if split_columns:
@@ -130,6 +135,7 @@ def correct_min_max_tables_in_middle_json(
                 stats.columns_added += split_columns
             stats.rows_corrected += corrected_rows
             stats.nowrap_cells += nowrap_cells
+            stats.pin_attribute_rows_repaired += pin_attribute_rows_repaired
             correction_cache[cache_key] = corrected_html
             span["html"] = corrected_html
 
@@ -236,6 +242,26 @@ def _correct_one_table(
         )
         if row_corrected:
             corrected_rows += 1
+            html_values = [cells[i]["inner"] for i in value_column_indexes]
+            html_mask = [bool(_plain_text(value)) for value in html_values]
+
+        center_corrected = _correct_values_by_pdf_centers(
+            cells=cells,
+            value_column_indexes=value_column_indexes,
+            html_values=html_values,
+            centers=centers,
+            x_ranges=x_ranges,
+            value_groups=value_groups,
+            explicit_colspans=row_explicit_colspans,
+            text_page=text_page,
+            row_y0=row_y0,
+            row_y1=row_y1,
+            page_height=page_height,
+        )
+        if center_corrected:
+            if not row_corrected:
+                corrected_rows += 1
+            row_corrected = True
             html_values = [cells[i]["inner"] for i in value_column_indexes]
             html_mask = [bool(_plain_text(value)) for value in html_values]
 
@@ -390,6 +416,167 @@ def _correct_single_pdf_value_duplicated_in_html(
                 )
             changed = True
     return changed
+
+
+def _correct_values_by_pdf_centers(
+    cells: list[dict[str, str]],
+    value_column_indexes: list[int],
+    html_values: list[str],
+    centers: list[float],
+    x_ranges: list[tuple[float, float]],
+    value_groups: list[tuple[int, int]],
+    explicit_colspans: list[tuple[int, int]],
+    text_page: Any,
+    row_y0: float,
+    row_y1: float,
+    page_height: float,
+) -> bool:
+    """Relocate non-duplicated values whose PDF text centers prove a shift."""
+    changed = False
+    for group_start, group_end in value_groups:
+        group_positions = list(range(group_start, group_end))
+        group_columns = [
+            value_column_indexes[position]
+            for position in group_positions
+        ]
+        group_centers = centers[group_start:group_end]
+        if len(group_centers) < 2:
+            continue
+
+        html_non_empty = [
+            position
+            for position in group_positions
+            if _plain_text(html_values[position])
+        ]
+        if len(html_non_empty) < 2:
+            continue
+
+        duplicate_check: dict[str, list[int]] = {}
+        for position in html_non_empty:
+            duplicate_check.setdefault(
+                _normalize_value(_plain_text(html_values[position])),
+                [],
+            ).append(position)
+        if any(len(positions) > 1 for positions in duplicate_check.values()):
+            continue
+
+        left_gap = group_centers[1] - group_centers[0]
+        right_gap = group_centers[-1] - group_centers[-2]
+        group_left = group_centers[0] - left_gap / 2.0
+        group_right = group_centers[-1] + right_gap / 2.0
+
+        assignments: dict[int, int] = {}
+        for position in html_non_empty:
+            plain_value = _plain_text(html_values[position])
+            centers_for_value = _find_pdf_value_centers(
+                text_page=text_page,
+                value=plain_value,
+                left=group_left,
+                right=group_right,
+                row_y0=row_y0,
+                row_y1=row_y1,
+                page_height=page_height,
+            )
+            if len(centers_for_value) == 1:
+                target_position = min(
+                    group_positions,
+                    key=lambda candidate: abs(
+                        centers[candidate] - centers_for_value[0]
+                    ),
+                )
+            else:
+                target_position = _find_unique_pdf_value_column(
+                    text_page=text_page,
+                    value=plain_value,
+                    x_ranges=x_ranges,
+                    group_positions=group_positions,
+                    row_y0=row_y0,
+                    row_y1=row_y1,
+                    page_height=page_height,
+                )
+            if target_position is None:
+                assignments = {}
+                break
+            if target_position in assignments.values():
+                assignments = {}
+                break
+            assignments[position] = target_position
+
+        if not assignments:
+            continue
+        if all(source == target for source, target in assignments.items()):
+            continue
+
+        # Do not collapse an intentional full-span shared value; those are
+        # handled by the duplicated-value branch.
+        if any(
+            _preserve_explicit_value_span(
+                value=_plain_text(html_values[source]),
+                duplicate_columns=group_columns,
+                group_columns=group_columns,
+                explicit_colspans=explicit_colspans,
+                value_center=centers[target],
+                group_centers=group_centers,
+            )
+            for source, target in assignments.items()
+        ):
+            continue
+
+        relocated = {target: html_values[source] for source, target in assignments.items()}
+        for position in group_positions:
+            column_index = value_column_indexes[position]
+            cells[column_index]["inner"] = relocated.get(position, "")
+        changed = True
+    return changed
+
+
+def _find_unique_pdf_value_column(
+    text_page: Any,
+    value: str,
+    x_ranges: list[tuple[float, float]],
+    group_positions: list[int],
+    row_y0: float,
+    row_y1: float,
+    page_height: float,
+) -> int | None:
+    """Find the one value column whose PDF cell text contains this value."""
+    matches: list[int] = []
+    for position in group_positions:
+        if position >= len(x_ranges):
+            continue
+        left, right = x_ranges[position]
+        pdf_cell_text = _extract_pdf_cell_text(
+            text_page,
+            left,
+            right,
+            row_y0,
+            row_y1,
+            page_height,
+        )
+        if _pdf_cell_text_contains_value(pdf_cell_text, value):
+            matches.append(position)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _pdf_cell_text_contains_value(pdf_text: str, value: str) -> bool:
+    normalized_text = _normalize_value(pdf_text)
+    needle = _normalize_value(value)
+    if not normalized_text or not needle:
+        return False
+
+    start = 0
+    while True:
+        match_index = normalized_text.find(needle, start)
+        if match_index < 0:
+            return False
+        if _normalized_match_has_value_boundaries(
+            normalized_text,
+            match_index,
+            len(needle),
+            needle,
+        ):
+            return True
+        start = match_index + 1
 
 
 def _preserve_explicit_value_span(
@@ -620,6 +807,125 @@ def _protect_numeric_value_spacing(table_html: str) -> tuple[str, int]:
     return _rebuild_table(rows), changed
 
 
+def _repair_pin_attributes_continuation_rows(table_html: str) -> tuple[str, int]:
+    """Restore stable fields for Pin Attributes continuation rows."""
+    rows = _parse_expanded_rows(table_html)
+    if len(rows) < 3:
+        return table_html, 0
+
+    header_index, columns = _find_pin_attributes_header(rows)
+    if header_index < 0:
+        return table_html, 0
+
+    repaired = 0
+    for row_index in range(header_index + 1, len(rows)):
+        cells = rows[row_index]
+        ball_col = columns["ball_num"]
+        if ball_col >= len(cells):
+            continue
+        if not _looks_like_ball_number_list(cells[ball_col]["inner"]):
+            continue
+
+        repair_values: dict[int, str] = {}
+        for column_name in ("ball_name", "signal_name", "signal_type"):
+            column_index = columns[column_name]
+            if column_index >= len(cells) or _plain_text(cells[column_index]["inner"]):
+                continue
+            value = _nearest_pin_continuation_value(
+                rows=rows,
+                row_index=row_index,
+                column_index=column_index,
+                columns=columns,
+            )
+            if value:
+                repair_values[column_index] = value
+
+        if not repair_values:
+            continue
+        for column_index, value in repair_values.items():
+            cells[column_index]["inner"] = value
+        repaired += 1
+
+    if repaired == 0:
+        return table_html, 0
+    return _rebuild_table(rows), repaired
+
+
+def _find_pin_attributes_header(
+    rows: list[list[dict[str, str]]],
+) -> tuple[int, dict[str, int]]:
+    for row_index, cells in enumerate(rows[:3]):
+        labels = [_normalize_header_label(_plain_text(cell["inner"])) for cell in cells]
+        columns = {
+            "ball_num": _first_label_index(labels, "ballnum"),
+            "ball_name": _first_label_index(labels, "ballname"),
+            "signal_name": _first_label_index(labels, "signalname"),
+            "signal_type": _first_label_index(labels, "signaltype"),
+        }
+        if all(index >= 0 for index in columns.values()):
+            return row_index, columns
+    return -1, {}
+
+
+def _normalize_header_label(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _first_label_index(labels: list[str], needle: str) -> int:
+    for index, label in enumerate(labels):
+        if needle in label:
+            return index
+    return -1
+
+
+def _looks_like_ball_number_list(value: str) -> bool:
+    text = _plain_text(value)
+    if not text:
+        return False
+    tokens = re.findall(r"\b[A-Z]{1,2}\d{1,2}\b", text)
+    return len(tokens) >= 3
+
+
+def _nearest_pin_continuation_value(
+    rows: list[list[dict[str, str]]],
+    row_index: int,
+    column_index: int,
+    columns: dict[str, int],
+) -> str:
+    # VLM may split one tall continuation row into adjacent visual rows.
+    # Prefer the nearest row that already carries the VSS continuation labels.
+    for offset in (1, 2):
+        for candidate_index in (row_index - offset, row_index + offset):
+            if candidate_index < 0 or candidate_index >= len(rows):
+                continue
+            candidate = rows[candidate_index]
+            if column_index >= len(candidate):
+                continue
+            value = candidate[column_index]["inner"]
+            if not _plain_text(value):
+                continue
+            if _is_vss_pin_continuation_row(candidate, columns):
+                return value
+    return ""
+
+
+def _is_vss_pin_continuation_row(
+    cells: list[dict[str, str]],
+    columns: dict[str, int],
+) -> bool:
+    def col_text(name: str) -> str:
+        index = columns[name]
+        if index >= len(cells):
+            return ""
+        return _plain_text(cells[index]["inner"]).upper()
+
+    return (
+        col_text("ball_name").startswith("VSS")
+        and col_text("signal_name") == "VSS"
+        and col_text("signal_type") == "GND"
+    )
+
+
 def _is_short_numeric_expression(value: str) -> bool:
     if not value or len(value) > 40 or not re.search(r"\s", value):
         return False
@@ -800,6 +1106,14 @@ def _find_pdf_value_centers(
         match_index = normalized_text.find(needle, start)
         if match_index < 0:
             return centers
+        if not _normalized_match_has_value_boundaries(
+            normalized_text,
+            match_index,
+            len(needle),
+            needle,
+        ):
+            start = match_index + 1
+            continue
         original_indexes = char_indexes[match_index:match_index + len(needle)]
         boxes = []
         for char_index in original_indexes:
@@ -824,6 +1138,35 @@ def _find_pdf_value_centers(
             if left <= center_x <= right and row_y0 <= center_y <= row_y1:
                 centers.append(center_x)
         start = match_index + 1
+
+
+def _normalized_match_has_value_boundaries(
+    normalized_text: str,
+    match_index: int,
+    match_length: int,
+    needle: str,
+) -> bool:
+    before = normalized_text[match_index - 1] if match_index > 0 else ""
+    after_index = match_index + match_length
+    after = normalized_text[after_index] if after_index < len(normalized_text) else ""
+
+    # Prevent a short limit such as "2" from matching the first digit of
+    # another value such as "257". Pure numbers may be followed by units or
+    # OCR residue, but cannot be glued to another digit or decimal point.
+    if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", needle):
+        if before and (before.isdigit() or before == "."):
+            return False
+        if after and (after.isdigit() or after == "."):
+            return False
+        return True
+
+    # Non-numeric values still need stricter token boundaries so a short
+    # expression is not found inside a longer symbol.
+    if before and (before.isalnum() or before in "._"):
+        return False
+    if after and (after.isalnum() or after in "._"):
+        return False
+    return True
 
 
 def _normalized_text_with_indexes(value: str) -> tuple[str, list[int]]:

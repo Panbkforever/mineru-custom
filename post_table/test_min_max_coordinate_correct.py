@@ -3,10 +3,13 @@ from unittest.mock import patch
 
 from post_table.expand_rowspan import expand_colspan, expand_rowspan
 from post_table.min_max_coordinate_correct import (
+    _correct_values_by_pdf_centers,
     _correct_single_pdf_value_duplicated_in_html,
     _find_explicit_colspan_ranges,
+    _pdf_cell_text_contains_value,
     _parse_expanded_rows,
     _preserve_explicit_value_span,
+    _repair_pin_attributes_continuation_rows,
     _value_header_groups,
 )
 
@@ -106,6 +109,70 @@ class MinMaxCoordinateCorrectTest(unittest.TestCase):
                 value_center=200.0,
                 group_centers=[100.0, 200.0, 300.0],
             )
+        )
+
+    def test_non_duplicate_values_are_relocated_by_pdf_centers(self):
+        cells = [
+            {"open": "<td>", "inner": "", "close": "</td>"},
+            {"open": "<td>", "inner": "2", "close": "</td>"},
+            {"open": "<td>", "inner": "257", "close": "</td>"},
+        ]
+
+        def fake_centers(**kwargs):
+            if kwargs["value"] == "2":
+                return [100.0]
+            if kwargs["value"] == "257":
+                return [300.0]
+            return []
+
+        with patch(
+            "post_table.min_max_coordinate_correct._find_pdf_value_centers",
+            side_effect=fake_centers,
+        ):
+            changed = _correct_values_by_pdf_centers(
+                cells=cells,
+                value_column_indexes=[0, 1, 2],
+                html_values=[cell["inner"] for cell in cells],
+                centers=[100.0, 200.0, 300.0],
+                x_ranges=[(50.0, 150.0), (150.0, 250.0), (250.0, 350.0)],
+                value_groups=[(0, 3)],
+                explicit_colspans=[],
+                text_page=object(),
+                row_y0=0.0,
+                row_y1=10.0,
+                page_height=100.0,
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual([cell["inner"] for cell in cells], ["2", "", "257"])
+
+    def test_short_value_does_not_match_inside_longer_number(self):
+        self.assertTrue(_pdf_cell_text_contains_value("2", "2"))
+        self.assertTrue(_pdf_cell_text_contains_value("257 AD SMP K C", "257"))
+        self.assertFalse(_pdf_cell_text_contains_value("257 AD SMP K C", "2"))
+
+    def test_pin_attributes_continuation_row_restores_vss_fields(self):
+        table = (
+            "<table>"
+            "<tr><td>Ball Num [1]</td><td>Ball Name [2]</td>"
+            "<td>Signal Name [3]</td><td>Signal Type [4]</td>"
+            "<td>Mux Mode [5]</td></tr>"
+            "<tr><td>G18, G19, G20</td><td>VSS (continued)</td>"
+            "<td>VSS</td><td>GND</td><td></td></tr>"
+            "<tr><td>U3, U30, V20, W1</td><td></td>"
+            "<td></td><td></td><td></td></tr>"
+            "<tr><td>W11, W12, Y8</td><td>VSS (continued)</td>"
+            "<td>VSS</td><td>GND</td><td></td></tr>"
+            "</table>"
+        )
+
+        repaired, count = _repair_pin_attributes_continuation_rows(table)
+        rows = _parse_expanded_rows(repaired)
+
+        self.assertEqual(count, 1)
+        self.assertEqual(
+            [cell["inner"] for cell in rows[2][1:4]],
+            ["VSS (continued)", "VSS", "GND"],
         )
 
 
