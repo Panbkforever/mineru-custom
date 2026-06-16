@@ -62,6 +62,7 @@ def correct_min_max_tables_in_middle_json(
         import numpy as np
         import pypdfium2 as pdfium
         from post_table.expand_rowspan import expand_colspan, expand_rowspan
+        from post_table.超长表格处理 import repair_ultra_long_table_html
     except Exception:
         return stats.__dict__
 
@@ -127,7 +128,7 @@ def correct_min_max_tables_in_middle_json(
             (
                 corrected_html,
                 pin_attribute_rows_repaired,
-            ) = _repair_pin_attributes_continuation_rows(corrected_html)
+            ) = repair_ultra_long_table_html(corrected_html)
             if matched:
                 stats.tables_matched += 1
             if split_columns:
@@ -805,125 +806,6 @@ def _protect_numeric_value_spacing(table_html: str) -> tuple[str, int]:
     if changed == 0:
         return table_html, 0
     return _rebuild_table(rows), changed
-
-
-def _repair_pin_attributes_continuation_rows(table_html: str) -> tuple[str, int]:
-    """Restore stable fields for Pin Attributes continuation rows."""
-    rows = _parse_expanded_rows(table_html)
-    if len(rows) < 3:
-        return table_html, 0
-
-    header_index, columns = _find_pin_attributes_header(rows)
-    if header_index < 0:
-        return table_html, 0
-
-    repaired = 0
-    for row_index in range(header_index + 1, len(rows)):
-        cells = rows[row_index]
-        ball_col = columns["ball_num"]
-        if ball_col >= len(cells):
-            continue
-        if not _looks_like_ball_number_list(cells[ball_col]["inner"]):
-            continue
-
-        repair_values: dict[int, str] = {}
-        for column_name in ("ball_name", "signal_name", "signal_type"):
-            column_index = columns[column_name]
-            if column_index >= len(cells) or _plain_text(cells[column_index]["inner"]):
-                continue
-            value = _nearest_pin_continuation_value(
-                rows=rows,
-                row_index=row_index,
-                column_index=column_index,
-                columns=columns,
-            )
-            if value:
-                repair_values[column_index] = value
-
-        if not repair_values:
-            continue
-        for column_index, value in repair_values.items():
-            cells[column_index]["inner"] = value
-        repaired += 1
-
-    if repaired == 0:
-        return table_html, 0
-    return _rebuild_table(rows), repaired
-
-
-def _find_pin_attributes_header(
-    rows: list[list[dict[str, str]]],
-) -> tuple[int, dict[str, int]]:
-    for row_index, cells in enumerate(rows[:3]):
-        labels = [_normalize_header_label(_plain_text(cell["inner"])) for cell in cells]
-        columns = {
-            "ball_num": _first_label_index(labels, "ballnum"),
-            "ball_name": _first_label_index(labels, "ballname"),
-            "signal_name": _first_label_index(labels, "signalname"),
-            "signal_type": _first_label_index(labels, "signaltype"),
-        }
-        if all(index >= 0 for index in columns.values()):
-            return row_index, columns
-    return -1, {}
-
-
-def _normalize_header_label(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", value.lower())
-
-
-def _first_label_index(labels: list[str], needle: str) -> int:
-    for index, label in enumerate(labels):
-        if needle in label:
-            return index
-    return -1
-
-
-def _looks_like_ball_number_list(value: str) -> bool:
-    text = _plain_text(value)
-    if not text:
-        return False
-    tokens = re.findall(r"\b[A-Z]{1,2}\d{1,2}\b", text)
-    return len(tokens) >= 3
-
-
-def _nearest_pin_continuation_value(
-    rows: list[list[dict[str, str]]],
-    row_index: int,
-    column_index: int,
-    columns: dict[str, int],
-) -> str:
-    # VLM may split one tall continuation row into adjacent visual rows.
-    # Prefer the nearest row that already carries the VSS continuation labels.
-    for offset in (1, 2):
-        for candidate_index in (row_index - offset, row_index + offset):
-            if candidate_index < 0 or candidate_index >= len(rows):
-                continue
-            candidate = rows[candidate_index]
-            if column_index >= len(candidate):
-                continue
-            value = candidate[column_index]["inner"]
-            if not _plain_text(value):
-                continue
-            if _is_vss_pin_continuation_row(candidate, columns):
-                return value
-    return ""
-
-
-def _is_vss_pin_continuation_row(
-    cells: list[dict[str, str]],
-    columns: dict[str, int],
-) -> bool:
-    def col_text(name: str) -> str:
-        index = columns[name]
-        if index >= len(cells):
-            return ""
-        return _plain_text(cells[index]["inner"]).upper()
-
-    return (
-        col_text("ball_name").startswith("VSS")
-        and col_text("signal_name") == "VSS"
-        and col_text("signal_type") == "GND"
-    )
 
 
 def _is_short_numeric_expression(value: str) -> bool:
