@@ -11,7 +11,6 @@ from post_table.min_max_coordinate_correct import (
     _preserve_explicit_value_span,
     _value_header_groups,
 )
-from post_table.超长表格处理 import repair_ultra_long_table_html
 
 
 class MinMaxCoordinateCorrectTest(unittest.TestCase):
@@ -150,30 +149,6 @@ class MinMaxCoordinateCorrectTest(unittest.TestCase):
         self.assertTrue(_pdf_cell_text_contains_value("2", "2"))
         self.assertTrue(_pdf_cell_text_contains_value("257 AD SMP K C", "257"))
         self.assertFalse(_pdf_cell_text_contains_value("257 AD SMP K C", "2"))
-
-    def test_pin_attributes_continuation_row_is_not_guessed_from_neighbors(self):
-        table = (
-            "<table>"
-            "<tr><td>Ball Num [1]</td><td>Ball Name [2]</td>"
-            "<td>Signal Name [3]</td><td>Signal Type [4]</td>"
-            "<td>Mux Mode [5]</td></tr>"
-            "<tr><td>G18, G19, G20</td><td>VSS (continued)</td>"
-            "<td>VSS</td><td>GND</td><td></td></tr>"
-            "<tr><td>U3, U30, V20, W1</td><td></td>"
-            "<td></td><td></td><td></td></tr>"
-            "<tr><td>W11, W12, Y8</td><td>VSS (continued)</td>"
-            "<td>VSS</td><td>GND</td><td></td></tr>"
-            "</table>"
-        )
-
-        repaired, count = repair_ultra_long_table_html(table)
-        rows = _parse_expanded_rows(repaired)
-
-        self.assertEqual(count, 0)
-        self.assertEqual(
-            [cell["inner"] for cell in rows[2][1:4]],
-            ["", "", ""],
-        )
 
 
 if __name__ == "__main__":

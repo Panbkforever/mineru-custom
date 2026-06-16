@@ -62,7 +62,9 @@ def correct_min_max_tables_in_middle_json(
         import numpy as np
         import pypdfium2 as pdfium
         from post_table.expand_rowspan import expand_colspan, expand_rowspan
-        from post_table.超长表格处理 import repair_ultra_long_table_html
+        from post_table.ultra_long_table_processing import (
+            repair_ultra_long_table_html,
+        )
     except Exception:
         return stats.__dict__
 
