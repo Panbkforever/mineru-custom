@@ -32,6 +32,17 @@ PACKAGE_HEADER_RE = re.compile(
     r"abc|alw|alz|anf|anj|zqw|pwp|rgy|rsm|rge|rte)\b",
     re.IGNORECASE,
 )
+PACKAGE_FAMILY_RE = re.compile(
+    r"\b(qfp|lqfp|tqfp|htqfp|vqfn|vssop|ssop|tssop|qfn|bga|pbga|nfbga|"
+    r"fcbga|soic|sop|pdip|pga|clcc|lccc|dfn|wqfn)\b",
+    re.IGNORECASE,
+)
+PACKAGE_CODE_RE = re.compile(
+    r"\b(pm|pt|pn|pnp|pzp|pz|peu|rgc|rtd|rgz|rhb|rsh|dgs\d*|da|pw|n|rsa|"
+    r"zce\d*[a-z]*|nzn\d*[a-z]*|zwt|zjz|zhh|zay|alv|alx|am[a-z]|abc|alw|"
+    r"alz|anf|anj|zqw|pwp|rgy|rsm|rge|rte)\b",
+    re.IGNORECASE,
+)
 PIN_FIELD_ORDER = [
     "pin_no",
     "pin_name",
@@ -102,6 +113,15 @@ class ExtractedGroup:
     pin_list: list[dict[str, Any]] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class PackageIdentity:
+    display: str
+    key: str
+    pin_count: str = ""
+    family: str = ""
+    code: str = ""
+
+
 def extract_pin_package_info_from_middle_json(
     middle_json: dict[str, Any],
     source_name: str = "",
@@ -122,7 +142,7 @@ def extract_pin_package_info_from_middle_json(
         if is_ordering_table(headers):
             continue
 
-        decisions = classify_columns(headers, rows[header_index + 1:])
+        decisions = classify_columns(headers, rows[header_index + 1:], table.title)
         if not is_pin_package_table(decisions):
             continue
 
@@ -143,16 +163,19 @@ def extract_pin_package_info_from_middle_json(
                 raw_fields = pin_record.pop("_raw_fields", None)
                 if include_debug and raw_fields:
                     pin_record["raw_fields"] = raw_fields
-                package_bucket = packages.setdefault(
-                    record_pkg,
-                    {"pkg": record_pkg, "group_list": [], "_groups": {}},
+                package_identity = build_package_identity(record_pkg)
+                package_bucket = get_package_bucket(
+                    packages,
+                    package_identity,
+                    pin_record,
+                    current_group_name,
                 )
                 current_group = get_or_create_group(package_bucket, current_group_name)
                 if include_debug and source_name:
                     pin_record.setdefault("source", source_name)
                 if include_debug and table.page_idx is not None:
                     pin_record.setdefault("source_page", table.page_idx + 1)
-                current_group.pin_list.append(pin_record)
+                add_pin_record_to_group(current_group, pin_record)
 
     result = []
     for package_bucket in packages.values():
@@ -162,7 +185,10 @@ def extract_pin_package_info_from_middle_json(
             if group.pin_list
         ]
         if groups:
-            result.append({"pkg": package_bucket["pkg"], "group_list": groups})
+            package_result = {"pkg": package_bucket["pkg"], "group_list": groups}
+            if include_debug:
+                package_result["pkg_key"] = package_bucket["pkg_key"]
+            result.append(package_result)
     return result
 
 
@@ -257,15 +283,32 @@ def build_combined_headers(rows: list[list[str]], header_index: int) -> list[str
     return headers
 
 
-def classify_columns(headers: list[str], data_rows: list[list[str]]) -> list[ColumnDecision]:
+def classify_columns(
+    headers: list[str],
+    data_rows: list[list[str]],
+    title_context: str = "",
+) -> list[ColumnDecision]:
     decisions = []
     max_columns = max([len(headers), *(len(row) for row in data_rows[:20])] or [0])
     for index in range(max_columns):
         header = headers[index] if index < len(headers) else ""
+        column_values = [row[index] for row in data_rows[:30] if index < len(row)]
+        package_score = score_package_column(header, column_values, title_context)
+        if package_score >= 6:
+            decisions.append(
+                ColumnDecision(
+                    index=index,
+                    raw_header=header,
+                    field_name="package_pin_no",
+                    score=package_score,
+                )
+            )
+            continue
         field_name, header_score = classify_header(header)
-        value_field, value_score = classify_values(
-            [row[index] for row in data_rows[:30] if index < len(row)]
-        )
+        if is_value_inference_blocked_header(header):
+            value_field, value_score = "", 0
+        else:
+            value_field, value_score = classify_values(column_values)
         if value_score > header_score and field_name == "":
             field_name = value_field
         score = header_score + value_score
@@ -337,6 +380,15 @@ def classify_header(header: str) -> tuple[str, int]:
     return "", 0
 
 
+def is_value_inference_blocked_header(header: str) -> bool:
+    normalized = normalize_header(header)
+    if not normalized:
+        return False
+    if any(keyword in normalized for keyword in IGNORE_HEADER_KEYWORDS):
+        return not any(keyword in normalized for keyword in ("signal type", "pin type", "io type"))
+    return False
+
+
 def classify_values(values: list[str]) -> tuple[str, int]:
     values = [value for value in values if value]
     if not values:
@@ -367,6 +419,56 @@ def is_pin_package_table(decisions: list[ColumnDecision]) -> bool:
         for decision in decisions
     )
     return has_number and has_name and has_explicit_number_header
+
+
+def score_package_column(header: str, values: list[str], title_context: str = "") -> int:
+    """Score whether a column is a package-specific pin-number column."""
+    normalized_header = normalize_header(header)
+    if not normalized_header:
+        return 0
+    if any(keyword in normalized_header for keyword in ("orderable", "package qty", "package type", "package drawing")):
+        return 0
+
+    score = 0
+    has_package_name = bool(PACKAGE_HEADER_RE.search(normalized_header))
+    has_pin_header = any(
+        keyword in normalized_header
+        for keyword in (
+            "引脚编号",
+            "管脚编号",
+            "端子编号",
+            "pin number",
+            "pin no",
+            "ball number",
+            "ball no",
+            "terminal number",
+            "terminal no",
+        )
+    )
+    if has_package_name:
+        score += 3
+    if has_pin_header:
+        score += 2
+    if extract_package_identity_parts(header)["pin_count"]:
+        score += 1
+    if extract_package_identity_parts(header)["code"]:
+        score += 1
+
+    sample = [value for value in values if value.strip() and value.strip() not in {"-", "—", "NA", "N/A"}][:20]
+    if sample:
+        pin_like = sum(looks_like_pin_list(value) for value in sample)
+        if pin_like / len(sample) >= 0.65:
+            score += 3
+        elif pin_like / len(sample) >= 0.35:
+            score += 1
+
+    context = normalize_header(title_context)
+    if any(keyword in context for keyword in ("pin attributes", "terminal functions", "pin assignment", "引脚属性", "引脚分配")):
+        score += 1
+
+    if not has_package_name:
+        return 0
+    return score
 
 
 def extract_pin_records_from_row(
@@ -431,6 +533,69 @@ def extract_pin_records_from_row(
     return records
 
 
+def get_package_bucket(
+    packages: dict[str, dict[str, Any]],
+    identity: PackageIdentity,
+    pin_record: dict[str, Any],
+    group_name: str,
+) -> dict[str, Any]:
+    """Return a package bucket, forking on strong pin conflicts."""
+    bucket_key = identity.key
+    bucket = packages.get(bucket_key)
+    if bucket and has_strong_pin_conflict(bucket, pin_record):
+        bucket_key = f"{identity.key}|scope={slug_text(group_name)}"
+        bucket = packages.get(bucket_key)
+
+    if not bucket:
+        bucket = {
+            "pkg": identity.display,
+            "pkg_key": bucket_key,
+            "group_list": [],
+            "_groups": {},
+            "_pin_index": {},
+        }
+        packages[bucket_key] = bucket
+    register_package_pin_seen(bucket, pin_record)
+    return bucket
+
+
+def has_strong_pin_conflict(package_bucket: dict[str, Any], pin_record: dict[str, Any]) -> bool:
+    """Avoid merging same-named package columns when the pin map clearly differs."""
+    pin_no = pin_record.get("pin_no", "")
+    pin_name = normalize_pin_name_for_compare(pin_record.get("pin_name", ""))
+    if not pin_no or not is_strong_identity_name(pin_name):
+        return False
+
+    pin_index = package_bucket.setdefault("_pin_index", {})
+    existing_names = {
+        name for name in pin_index.get(pin_no, set()) if is_strong_identity_name(name)
+    }
+    if existing_names and pin_name not in existing_names and not any(
+        pin_names_compatible(pin_name, existing) for existing in existing_names
+    ):
+        return True
+    return False
+
+
+def register_package_pin_seen(package_bucket: dict[str, Any], pin_record: dict[str, Any]) -> None:
+    pin_no = pin_record.get("pin_no", "")
+    pin_name = normalize_pin_name_for_compare(pin_record.get("pin_name", ""))
+    if pin_no and pin_name:
+        package_bucket.setdefault("_pin_index", {}).setdefault(pin_no, set()).add(pin_name)
+
+
+def is_strong_identity_name(pin_name: str) -> bool:
+    if not pin_name:
+        return False
+    if any(separator in pin_name for separator in ("|", "/", ",")):
+        return False
+    return bool(re.fullmatch(r"[a-z0-9_.$()+\-]+", pin_name))
+
+
+def pin_names_compatible(left: str, right: str) -> bool:
+    return left == right or left in right or right in left
+
+
 def get_or_create_group(package_bucket: dict[str, Any], group_name: str) -> ExtractedGroup:
     group_name = group_name.strip() or "Pin/Package Table"
     groups = package_bucket["_groups"]
@@ -438,6 +603,33 @@ def get_or_create_group(package_bucket: dict[str, Any], group_name: str) -> Extr
         groups[group_name] = ExtractedGroup(group=group_name)
         package_bucket["group_list"].append(groups[group_name])
     return groups[group_name]
+
+
+def add_pin_record_to_group(group: ExtractedGroup, pin_record: dict[str, Any]) -> None:
+    pin_no = pin_record.get("pin_no", "")
+    if not pin_no:
+        group.pin_list.append(pin_record)
+        return
+
+    for existing_record in group.pin_list:
+        if existing_record.get("pin_no") == pin_no:
+            merge_pin_record(existing_record, pin_record)
+            return
+    group.pin_list.append(pin_record)
+
+
+def merge_pin_record(existing_record: dict[str, Any], new_record: dict[str, Any]) -> None:
+    for key, value in new_record.items():
+        if not value:
+            continue
+        if key not in existing_record or not existing_record[key]:
+            existing_record[key] = value
+            continue
+        if existing_record[key] == value:
+            continue
+        if key == "pin_no":
+            continue
+        existing_record[key] = merge_field_value(str(existing_record[key]), str(value))
 
 
 def infer_package_name(text: str) -> str:
@@ -544,6 +736,59 @@ def clean_package_label(header: str) -> str:
     return label
 
 
+def build_package_identity(label: str) -> PackageIdentity:
+    display = clean_package_label(label) if label else ""
+    parts = extract_package_identity_parts(display)
+    key_parts = []
+    if parts["pin_count"]:
+        key_parts.append(f"pins={parts['pin_count']}")
+    if parts["family"]:
+        key_parts.append(f"family={parts['family']}")
+    if parts["code"]:
+        key_parts.append(f"code={parts['code']}")
+    if not key_parts:
+        key_parts.append(f"label={normalize_package_key(display)}")
+    return PackageIdentity(
+        display=display,
+        key="|".join(key_parts),
+        pin_count=parts["pin_count"],
+        family=parts["family"],
+        code=parts["code"],
+    )
+
+
+def extract_package_identity_parts(label: str) -> dict[str, str]:
+    normalized = normalize_package_word_order(plain_text(label))
+    pin_count = ""
+    family = ""
+    code = ""
+
+    count_match = re.search(r"\b(\d{2,4})\b", normalized)
+    if count_match:
+        pin_count = count_match.group(1)
+
+    family_match = PACKAGE_FAMILY_RE.search(normalized)
+    if family_match:
+        family = family_match.group(1).upper().replace(" ", "")
+
+    code_matches = [
+        match.group(1).upper()
+        for match in PACKAGE_CODE_RE.finditer(normalized)
+        if match.group(1).upper() != family
+    ]
+    if code_matches:
+        code = "_".join(dict.fromkeys(code_matches))
+
+    return {"pin_count": pin_count, "family": family, "code": code}
+
+
+def normalize_package_key(label: str) -> str:
+    label = normalize_package_word_order(label)
+    label = normalize_header(label)
+    label = re.sub(r"[^a-z0-9]+", "_", label).strip("_")
+    return label or "unknown"
+
+
 def normalize_package_word_order(label: str) -> str:
     label = re.sub(r"\s+", " ", label).strip()
     match = re.fullmatch(r"([A-Za-z0-9]+)\s*\(\s*(\d{2,4})\s*\)", label)
@@ -553,6 +798,16 @@ def normalize_package_word_order(label: str) -> str:
     if match:
         return f"{match.group(2)} {match.group(1)}"
     return label
+
+
+def normalize_pin_name_for_compare(value: str) -> str:
+    return normalize_header(value).replace(" ", "")
+
+
+def slug_text(value: str) -> str:
+    slug = normalize_header(value)
+    slug = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "_", slug).strip("_")
+    return slug[:60] or "unknown"
 
 
 def looks_like_pin_list(value: str) -> bool:

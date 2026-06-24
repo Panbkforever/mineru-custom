@@ -259,6 +259,68 @@
   - 规范化 `SIGNAL / NAME / NO.` 表头。
   - 将识别成 `SIGNAL NAME NO.` 的表头处理成两列展开结构。
 
+## 引脚与封装信息抽取
+
+### `extract.py`
+
+用途：单文件入口。先调用 `parse_doc.py` 解析 PDF，再从解析输出的 `*_middle.json` 中抽取引脚/封装信息，输出 JSON。
+
+### `batch_extract.py`
+
+用途：批量入口。默认遍历主目录下 `Multi_package_TIpdf/*.pdf`，将每个 PDF 的抽取结果写入 `ex_outputs/<pdf名>.json`。
+
+### `extract/pin_package_extractor.py`
+
+用途：从 MinerU `middle_json` 的 HTML 表格中识别引脚/封装字段，并输出结构化 JSON。
+
+主要函数：
+
+- `extract_pin_package_info_from_middle_json(...)`
+  - 主入口。
+  - 遍历 `middle_json` 中的表格。
+  - 跳过订购信息表。
+  - 识别引脚表后按封装分组、按表格分组、按 `pin_no` 归并记录。
+
+- `score_package_column(header, values, title_context="")`
+  - 判断某一列是否是“封装对应的引脚编号列”。
+  - 使用综合打分，不只靠列名：
+    - 封装名模式，如 `64 LQFP`、`48 PT/RGZ`、`ZCE Ball Number`。
+    - 列值形态，大部分值应像引脚编号，如 `1`、`40`、`A11`、`R2`。
+    - 表格上下文，如 `Pin Attributes`、`Terminal Functions`、`引脚属性`。
+  - 订购表中的 `Package Pins`、`Package Type`、`Package Drawing` 不作为引脚列。
+
+- `build_package_identity(label)`
+  - 对封装名做标准化，生成内部 `pkg_key`。
+  - 会提取：
+    - `pin_count`：例如 `64`、`100`。
+    - `family`：例如 `LQFP`、`VQFN`、`QFP`、`NFBGA`。
+    - `code`：例如 `PM`、`PT`、`RGZ`、`RHB`、`ZCE`、`NZN`。
+  - 示例：
+    - `LQFP (100)` -> `100 LQFP`，`pkg_key=pins=100|family=LQFP`
+    - `LQFP-64` -> `64 LQFP`，`pkg_key=pins=64|family=LQFP`
+    - `引脚编号(1) 64 PM` -> `64 PM`，`pkg_key=pins=64|code=PM`
+    - `ZCE Ball Number` -> `ZCE`，`pkg_key=code=ZCE`
+
+- `get_package_bucket(...)`
+  - 合并同一封装时不直接使用原始 `pkg` 字符串，而是使用标准化后的 `pkg_key`。
+  - 这样同一封装在多个不同表格中出现时，会进入同一个封装对象。
+
+- `has_strong_pin_conflict(...)`
+  - 防止误合并不同器件型号或不同 package drawing。
+  - 如果两个表格中封装字段名称看起来一样，但同一个 `pkg_key + pin_no` 对应的简单引脚名明显冲突，则保守地拆成不同 bucket。
+  - 复杂复用功能名包含 `|`、`/`、`,` 时不作为强冲突依据，避免把复用功能误认为不同封装。
+
+- `add_pin_record_to_group(...)`
+  - 同一封装、同一 group 内按 `pin_no` 做引脚级归并。
+  - 如果一个表给出 `pin_name`，另一个表给出 `type`，最终合到同一个引脚记录中。
+
+当前逻辑重点：
+
+- 判断封装列：使用“封装名模式 + 列值形态 + 表格上下文”综合打分。
+- 判断两个封装是否相同：先做封装名标准化，再比较 `pin_count/family/code` 组成的 `pkg_key`。
+- 多表合并同一封装：用 `pkg_key` 合并封装，再在 group 内按 `pin_no` 做引脚级归并。
+- 冲突保护：同名字段不一定代表同一封装；如果疑似不同器件型号或不同 package drawing，且出现强引脚映射冲突，则保守拆分，避免错误合并。
+
 - `_fix_terminal_functions_table_html(html)`
   - 修复 Terminal Functions 表格前两列合并错误。
 
