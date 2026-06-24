@@ -103,6 +103,7 @@ class ExtractedGroup:
 def extract_pin_package_info_from_middle_json(
     middle_json: dict[str, Any],
     source_name: str = "",
+    include_debug: bool = False,
 ) -> list[dict[str, Any]]:
     """Extract package/group/pin records from one MinerU middle_json object."""
     packages: dict[str, dict[str, Any]] = {}
@@ -137,14 +138,17 @@ def extract_pin_package_info_from_middle_json(
             pin_records = extract_pin_records_from_row(row, decisions)
             for pin_record in pin_records:
                 record_pkg = pin_record.pop("_pkg", default_pkg)
+                raw_fields = pin_record.pop("_raw_fields", None)
+                if include_debug and raw_fields:
+                    pin_record["raw_fields"] = raw_fields
                 package_bucket = packages.setdefault(
                     record_pkg,
                     {"pkg": record_pkg, "group_list": [], "_groups": {}},
                 )
                 current_group = get_or_create_group(package_bucket, current_group_name)
-                if source_name:
+                if include_debug and source_name:
                     pin_record.setdefault("source", source_name)
-                if table.page_idx is not None:
+                if include_debug and table.page_idx is not None:
                     pin_record.setdefault("source_page", table.page_idx + 1)
                 current_group.pin_list.append(pin_record)
 
@@ -355,7 +359,12 @@ def is_pin_package_table(decisions: list[ColumnDecision]) -> bool:
     fields = {decision.field_name for decision in decisions}
     has_number = bool(fields & {"pin_no", "ball_no", "terminal_no", "package_pin_no"})
     has_name = bool(fields & {"pin_name", "ball_name", "signal_name", "terminal_name", "pad_name"})
-    return has_number and has_name
+    has_explicit_number_header = any(
+        decision.field_name in {"pin_no", "ball_no", "terminal_no", "package_pin_no"}
+        and classify_header(decision.raw_header)[1] >= 4
+        for decision in decisions
+    )
+    return has_number and has_name and has_explicit_number_header
 
 
 def extract_pin_records_from_row(
@@ -394,7 +403,8 @@ def extract_pin_records_from_row(
                         record[key] = value
                 record["pin_no"] = pin_no
                 record["_pkg"] = package_name
-                record["raw_fields"] = raw_fields
+                if raw_fields:
+                    record["_raw_fields"] = raw_fields
                 records.append(record)
         return records
 
@@ -413,7 +423,8 @@ def extract_pin_records_from_row(
             if key not in record:
                 record[key] = value
         record["pin_no"] = pin_no
-        record["raw_fields"] = raw_fields
+        if raw_fields:
+            record["_raw_fields"] = raw_fields
         records.append(record)
     return records
 
@@ -505,6 +516,7 @@ def is_package_pin_header(normalized_header: str) -> bool:
 def clean_package_label(header: str) -> str:
     label = plain_text(header)
     label = re.sub(r"\[[^\]]+\]", " ", label)
+    label = re.sub(r"\(\s*\d+\s*\)", " ", label)
     label = re.sub(
         r"(?:引脚编号|管脚编号|端子编号|pin\s*(?:number|no\.?)|pins?)",
         " ",
