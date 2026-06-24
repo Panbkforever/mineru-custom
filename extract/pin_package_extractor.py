@@ -24,6 +24,11 @@ CELL_RE = re.compile(
 TAG_RE = re.compile(r"<[^>]+>")
 BALL_TOKEN_RE = re.compile(r"\b[A-Z]{1,2}\d{1,2}\b")
 NUMERIC_PIN_RE = re.compile(r"^\d{1,4}$")
+PACKAGE_HEADER_RE = re.compile(
+    r"\b(?:\d{2,4}\s*)?(?:lqfp|vqfn|vssop|qfn|tqfp|bga|soic|sop|dfn|wqfn|"
+    r"pm|pt|rgz|rhb|dgs\d*|pwp|rgy|rsm|rge|rte)\b",
+    re.IGNORECASE,
+)
 
 PIN_FIELD_ORDER = [
     "pin_no",
@@ -58,6 +63,19 @@ IGNORE_HEADER_KEYWORDS = {
     "comment",
     "address",
     "register",
+}
+
+ORDERING_TABLE_KEYWORDS = {
+    "orderable device",
+    "device",
+    "status",
+    "package type",
+    "package drawing",
+    "package qty",
+    "eco plan",
+    "lead finish",
+    "msl peak temp",
+    "samples",
 }
 
 
@@ -98,27 +116,32 @@ def extract_pin_package_info_from_middle_json(
         if header_index < 0:
             continue
 
+        if is_ordering_table(headers):
+            continue
+
         decisions = classify_columns(headers, rows[header_index + 1:])
         if not is_pin_package_table(decisions):
             continue
 
-        pkg = infer_package_name(table.title)
+        default_pkg = infer_package_name(table.title)
         group_name = infer_group_name(table.title) or "Pin/Package Table"
-        package_bucket = packages.setdefault(
-            pkg,
-            {"pkg": pkg, "group_list": [], "_groups": {}},
-        )
-        current_group = get_or_create_group(package_bucket, group_name)
+        current_group_name = group_name
 
         for row in rows[header_index + 1:]:
             if is_group_row(row):
                 group_text = first_non_empty(row)
                 if group_text:
-                    current_group = get_or_create_group(package_bucket, group_text)
+                    current_group_name = group_text
                 continue
 
             pin_records = extract_pin_records_from_row(row, decisions)
             for pin_record in pin_records:
+                record_pkg = pin_record.pop("_pkg", default_pkg)
+                package_bucket = packages.setdefault(
+                    record_pkg,
+                    {"pkg": record_pkg, "group_list": [], "_groups": {}},
+                )
+                current_group = get_or_create_group(package_bucket, current_group_name)
                 if source_name:
                     pin_record.setdefault("source", source_name)
                 if table.page_idx is not None:
@@ -200,14 +223,32 @@ def choose_header_row(rows: list[list[str]]) -> tuple[int, list[str]]:
     best_score = 0
     best_headers: list[str] = []
     for index, row in enumerate(rows[:4]):
-        score = sum(classify_header(cell)[1] for cell in row)
+        headers = build_combined_headers(rows, index)
+        score = sum(classify_header(cell)[1] for cell in headers)
+        if is_ordering_table(headers):
+            score = 0
         if score > best_score:
             best_index = index
             best_score = score
-            best_headers = row
+            best_headers = headers
     if best_score < 4:
         return -1, []
     return best_index, best_headers
+
+
+def build_combined_headers(rows: list[list[str]], header_index: int) -> list[str]:
+    """Merge stacked header rows so Chinese multi-row package headers stay visible."""
+    max_columns = max((len(row) for row in rows[: header_index + 1]), default=0)
+    headers = []
+    for column_index in range(max_columns):
+        parts = []
+        for row in rows[: header_index + 1]:
+            if column_index < len(row) and row[column_index].strip():
+                value = row[column_index].strip()
+                if value not in parts:
+                    parts.append(value)
+        headers.append(" ".join(parts).strip())
+    return headers
 
 
 def classify_columns(headers: list[str], data_rows: list[list[str]]) -> list[ColumnDecision]:
@@ -238,6 +279,18 @@ def classify_header(header: str) -> tuple[str, int]:
     normalized = normalize_header(header)
     if not normalized:
         return "", 0
+
+    if is_package_pin_header(normalized):
+        return "package_pin_no", 6
+
+    if any(keyword in normalized for keyword in ("引脚编号", "管脚编号", "端子编号", "pin 编号")):
+        return "pin_no", 5
+    if any(keyword in normalized for keyword in ("引脚名称", "管脚名称", "端子名称", "引脚名")):
+        return "pin_name", 5
+    if "信号名称" in normalized or normalized == "信号":
+        return "pin_name", 5
+    if any(keyword in normalized for keyword in ("引脚类型", "信号类型", "管脚类型", "端子类型", "io 结构", "i o 结构")):
+        return "type", 4
 
     if any(keyword in normalized for keyword in IGNORE_HEADER_KEYWORDS):
         if not any(keyword in normalized for keyword in ("signal type", "pin type", "io type")):
@@ -272,7 +325,7 @@ def classify_header(header: str) -> tuple[str, int]:
     if "i/o" in normalized or normalized == "io":
         return "io_type", 3
 
-    if "package" in normalized:
+    if "package" in normalized and "pin" not in normalized:
         return "package", 3
 
     return "", 0
@@ -300,7 +353,7 @@ def classify_values(values: list[str]) -> tuple[str, int]:
 
 def is_pin_package_table(decisions: list[ColumnDecision]) -> bool:
     fields = {decision.field_name for decision in decisions}
-    has_number = bool(fields & {"pin_no", "ball_no", "terminal_no"})
+    has_number = bool(fields & {"pin_no", "ball_no", "terminal_no", "package_pin_no"})
     has_name = bool(fields & {"pin_name", "ball_name", "signal_name", "terminal_name", "pad_name"})
     return has_number and has_name
 
@@ -311,17 +364,39 @@ def extract_pin_records_from_row(
 ) -> list[dict[str, Any]]:
     raw_fields: dict[str, str] = {}
     fields: dict[str, str] = {}
+    package_pin_values: list[tuple[str, str]] = []
     for decision in decisions:
         value = row[decision.index].strip() if decision.index < len(row) else ""
         if not value:
             continue
         raw_key = decision.raw_header or f"column_{decision.index + 1}"
         raw_fields[raw_key] = value
+        if decision.field_name == "package_pin_no":
+            package_pin_values.append((raw_key, value))
+            continue
         field_name = normalize_field_name(decision.field_name)
         fields[field_name] = merge_field_value(fields.get(field_name, ""), value)
 
     if not fields:
         return []
+
+    if package_pin_values:
+        records = []
+        for package_header, pin_no_value in package_pin_values:
+            pin_numbers = split_pin_numbers(pin_no_value)
+            if not pin_numbers:
+                continue
+            package_name = clean_package_label(package_header)
+            for pin_no in pin_numbers:
+                record = {key: fields[key] for key in PIN_FIELD_ORDER if key in fields}
+                for key, value in fields.items():
+                    if key not in record:
+                        record[key] = value
+                record["pin_no"] = pin_no
+                record["_pkg"] = package_name
+                record["raw_fields"] = raw_fields
+                records.append(record)
+        return records
 
     pin_no_value = fields.get("pin_no", "")
     if not pin_no_value:
@@ -371,7 +446,7 @@ def infer_group_name(text: str) -> str:
     if not text:
         return ""
     table_match = re.search(
-        r"(?:Table\s+\S+\.\s*)?([^。\\n]*?(?:Pin Attributes|Terminal Functions|Pin Assignment|Terminal Assignment|Package Pins?)[^。\\n]*)",
+        r"(?:Table\s+\S+\.\s*)?([^。\\n]*?(?:Pin Attributes|Terminal Functions|Pin Assignment|Terminal Assignment|Package Pins?|引脚属性|引脚分配|封装引脚)[^。\\n]*)",
         text,
         re.IGNORECASE,
     )
@@ -407,6 +482,37 @@ def split_pin_numbers(value: str) -> list[str]:
         return [value]
     numeric_tokens = re.findall(r"\b\d{1,4}\b", value)
     return numeric_tokens
+
+
+def is_ordering_table(headers: list[str]) -> bool:
+    normalized_headers = [normalize_header(header) for header in headers if header.strip()]
+    joined = " ".join(normalized_headers)
+    hit_count = sum(1 for keyword in ORDERING_TABLE_KEYWORDS if keyword in joined)
+    return "orderable device" in joined and hit_count >= 3
+
+
+def is_package_pin_header(normalized_header: str) -> bool:
+    if not PACKAGE_HEADER_RE.search(normalized_header):
+        return False
+    if any(keyword in normalized_header for keyword in ("orderable", "package qty", "package type", "package drawing")):
+        return False
+    if any(keyword in normalized_header for keyword in ("引脚编号", "管脚编号", "端子编号", "pin number", "pin no")):
+        return True
+    # In stacked package tables, the leaf header can be just "64 PM" or "RHB".
+    return bool(re.fullmatch(r"(?:\d{2,4}\s*)?(?:[a-z0-9]+(?:\s+[a-z0-9]+){0,2})", normalized_header))
+
+
+def clean_package_label(header: str) -> str:
+    label = plain_text(header)
+    label = re.sub(r"\[[^\]]+\]", " ", label)
+    label = re.sub(
+        r"(?:引脚编号|管脚编号|端子编号|pin\s*(?:number|no\.?)|pins?)",
+        " ",
+        label,
+        flags=re.IGNORECASE,
+    )
+    label = re.sub(r"\s+", " ", label).strip(" -:/")
+    return label
 
 
 def looks_like_pin_list(value: str) -> bool:
@@ -472,6 +578,7 @@ def normalize_header(value: str) -> str:
     value = plain_text(value).lower()
     value = re.sub(r"\[[^\]]+\]", " ", value)
     value = re.sub(r"[†‡*]+", " ", value)
+    value = re.sub(r"[、，,]+", " ", value)
     value = re.sub(r"[_\-/]+", " ", value)
     value = re.sub(r"\s+", " ", value).strip()
     return value
