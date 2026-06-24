@@ -25,11 +25,13 @@ TAG_RE = re.compile(r"<[^>]+>")
 BALL_TOKEN_RE = re.compile(r"\b[A-Z]{1,2}\d{1,2}\b")
 NUMERIC_PIN_RE = re.compile(r"^\d{1,4}$")
 PACKAGE_HEADER_RE = re.compile(
-    r"\b(?:\d{2,4}\s*)?(?:lqfp|vqfn|vssop|qfn|tqfp|bga|soic|sop|dfn|wqfn|"
-    r"pm|pt|rgz|rhb|dgs\d*|pwp|rgy|rsm|rge|rte)\b",
+    r"\b(?:\d{2,4}\s*)?(?:qfp|lqfp|tqfp|htqfp|vqfn|vssop|ssop|tssop|qfn|"
+    r"bga|pbga|nfbga|fcbga|fc csp|soic|sop|pdip|pga|clcc|lccc|dfn|wqfn|"
+    r"pm|pt|pn|pnp|pzp|pz|peu|rgc|rtd|rgz|rhb|rsh|dgs\d*|da|pw|n|rsa|"
+    r"zce\d*[a-z]*|nzn\d*[a-z]*|zwt|zjz|zhh|zay|alv|alx|am[a-z]|"
+    r"abc|alw|alz|anf|anj|zqw|pwp|rgy|rsm|rge|rte)\b",
     re.IGNORECASE,
 )
-
 PIN_FIELD_ORDER = [
     "pin_no",
     "pin_name",
@@ -507,7 +509,20 @@ def is_package_pin_header(normalized_header: str) -> bool:
         return False
     if any(keyword in normalized_header for keyword in ("orderable", "package qty", "package type", "package drawing")):
         return False
-    if any(keyword in normalized_header for keyword in ("引脚编号", "管脚编号", "端子编号", "pin number", "pin no")):
+    if any(
+        keyword in normalized_header
+        for keyword in (
+            "引脚编号",
+            "管脚编号",
+            "端子编号",
+            "pin number",
+            "pin no",
+            "ball number",
+            "ball no",
+            "terminal number",
+            "terminal no",
+        )
+    ):
         return True
     # In stacked package tables, the leaf header can be just "64 PM" or "RHB".
     return bool(re.fullmatch(r"(?:\d{2,4}\s*)?(?:[a-z0-9]+(?:\s+[a-z0-9]+){0,2})", normalized_header))
@@ -516,14 +531,27 @@ def is_package_pin_header(normalized_header: str) -> bool:
 def clean_package_label(header: str) -> str:
     label = plain_text(header)
     label = re.sub(r"\[[^\]]+\]", " ", label)
-    label = re.sub(r"\(\s*\d+\s*\)", " ", label)
+    label = normalize_package_word_order(label)
+    label = re.sub(r"\(\s*\d{1,2}\s*\)", " ", label)
     label = re.sub(
-        r"(?:引脚编号|管脚编号|端子编号|pin\s*(?:number|no\.?)|pins?)",
+        r"(?:引脚编号|管脚编号|端子编号|pin\s*(?:number|no\.?)|pins?|ball\s*(?:number|no\.?)|terminal\s*(?:number|no\.?))",
         " ",
         label,
         flags=re.IGNORECASE,
     )
+    label = normalize_package_word_order(label)
     label = re.sub(r"\s+", " ", label).strip(" -:/")
+    return label
+
+
+def normalize_package_word_order(label: str) -> str:
+    label = re.sub(r"\s+", " ", label).strip()
+    match = re.fullmatch(r"([A-Za-z0-9]+)\s*\(\s*(\d{2,4})\s*\)", label)
+    if match:
+        return f"{match.group(2)} {match.group(1)}"
+    match = re.fullmatch(r"([A-Za-z0-9]+)\s*[- ]\s*(\d{2,4})", label)
+    if match:
+        return f"{match.group(2)} {match.group(1)}"
     return label
 
 
