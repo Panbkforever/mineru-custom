@@ -63,6 +63,11 @@ def main() -> int:
         default=None,
         help="Output JSON path. Default: <output>/pin_package_extract.json",
     )
+    parser.add_argument(
+        "--semantic-classify",
+        action="store_true",
+        help="Use DeepSeek semantic classification to filter non-pin tables. Requires DEEPSEEK_API_KEY.",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input_path)
@@ -78,7 +83,12 @@ def main() -> int:
 
     extracted = []
     for middle_file in middle_files:
-        extracted.extend(extract_pin_package_info_from_middle_json_file(middle_file))
+        extracted.extend(
+            extract_pin_package_info_from_middle_json_file(
+                middle_file,
+                use_semantic_classifier=args.semantic_classify,
+            )
+        )
 
     output_path = (
         Path(args.extract_output).resolve()

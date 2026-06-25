@@ -126,6 +126,7 @@ def extract_pin_package_info_from_middle_json(
     middle_json: dict[str, Any],
     source_name: str = "",
     include_debug: bool = False,
+    use_semantic_classifier: bool = False,
 ) -> list[dict[str, Any]]:
     """Extract package/group/pin records from one MinerU middle_json object."""
     packages: dict[str, dict[str, Any]] = {}
@@ -144,6 +145,14 @@ def extract_pin_package_info_from_middle_json(
 
         decisions = classify_columns(headers, rows[header_index + 1:], table.title)
         if not is_pin_package_table(decisions):
+            continue
+        if use_semantic_classifier and not semantic_allows_pin_creation(
+            table.title,
+            headers,
+            rows[header_index + 1:],
+            decisions,
+            include_debug=include_debug,
+        ):
             continue
 
         default_pkg = infer_package_name(table.title)
@@ -190,10 +199,17 @@ def extract_pin_package_info_from_middle_json(
     return result
 
 
-def extract_pin_package_info_from_middle_json_file(path: str | Path) -> list[dict[str, Any]]:
+def extract_pin_package_info_from_middle_json_file(
+    path: str | Path,
+    use_semantic_classifier: bool = False,
+) -> list[dict[str, Any]]:
     path = Path(path)
     middle_json = json.loads(path.read_text(encoding="utf-8"))
-    return extract_pin_package_info_from_middle_json(middle_json, source_name=path.stem)
+    return extract_pin_package_info_from_middle_json(
+        middle_json,
+        source_name=path.stem,
+        use_semantic_classifier=use_semantic_classifier,
+    )
 
 
 def iter_table_candidates(middle_json: dict[str, Any]) -> list[TableCandidate]:
@@ -431,6 +447,26 @@ def is_pin_package_table(decisions: list[ColumnDecision]) -> bool:
         for decision in decisions
     )
     return has_number and has_name and has_explicit_number_header
+
+
+def semantic_allows_pin_creation(
+    title: str,
+    headers: list[str],
+    data_rows: list[list[str]],
+    decisions: list[ColumnDecision],
+    include_debug: bool = False,
+) -> bool:
+    from extract.semantic_classifier import classify_table_semantics
+
+    decision = classify_table_semantics(
+        title=title,
+        headers=headers,
+        sample_rows=data_rows[:8],
+        decisions=decisions,
+    )
+    if include_debug:
+        print(f"semantic decision: {decision}")
+    return bool(decision.get("should_create_pins")) and float(decision.get("confidence", 0)) >= 0.6
 
 
 def score_package_column(header: str, values: list[str], title_context: str = "") -> int:

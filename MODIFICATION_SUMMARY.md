@@ -269,6 +269,13 @@
 
 用途：批量入口。默认遍历主目录下 `Multi_package_TIpdf/*.pdf`，将每个 PDF 的抽取结果写入 `ex_outputs/<pdf名>.json`。
 
+可选参数：
+
+- `--semantic-classify`
+  - 启用 DeepSeek 表格语义分类。
+  - 需要通过环境变量提供 `DEEPSEEK_API_KEY`。
+  - 只用于判断表格是否可以创建封装引脚记录，不直接生成最终引脚数据。
+
 ### `extract/pin_package_extractor.py`
 
 用途：从 MinerU `middle_json` 的 HTML 表格中识别引脚/封装字段，并输出结构化 JSON。
@@ -315,12 +322,52 @@
   - 同一封装、同一 group 内按 `pin_no` 做引脚级归并。
   - 如果一个表给出 `pin_name`，另一个表给出 `type`，最终合到同一个引脚记录中。
 
+- `semantic_allows_pin_creation(...)`
+  - 可选语义过滤入口。
+  - 当 `--semantic-classify` 开启时，会调用 `extract/semantic_classifier.py`。
+  - 语义分类结果只有在 `should_create_pins=true` 且置信度不低于 0.6 时才允许抽取。
+
+### `extract/semantic_classifier.py`
+
+用途：调用 DeepSeek API 对表格做语义分类。
+
+主要函数：
+
+- `classify_table_semantics(...)`
+  - 输入表名、表头、样例行、规则初判列角色。
+  - 输出结构化 JSON，包括：
+    - `table_role`
+    - `should_create_pins`
+    - `package_columns`
+    - `name_columns`
+    - `type_columns`
+    - `confidence`
+    - `reason`
+
+- `call_deepseek_json(...)`
+  - 使用 OpenAI-compatible Chat Completions 调用 DeepSeek。
+  - 默认 base url：`https://api.deepseek.com`
+  - 默认模型：`deepseek-v4-flash`
+  - API key 从环境变量 `DEEPSEEK_API_KEY` 读取，不写入代码。
+
+相关环境变量：
+
+- `DEEPSEEK_API_KEY`
+  - DeepSeek API Key，必填。
+- `DEEPSEEK_MODEL`
+  - 默认 `deepseek-v4-flash`。
+- `DEEPSEEK_BASE_URL`
+  - 默认 `https://api.deepseek.com`。
+- `DEEPSEEK_TIMEOUT`
+  - 默认 `30` 秒。
+
 当前逻辑重点：
 
 - 判断封装列：使用“封装名模式 + 列值形态 + 表格上下文”综合打分。
 - 判断两个封装是否相同：先做封装名标准化，再比较 `pin_count/family/code` 组成的 `pkg_key`。
 - 多表合并同一封装：用标准化身份合并封装，封装别名追加到 `pkg`，再按表名进入不同 group。
 - group 表示表名或表格分组；同一个封装可能出现在多个不同表格中，按 group 划分来源。
+- LLM 语义分类只负责判断“这个表是否表达封装-物理引脚-信号映射关系”；最终数据仍由代码从表格中抽取，避免模型直接编造引脚。
 
 - `_fix_terminal_functions_table_html(html)`
   - 修复 Terminal Functions 表格前两列合并错误。

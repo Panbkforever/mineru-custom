@@ -78,6 +78,11 @@ def main() -> int:
         action="store_true",
         help="Continue processing remaining PDFs if one file fails.",
     )
+    parser.add_argument(
+        "--semantic-classify",
+        action="store_true",
+        help="Use DeepSeek semantic classification in extract.py. Requires DEEPSEEK_API_KEY.",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent
@@ -175,6 +180,8 @@ def build_extract_command(
         command.append("--no-images")
     if args.skip_parse:
         command.append("--skip-parse")
+    if args.semantic_classify:
+        command.append("--semantic-classify")
     return command
 
 
