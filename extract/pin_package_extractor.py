@@ -458,12 +458,16 @@ def semantic_allows_pin_creation(
 ) -> bool:
     from extract.semantic_classifier import classify_table_semantics
 
-    decision = classify_table_semantics(
-        title=title,
-        headers=headers,
-        sample_rows=data_rows[:8],
-        decisions=decisions,
-    )
+    try:
+        decision = classify_table_semantics(
+            title=title,
+            headers=headers,
+            sample_rows=data_rows[:8],
+            decisions=decisions,
+        )
+    except Exception as exc:
+        print(f"语义分类失败，跳过当前表格: {exc}")
+        return False
     if include_debug:
         print(f"semantic decision: {decision}")
     return bool(decision.get("should_create_pins")) and float(decision.get("confidence", 0)) >= 0.6

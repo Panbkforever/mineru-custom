@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from typing import Any
@@ -129,8 +130,37 @@ def call_deepseek_json(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
         raise RuntimeError(f"DeepSeek API 请求失败: {exc}") from exc
 
     completion = json.loads(raw)
-    content = completion["choices"][0]["message"]["content"]
-    return json.loads(content)
+    content = str(completion["choices"][0]["message"].get("content") or "")
+    return parse_json_content(content)
+
+
+def parse_json_content(content: str) -> dict[str, Any]:
+    """Parse JSON even when the model wraps it in markdown or extra text."""
+    content = content.strip()
+    if not content:
+        raise ValueError("DeepSeek returned empty message content")
+
+    candidates = [content]
+    fenced_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL | re.IGNORECASE)
+    if fenced_match:
+        candidates.insert(0, fenced_match.group(1))
+
+    object_match = re.search(r"\{.*\}", content, re.DOTALL)
+    if object_match:
+        candidates.append(object_match.group(0))
+
+    last_error: Exception | None = None
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+
+    preview = content[:300].replace("\n", "\\n")
+    raise ValueError(f"DeepSeek returned non-JSON content: {preview}") from last_error
 
 
 def normalize_semantic_response(response: dict[str, Any]) -> dict[str, Any]:
