@@ -17,7 +17,12 @@ from typing import Any
 
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
-PIN_TABLE_ROLES = {"pin_package_mapping", "pin_attributes", "terminal_functions"}
+PIN_TABLE_ROLES = {
+    "pin_package_mapping",
+    "pin_attributes",
+    "terminal_functions",
+    "package_connectivity_requirements",
+}
 
 
 def classify_table_semantics(
@@ -50,6 +55,7 @@ def build_prompt_payload(
                 "ZCE Ball Number | NZN Ball Number | Ball Name | Signal Name | Signal Type",
                 "64 LQFP | 48 VQFN | Pin Name | Type",
                 "TERMINAL NAME | NO. | I/O | DESCRIPTION",
+                "Connectivity Requirements - AM273x ZCE Package with BALL NUMBER and BALL NAME",
             ],
             "invalid_examples": [
                 "Input Conditions / Output Conditions / Timing Requirements",
@@ -73,7 +79,7 @@ def build_prompt_payload(
             ],
         },
         "output_schema": {
-            "table_role": "pin_package_mapping | supplemental_signal_description | electrical_conditions | timing_table | boot_mode_table | ordering_table | other",
+            "table_role": "pin_package_mapping | pin_attributes | terminal_functions | package_connectivity_requirements | supplemental_signal_description | electrical_conditions | timing_table | boot_mode_table | ordering_table | other",
             "should_create_pins": "boolean",
             "package_columns": [{"column_index": 0, "pkg": "package name", "field": "pin_no"}],
             "name_columns": [{"column_index": 0, "field": "pin_name|ball_name|signal_name"}],

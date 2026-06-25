@@ -15,6 +15,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from extract.table_association_rules import (
+    PackageSnapshot,
+    resolve_table_package_association,
+)
+
 
 TR_RE = re.compile(r"(<tr[^>]*>)(.*?)(</tr>)", re.DOTALL | re.IGNORECASE)
 CELL_RE = re.compile(
@@ -146,16 +151,24 @@ def extract_pin_package_info_from_middle_json(
         decisions = classify_columns(headers, rows[header_index + 1:], table.title)
         if not is_pin_package_table(decisions):
             continue
+        association = resolve_table_package_association(
+            table.title,
+            headers,
+            rows[header_index + 1:],
+            decisions,
+            build_package_snapshots(packages),
+        )
         if use_semantic_classifier and not semantic_allows_pin_creation(
             table.title,
             headers,
             rows[header_index + 1:],
             decisions,
+            has_associated_package=bool(association.package),
             include_debug=include_debug,
         ):
             continue
 
-        default_pkg = infer_package_name(table.title)
+        default_pkg = association.package or infer_package_name(table.title)
         group_name = infer_group_name(table.title) or "Pin/Package Table"
         current_group_name = group_name
 
@@ -456,6 +469,7 @@ def semantic_allows_pin_creation(
     headers: list[str],
     data_rows: list[list[str]],
     decisions: list[ColumnDecision],
+    has_associated_package: bool = False,
     include_debug: bool = False,
 ) -> bool:
     from extract.semantic_classifier import classify_table_semantics
@@ -472,7 +486,11 @@ def semantic_allows_pin_creation(
         return False
     if include_debug:
         print(f"semantic decision: {decision}")
-    if not any(decision.field_name == "package_pin_no" for decision in decisions) and not infer_package_name(title):
+    if (
+        not any(decision.field_name == "package_pin_no" for decision in decisions)
+        and not infer_package_name(title)
+        and not has_associated_package
+    ):
         return False
     return bool(decision.get("should_create_pins")) and float(decision.get("confidence", 0)) >= 0.6
 
@@ -619,6 +637,30 @@ def get_package_bucket(
     return bucket
 
 
+def build_package_snapshots(packages: dict[str, dict[str, Any]]) -> list[PackageSnapshot]:
+    """Collect known package pin/name evidence for later table association."""
+    snapshots = []
+    for package in packages.values():
+        pin_numbers: set[str] = set()
+        pin_names: set[str] = set()
+        for group in package.get("_groups", {}).values():
+            for record in group.pin_list:
+                pin_no = str(record.get("pin_no", "")).strip()
+                pin_name = str(record.get("pin_name") or record.get("ball_name") or "").strip()
+                if pin_no:
+                    pin_numbers.add(pin_no)
+                if pin_name:
+                    pin_names.add(pin_name.upper())
+        snapshots.append(
+            PackageSnapshot(
+                pkg=package.get("pkg", ""),
+                pin_numbers=pin_numbers,
+                pin_names=pin_names,
+            )
+        )
+    return snapshots
+
+
 def find_compatible_package_key(
     packages: dict[str, dict[str, Any]],
     identity: PackageIdentity,
@@ -714,7 +756,8 @@ def infer_group_name(text: str) -> str:
         return ""
     group_keywords = (
         r"Pin Attributes|Terminal Functions|Pin Assignment|Terminal Assignment|"
-        r"Package Pins?|Signal Descriptions|引脚属性|引脚分配|封装引脚"
+        r"Package Pins?|Signal Descriptions|Connectivity Requirements|"
+        r"Connection Requirements|引脚属性|引脚分配|封装引脚"
     )
     table_match = re.search(
         rf"((?:Table|表)\s+\S+\.?\s+[^。\n]{{0,140}}?(?:{group_keywords})[^。\n]{{0,80}})",
@@ -924,7 +967,7 @@ def looks_like_type_value(value: str) -> bool:
 def normalize_field_name(field_name: str) -> str:
     if field_name in {"ball_no", "terminal_no"}:
         return "pin_no"
-    if field_name in {"signal_name", "terminal_name"}:
+    if field_name in {"ball_name", "signal_name", "terminal_name"}:
         return "pin_name"
     if field_name == "io_type":
         return "type"
