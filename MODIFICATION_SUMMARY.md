@@ -304,11 +304,12 @@
 - `get_package_bucket(...)`
   - 合并同一封装时不直接使用原始 `pkg` 字符串，而是使用标准化后的 `pkg_key`。
   - 这样同一封装在多个不同表格中出现时，会进入同一个封装对象。
+  - 如果同一封装出现多个名称，例如 `ZCE`、`ZCE-64`，会在同一个封装对象的 `pkg` 后追加别名，而不是拆成两个封装。
 
-- `has_strong_pin_conflict(...)`
-  - 防止误合并不同器件型号或不同 package drawing。
-  - 如果两个表格中封装字段名称看起来一样，但同一个 `pkg_key + pin_no` 对应的简单引脚名明显冲突，则保守地拆成不同 bucket。
-  - 复杂复用功能名包含 `|`、`/`、`,` 时不作为强冲突依据，避免把复用功能误认为不同封装。
+- `package_identities_compatible(...)`
+  - 判断两个封装标准化身份是否可合并。
+  - 稳定 package code 相同且 pin count 不冲突时合并，例如 `ZCE` 和 `ZCE-64`。
+  - family 相同且 pin count 相同或一方缺失时合并，例如 `LQFP-64` 和 `64 LQFP`。
 
 - `add_pin_record_to_group(...)`
   - 同一封装、同一 group 内按 `pin_no` 做引脚级归并。
@@ -318,8 +319,8 @@
 
 - 判断封装列：使用“封装名模式 + 列值形态 + 表格上下文”综合打分。
 - 判断两个封装是否相同：先做封装名标准化，再比较 `pin_count/family/code` 组成的 `pkg_key`。
-- 多表合并同一封装：用 `pkg_key` 合并封装，再在 group 内按 `pin_no` 做引脚级归并。
-- 冲突保护：同名字段不一定代表同一封装；如果疑似不同器件型号或不同 package drawing，且出现强引脚映射冲突，则保守拆分，避免错误合并。
+- 多表合并同一封装：用标准化身份合并封装，封装别名追加到 `pkg`，再按表名进入不同 group。
+- group 表示表名或表格分组；同一个封装可能出现在多个不同表格中，按 group 划分来源。
 
 - `_fix_terminal_functions_table_html(html)`
   - 修复 Terminal Functions 表格前两列合并错误。

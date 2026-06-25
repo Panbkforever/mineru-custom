@@ -167,8 +167,6 @@ def extract_pin_package_info_from_middle_json(
                 package_bucket = get_package_bucket(
                     packages,
                     package_identity,
-                    pin_record,
-                    current_group_name,
                 )
                 current_group = get_or_create_group(package_bucket, current_group_name)
                 if include_debug and source_name:
@@ -201,6 +199,7 @@ def extract_pin_package_info_from_middle_json_file(path: str | Path) -> list[dic
 def iter_table_candidates(middle_json: dict[str, Any]) -> list[TableCandidate]:
     """Return HTML tables with nearby text as weak title context."""
     candidates: list[TableCandidate] = []
+    current_section_title = ""
     for page_info in middle_json.get("pdf_info", []):
         page_idx = page_info.get("page_idx")
         recent_texts: list[str] = []
@@ -208,18 +207,31 @@ def iter_table_candidates(middle_json: dict[str, Any]) -> list[TableCandidate]:
             html = span.get("html")
             text = plain_text(span.get("content") or span.get("text") or "")
             if isinstance(html, str) and "<table" in html.lower():
+                title = current_section_title or " ".join(dedupe_preserve_order(recent_texts[-5:])).strip()
                 candidates.append(
                     TableCandidate(
                         html=html,
                         page_idx=page_idx if isinstance(page_idx, int) else None,
-                        title=" ".join(recent_texts[-3:]).strip(),
+                        title=title,
                     )
                 )
                 continue
             if text:
+                detected_group = infer_group_name(text)
+                if detected_group:
+                    current_section_title = detected_group
                 recent_texts.append(text)
-                recent_texts = recent_texts[-5:]
+                recent_texts = recent_texts[-10:]
     return candidates
+
+
+def dedupe_preserve_order(values: list[str]) -> list[str]:
+    deduped = []
+    for value in values:
+        value = value.strip()
+        if value and value not in deduped:
+            deduped.append(value)
+    return deduped
 
 
 def iter_spans_in_reading_order(value: Any):
@@ -536,15 +548,10 @@ def extract_pin_records_from_row(
 def get_package_bucket(
     packages: dict[str, dict[str, Any]],
     identity: PackageIdentity,
-    pin_record: dict[str, Any],
-    group_name: str,
 ) -> dict[str, Any]:
-    """Return a package bucket, forking on strong pin conflicts."""
-    bucket_key = identity.key
+    """Return the bucket for the same package identity and append new aliases."""
+    bucket_key = find_compatible_package_key(packages, identity) or identity.key
     bucket = packages.get(bucket_key)
-    if bucket and has_strong_pin_conflict(bucket, pin_record):
-        bucket_key = f"{identity.key}|scope={slug_text(group_name)}"
-        bucket = packages.get(bucket_key)
 
     if not bucket:
         bucket = {
@@ -552,48 +559,51 @@ def get_package_bucket(
             "pkg_key": bucket_key,
             "group_list": [],
             "_groups": {},
-            "_pin_index": {},
+            "_identity": identity,
+            "_aliases": [],
         }
         packages[bucket_key] = bucket
-    register_package_pin_seen(bucket, pin_record)
+    append_package_alias(bucket, identity.display)
     return bucket
 
 
-def has_strong_pin_conflict(package_bucket: dict[str, Any], pin_record: dict[str, Any]) -> bool:
-    """Avoid merging same-named package columns when the pin map clearly differs."""
-    pin_no = pin_record.get("pin_no", "")
-    pin_name = normalize_pin_name_for_compare(pin_record.get("pin_name", ""))
-    if not pin_no or not is_strong_identity_name(pin_name):
-        return False
+def find_compatible_package_key(
+    packages: dict[str, dict[str, Any]],
+    identity: PackageIdentity,
+) -> str:
+    if identity.key in packages:
+        return identity.key
 
-    pin_index = package_bucket.setdefault("_pin_index", {})
-    existing_names = {
-        name for name in pin_index.get(pin_no, set()) if is_strong_identity_name(name)
-    }
-    if existing_names and pin_name not in existing_names and not any(
-        pin_names_compatible(pin_name, existing) for existing in existing_names
-    ):
+    for bucket_key, bucket in packages.items():
+        existing_identity = bucket.get("_identity")
+        if isinstance(existing_identity, PackageIdentity) and package_identities_compatible(existing_identity, identity):
+            return bucket_key
+    return ""
+
+
+def package_identities_compatible(left: PackageIdentity, right: PackageIdentity) -> bool:
+    """Merge aliases such as ZCE and ZCE-64 when the stable package code matches."""
+    if left.key == right.key:
         return True
+    if left.code and right.code and left.code == right.code:
+        return compatible_pin_count(left.pin_count, right.pin_count)
+    if left.family and right.family and left.family == right.family:
+        return compatible_pin_count(left.pin_count, right.pin_count)
     return False
 
 
-def register_package_pin_seen(package_bucket: dict[str, Any], pin_record: dict[str, Any]) -> None:
-    pin_no = pin_record.get("pin_no", "")
-    pin_name = normalize_pin_name_for_compare(pin_record.get("pin_name", ""))
-    if pin_no and pin_name:
-        package_bucket.setdefault("_pin_index", {}).setdefault(pin_no, set()).add(pin_name)
+def compatible_pin_count(left: str, right: str) -> bool:
+    return not left or not right or left == right
 
 
-def is_strong_identity_name(pin_name: str) -> bool:
-    if not pin_name:
-        return False
-    if any(separator in pin_name for separator in ("|", "/", ",")):
-        return False
-    return bool(re.fullmatch(r"[a-z0-9_.$()+\-]+", pin_name))
-
-
-def pin_names_compatible(left: str, right: str) -> bool:
-    return left == right or left in right or right in left
+def append_package_alias(package_bucket: dict[str, Any], alias: str) -> None:
+    alias = alias.strip()
+    if not alias:
+        return
+    aliases = package_bucket.setdefault("_aliases", [])
+    if alias not in aliases:
+        aliases.append(alias)
+    package_bucket["pkg"] = " | ".join(aliases)
 
 
 def get_or_create_group(package_bucket: dict[str, Any], group_name: str) -> ExtractedGroup:
@@ -650,14 +660,32 @@ def infer_group_name(text: str) -> str:
     text = plain_text(text)
     if not text:
         return ""
+    group_keywords = (
+        r"Pin Attributes|Terminal Functions|Pin Assignment|Terminal Assignment|"
+        r"Package Pins?|Signal Descriptions|引脚属性|引脚分配|封装引脚"
+    )
     table_match = re.search(
-        r"(?:Table\s+\S+\.\s*)?([^。\\n]*?(?:Pin Attributes|Terminal Functions|Pin Assignment|Terminal Assignment|Package Pins?|引脚属性|引脚分配|封装引脚)[^。\\n]*)",
+        rf"((?:Table|表)\s+\S+\.?\s+[^。\n]{{0,140}}?(?:{group_keywords})[^。\n]{{0,80}})",
         text,
         re.IGNORECASE,
     )
     if table_match:
-        return re.sub(r"\s+", " ", table_match.group(1)).strip()
+        return clean_group_name(table_match.group(1))
+    section_match = re.search(
+        rf"(\d+(?:\.\d+)+\s+[^。\n]{{0,120}}?(?:{group_keywords})[^。\n]{{0,80}})",
+        text,
+        re.IGNORECASE,
+    )
+    if section_match:
+        return clean_group_name(section_match.group(1))
     return ""
+
+
+def clean_group_name(value: str) -> str:
+    value = re.sub(r"\s+", " ", plain_text(value)).strip()
+    if len(value) > 180:
+        value = value[:180].rsplit(" ", 1)[0].strip()
+    return value
 
 
 def is_group_row(row: list[str]) -> bool:
@@ -798,16 +826,6 @@ def normalize_package_word_order(label: str) -> str:
     if match:
         return f"{match.group(2)} {match.group(1)}"
     return label
-
-
-def normalize_pin_name_for_compare(value: str) -> str:
-    return normalize_header(value).replace(" ", "")
-
-
-def slug_text(value: str) -> str:
-    slug = normalize_header(value)
-    slug = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "_", slug).strip("_")
-    return slug[:60] or "unknown"
 
 
 def looks_like_pin_list(value: str) -> bool:
