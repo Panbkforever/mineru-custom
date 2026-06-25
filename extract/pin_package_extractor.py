@@ -202,6 +202,7 @@ def extract_pin_package_info_from_middle_json(
 def extract_pin_package_info_from_middle_json_file(
     path: str | Path,
     use_semantic_classifier: bool = False,
+    include_debug: bool = False,
 ) -> list[dict[str, Any]]:
     path = Path(path)
     middle_json = json.loads(path.read_text(encoding="utf-8"))
@@ -209,6 +210,7 @@ def extract_pin_package_info_from_middle_json_file(
         middle_json,
         source_name=path.stem,
         use_semantic_classifier=use_semantic_classifier,
+        include_debug=include_debug,
     )
 
 
@@ -470,6 +472,8 @@ def semantic_allows_pin_creation(
         return False
     if include_debug:
         print(f"semantic decision: {decision}")
+    if not any(decision.field_name == "package_pin_no" for decision in decisions) and not infer_package_name(title):
+        return False
     return bool(decision.get("should_create_pins")) and float(decision.get("confidence", 0)) >= 0.6
 
 
@@ -530,6 +534,7 @@ def extract_pin_records_from_row(
     raw_fields: dict[str, str] = {}
     fields: dict[str, str] = {}
     package_pin_values: list[tuple[str, str]] = []
+    has_package_pin_columns = any(decision.field_name == "package_pin_no" for decision in decisions)
     for decision in decisions:
         value = row[decision.index].strip() if decision.index < len(row) else ""
         if not value:
@@ -563,6 +568,13 @@ def extract_pin_records_from_row(
                     record["_raw_fields"] = raw_fields
                 records.append(record)
         return records
+
+    # If the table has explicit package-specific pin columns, rows without a
+    # value in those columns do not have a package owner. Do not fall back to a
+    # generic pin-number column, otherwise long signal-description tables create
+    # an extra pkg="" bucket from unrelated helper rows.
+    if has_package_pin_columns:
+        return []
 
     pin_no_value = fields.get("pin_no", "")
     if not pin_no_value:
@@ -951,3 +963,72 @@ def write_extraction_json(result: list[dict[str, Any]], output_path: str | Path)
         json.dumps(result, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def strip_debug_fields(result: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove extraction metadata before writing the user-facing JSON."""
+    stripped: list[dict[str, Any]] = []
+    for package in result:
+        new_package = {"pkg": package.get("pkg", ""), "group_list": []}
+        for group in package.get("group_list", []):
+            new_group = {"group": group.get("group", ""), "pin_list": []}
+            for pin in group.get("pin_list", []):
+                new_group["pin_list"].append(
+                    {
+                        key: value
+                        for key, value in pin.items()
+                        if key not in {"source", "source_page", "raw_fields"}
+                    }
+                )
+            if new_group["pin_list"]:
+                new_package["group_list"].append(new_group)
+        if new_package["group_list"]:
+            stripped.append(new_package)
+    return stripped
+
+
+def build_extraction_summary(
+    result: list[dict[str, Any]],
+    pdf_name: str = "",
+) -> dict[str, Any]:
+    """Build package/group counts and page spans for manual comparison."""
+    packages = []
+    total_pins = 0
+    for package in result:
+        groups = []
+        package_pin_count = 0
+        for group in package.get("group_list", []):
+            pins = group.get("pin_list", [])
+            pages = sorted(
+                {
+                    pin.get("source_page")
+                    for pin in pins
+                    if isinstance(pin.get("source_page"), int)
+                }
+            )
+            pin_count = len(pins)
+            package_pin_count += pin_count
+            groups.append(
+                {
+                    "group": group.get("group", ""),
+                    "pin_count": pin_count,
+                    "page_start": pages[0] if pages else None,
+                    "page_end": pages[-1] if pages else None,
+                    "pages": pages,
+                }
+            )
+        total_pins += package_pin_count
+        packages.append(
+            {
+                "pkg": package.get("pkg", ""),
+                "pin_count": package_pin_count,
+                "table_count": len(groups),
+                "group_list": groups,
+            }
+        )
+    return {
+        "pdf": pdf_name,
+        "package_count": len(packages),
+        "pin_count": total_pins,
+        "packages": packages,
+    }

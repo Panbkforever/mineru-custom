@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -113,8 +114,10 @@ def main() -> int:
     print("-" * 60)
 
     failed: list[tuple[Path, int]] = []
+    batch_summaries: list[dict] = []
     for index, pdf_path in enumerate(pdf_files, start=1):
         json_output = output_dir / f"{pdf_path.stem}.json"
+        summary_output = output_dir / f"{pdf_path.stem}_info.json"
         print(f"[{index}/{len(pdf_files)}] 处理: {pdf_path.name}")
 
         command = build_extract_command(
@@ -122,6 +125,7 @@ def main() -> int:
             pdf_path=pdf_path,
             parse_output_dir=parse_output_dir,
             json_output=json_output,
+            summary_output=summary_output,
             args=args,
         )
         return_code = subprocess.run(command).returncode
@@ -132,7 +136,14 @@ def main() -> int:
                 break
         else:
             print(f"  输出: {json_output}")
+            print(f"  信息: {summary_output}")
+            if summary_output.exists():
+                batch_summaries.append(json.loads(summary_output.read_text(encoding="utf-8")))
         print("-" * 60)
+
+    batch_summary_output = output_dir / "extraction_summary.json"
+    write_batch_summary(batch_summaries, batch_summary_output)
+    print(f"批量信息文件: {batch_summary_output}")
 
     if failed:
         print("失败文件:")
@@ -149,6 +160,7 @@ def build_extract_command(
     pdf_path: Path,
     parse_output_dir: Path,
     json_output: Path,
+    summary_output: Path,
     args: argparse.Namespace,
 ) -> list[str]:
     command = [
@@ -167,6 +179,8 @@ def build_extract_command(
         str(args.start_page),
         "--extract-output",
         str(json_output),
+        "--summary-output",
+        str(summary_output),
     ]
     if args.end_page is not None:
         command.extend(["--end-page", str(args.end_page)])
@@ -183,6 +197,19 @@ def build_extract_command(
     if args.semantic_classify:
         command.append("--semantic-classify")
     return command
+
+
+def write_batch_summary(summaries: list[dict], output_path: Path) -> None:
+    total_pins = sum(int(summary.get("pin_count", 0)) for summary in summaries)
+    total_packages = sum(int(summary.get("package_count", 0)) for summary in summaries)
+    payload = {
+        "pdf_count": len(summaries),
+        "package_count": total_packages,
+        "pin_count": total_pins,
+        "pdf_list": summaries,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":

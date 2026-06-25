@@ -15,7 +15,9 @@ import sys
 from pathlib import Path
 
 from extract.pin_package_extractor import (
+    build_extraction_summary,
     extract_pin_package_info_from_middle_json_file,
+    strip_debug_fields,
     write_extraction_json,
 )
 
@@ -64,6 +66,11 @@ def main() -> int:
         help="Output JSON path. Default: <output>/pin_package_extract.json",
     )
     parser.add_argument(
+        "--summary-output",
+        default=None,
+        help="Output extraction summary JSON path. Default: <extract-output>_info.json",
+    )
+    parser.add_argument(
         "--semantic-classify",
         action="store_true",
         help="Use DeepSeek semantic classification to filter non-pin tables. Requires DEEPSEEK_API_KEY.",
@@ -81,12 +88,13 @@ def main() -> int:
         print(f"未找到 middle_json: {output_dir}")
         return 1
 
-    extracted = []
+    extracted_with_debug = []
     for middle_file in middle_files:
-        extracted.extend(
+        extracted_with_debug.extend(
             extract_pin_package_info_from_middle_json_file(
                 middle_file,
                 use_semantic_classifier=args.semantic_classify,
+                include_debug=True,
             )
         )
 
@@ -95,8 +103,19 @@ def main() -> int:
         if args.extract_output
         else output_dir / "pin_package_extract.json"
     )
+    summary_path = (
+        Path(args.summary_output).resolve()
+        if args.summary_output
+        else output_path.with_name(f"{output_path.stem}_info.json")
+    )
+    extracted = strip_debug_fields(extracted_with_debug)
+    pdf_name = input_path.name if input_path.is_file() else input_path.resolve().name
+    summary = build_extraction_summary(extracted_with_debug, pdf_name=pdf_name)
+
     write_extraction_json(extracted, output_path)
+    write_extraction_json(summary, summary_path)
     print(f"引脚/封装字段提取完成: {output_path}")
+    print(f"提取信息文件完成: {summary_path}")
     print(f"提取 package 数: {len(extracted)}")
     print(json.dumps(extracted[:1], ensure_ascii=False, indent=2))
     return 0
