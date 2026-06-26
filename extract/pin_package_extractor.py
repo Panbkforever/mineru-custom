@@ -32,7 +32,7 @@ NUMERIC_PIN_RE = re.compile(r"^\d{1,4}$")
 PACKAGE_HEADER_RE = re.compile(
     r"\b(?:\d{2,4}\s*)?(?:qfp|lqfp|tqfp|htqfp|vqfn|vssop|ssop|tssop|qfn|"
     r"bga|pbga|nfbga|fcbga|fc csp|soic|sop|pdip|pga|clcc|lccc|dfn|wqfn|"
-    r"pm|pt|pn|pnp|pzp|pz|peu|rgc|rtd|rgz|rhb|rsh|dgs\d*|da|pw|n|rsa|"
+    r"pm|pt|pn|pnp|pzp|pz|peu|rgc|rtd|rgz|rha|rhb|rsh|dgs\d*|da|pw|n|rsa|"
     r"zce\d*[a-z]*|nzn\d*[a-z]*|zwt|zjz|zhh|zay|alv|alx|am[a-z]|"
     r"abc|alw|alz|anf|anj|zqw|pwp|rgy|rsm|rge|rte)\b",
     re.IGNORECASE,
@@ -43,7 +43,7 @@ PACKAGE_FAMILY_RE = re.compile(
     re.IGNORECASE,
 )
 PACKAGE_CODE_RE = re.compile(
-    r"\b(pm|pt|pn|pnp|pzp|pz|peu|rgc|rtd|rgz|rhb|rsh|dgs\d*|da|pw|n|rsa|"
+    r"\b(pm|pt|pn|pnp|pzp|pz|peu|rgc|rtd|rgz|rha|rhb|rsh|dgs\d*|da|pw|n|rsa|"
     r"zce\d*[a-z]*|nzn\d*[a-z]*|zwt|zjz|zhh|zay|alv|alx|am[a-z]|abc|alw|"
     r"alz|anf|anj|zqw|pwp|rgy|rsm|rge|rte)\b",
     re.IGNORECASE,
@@ -384,7 +384,7 @@ def classify_header(header: str) -> tuple[str, int]:
     if any(keyword in normalized for keyword in ("引脚类型", "信号类型", "管脚类型", "端子类型", "io 结构", "i o 结构")):
         return "type", 4
 
-    if any(keyword in normalized for keyword in IGNORE_HEADER_KEYWORDS):
+    if has_ignored_header_keyword(normalized):
         if not any(keyword in normalized for keyword in ("signal type", "pin type", "io type")):
             return "", 0
 
@@ -414,7 +414,7 @@ def classify_header(header: str) -> tuple[str, int]:
         return "type", 4
     if normalized == "type" or normalized.endswith(" type"):
         return "type", 3
-    if "i/o" in normalized or normalized == "io":
+    if "i/o" in normalized or normalized == "io" or normalized.startswith("i o"):
         return "io_type", 3
 
     if "package" in normalized and "pin" not in normalized:
@@ -427,8 +427,20 @@ def is_value_inference_blocked_header(header: str) -> bool:
     normalized = normalize_header(header)
     if not normalized:
         return False
-    if any(keyword in normalized for keyword in IGNORE_HEADER_KEYWORDS):
+    if has_ignored_header_keyword(normalized):
         return not any(keyword in normalized for keyword in ("signal type", "pin type", "io type"))
+    return False
+
+
+def has_ignored_header_keyword(normalized_header: str) -> bool:
+    """Avoid substring mistakes such as matching MIN inside TERMINAL."""
+    for keyword in IGNORE_HEADER_KEYWORDS:
+        if keyword in {"min", "typ", "nom", "max", "unit", "ret"}:
+            if re.search(rf"\b{re.escape(keyword)}\b", normalized_header):
+                return True
+            continue
+        if keyword in normalized_header:
+            return True
     return False
 
 
