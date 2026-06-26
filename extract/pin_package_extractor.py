@@ -142,6 +142,8 @@ def extract_pin_package_info_from_middle_json(
             continue
 
         header_index, headers = choose_header_row(rows)
+        if header_index < 0 and use_semantic_classifier:
+            header_index, headers = choose_loose_header_row(rows, table.title)
         if header_index < 0:
             continue
 
@@ -149,8 +151,6 @@ def extract_pin_package_info_from_middle_json(
             continue
 
         decisions = classify_columns(headers, rows[header_index + 1:], table.title)
-        if not is_pin_package_table(decisions):
-            continue
         association = resolve_table_package_association(
             table.title,
             headers,
@@ -158,14 +158,37 @@ def extract_pin_package_info_from_middle_json(
             decisions,
             build_package_snapshots(packages),
         )
-        if use_semantic_classifier and not semantic_allows_pin_creation(
-            table.title,
-            headers,
-            rows[header_index + 1:],
-            decisions,
-            has_associated_package=bool(association.package),
-            include_debug=include_debug,
-        ):
+        if use_semantic_classifier:
+            if not is_pin_package_table(decisions) and not is_semantic_candidate_table(
+                table.title,
+                headers,
+                rows[header_index + 1:],
+                decisions,
+            ):
+                continue
+            semantic_decision = classify_semantic_table(
+                table.title,
+                headers,
+                rows[header_index + 1:],
+                decisions,
+                include_debug=include_debug,
+            )
+            if not semantic_decision_allows_pin_creation(
+                semantic_decision,
+                decisions,
+                table.title,
+                has_associated_package=bool(association.package),
+            ):
+                continue
+            decisions = merge_semantic_column_decisions(
+                decisions,
+                semantic_decision,
+                headers,
+            )
+        elif not is_pin_package_table(decisions):
+            continue
+
+        if not is_pin_package_table(decisions):
             continue
 
         default_pkg = association.package or infer_package_name(table.title)
@@ -307,6 +330,25 @@ def choose_header_row(rows: list[list[str]]) -> tuple[int, list[str]]:
             best_score = score
             best_headers = headers
     if best_score < 4:
+        return -1, []
+    return best_index, best_headers
+
+
+def choose_loose_header_row(rows: list[list[str]], title: str = "") -> tuple[int, list[str]]:
+    """Choose a possible header row for semantic classification."""
+    best_index = -1
+    best_score = 0
+    best_headers: list[str] = []
+    for index, _row in enumerate(rows[:4]):
+        headers = build_combined_headers(rows, index)
+        score = score_loose_table_evidence(title, headers, rows[index + 1 : index + 6])
+        if is_ordering_table(headers):
+            score -= 4
+        if score > best_score:
+            best_index = index
+            best_score = score
+            best_headers = headers
+    if best_score < 3:
         return -1, []
     return best_index, best_headers
 
@@ -476,14 +518,13 @@ def is_pin_package_table(decisions: list[ColumnDecision]) -> bool:
     return has_number and has_name and has_explicit_number_header
 
 
-def semantic_allows_pin_creation(
+def classify_semantic_table(
     title: str,
     headers: list[str],
     data_rows: list[list[str]],
     decisions: list[ColumnDecision],
-    has_associated_package: bool = False,
     include_debug: bool = False,
-) -> bool:
+) -> dict[str, Any]:
     from extract.semantic_classifier import classify_table_semantics
 
     try:
@@ -495,16 +536,237 @@ def semantic_allows_pin_creation(
         )
     except Exception as exc:
         print(f"语义分类失败，跳过当前表格: {exc}")
-        return False
+        return {}
     if include_debug:
         print(f"semantic decision: {decision}")
+    return decision
+
+
+def semantic_decision_allows_pin_creation(
+    semantic_decision: dict[str, Any],
+    decisions: list[ColumnDecision],
+    title: str,
+    has_associated_package: bool = False,
+) -> bool:
+    if not semantic_decision:
+        return False
     if (
         not any(decision.field_name == "package_pin_no" for decision in decisions)
         and not infer_package_name(title)
         and not has_associated_package
+        and not semantic_decision.get("package_columns")
     ):
         return False
-    return bool(decision.get("should_create_pins")) and float(decision.get("confidence", 0)) >= 0.6
+    return bool(semantic_decision.get("should_create_pins")) and float(semantic_decision.get("confidence", 0)) >= 0.6
+
+
+def is_semantic_candidate_table(
+    title: str,
+    headers: list[str],
+    data_rows: list[list[str]],
+    decisions: list[ColumnDecision],
+) -> bool:
+    """Loose recall before DeepSeek; final extraction still needs strict checks."""
+    if is_ordering_table(headers):
+        return False
+    if is_pin_package_table(decisions):
+        return True
+    return score_loose_table_evidence(title, headers, data_rows[:5]) >= 3 and has_loose_pin_mapping_shape(title, headers)
+
+
+def score_loose_table_evidence(
+    title: str,
+    headers: list[str],
+    sample_rows: list[list[str]],
+) -> int:
+    title_text = normalize_header(title)
+    header_text = normalize_header(" ".join(headers))
+    text = " ".join([title_text, header_text]).strip()
+    score = 0
+    if any(keyword in header_text for keyword in ("pin", "ball", "terminal", "signal", "package", "引脚", "端子", "封装", "信号")):
+        score += 2
+    if any(keyword in title_text for keyword in ("pin attributes", "signal descriptions", "terminal functions", "connectivity requirements")):
+        score += 1
+    if any(keyword in header_text for keyword in ("pin attributes", "signal descriptions", "terminal functions", "connectivity requirements")):
+        score += 2
+    if "i/o" in header_text or "i o" in header_text or "type" in header_text:
+        score += 1
+    if PACKAGE_HEADER_RE.search(header_text):
+        score += 1
+    sample_text = " ".join(" ".join(row[:8]) for row in sample_rows)
+    if BALL_TOKEN_RE.search(sample_text):
+        score += 1
+    if has_ignored_header_keyword(header_text) and not any(keyword in header_text for keyword in ("pin", "ball", "terminal", "signal", "package")):
+        score -= 2
+    return score
+
+
+def has_loose_pin_mapping_shape(title: str, headers: list[str]) -> bool:
+    """Require mapping-like columns before spending an LLM call."""
+    title_text = normalize_header(title)
+    header_text = normalize_header(" ".join(headers))
+    has_number_column = any(
+        keyword in header_text
+        for keyword in (
+            "pin no",
+            "pin number",
+            "ball number",
+            "ball no",
+            "terminal no",
+            "terminal number",
+            "引脚编号",
+            "端子编号",
+        )
+    )
+    has_name_column = any(
+        keyword in header_text
+        for keyword in (
+            "pin name",
+            "ball name",
+            "terminal name",
+            "signal name",
+            "device signal",
+            "引脚名称",
+            "端子名称",
+            "信号名称",
+        )
+    )
+    if has_number_column and has_name_column:
+        return True
+    if "connectivity requirements" in title_text and has_number_column:
+        return True
+    if "package" in title_text and has_number_column and any(keyword in header_text for keyword in ("name", "signal")):
+        return True
+    return False
+
+
+def merge_semantic_column_decisions(
+    rule_decisions: list[ColumnDecision],
+    semantic_decision: dict[str, Any],
+    headers: list[str],
+) -> list[ColumnDecision]:
+    semantic_decisions = build_semantic_column_decisions(semantic_decision, headers)
+    if not semantic_decisions:
+        return rule_decisions
+
+    merged_by_index: dict[int, ColumnDecision] = {decision.index: decision for decision in rule_decisions}
+    for decision in semantic_decisions:
+        existing = merged_by_index.get(decision.index)
+        if not existing or semantic_field_priority(decision.field_name) >= semantic_field_priority(existing.field_name):
+            merged_by_index[decision.index] = decision
+    return sorted(merged_by_index.values(), key=lambda decision: decision.index)
+
+
+def build_semantic_column_decisions(
+    semantic_decision: dict[str, Any],
+    headers: list[str],
+) -> list[ColumnDecision]:
+    decisions: list[ColumnDecision] = []
+    for item in semantic_decision.get("package_columns") or []:
+        index = parse_column_index(item.get("column_index"))
+        pkg = str(item.get("pkg") or "").strip()
+        if index is None or is_generic_package_label(pkg):
+            continue
+        decisions.append(
+            ColumnDecision(
+                index=index,
+                raw_header=pkg or safe_header(headers, index),
+                field_name="package_pin_no",
+                score=10,
+            )
+        )
+
+    for item in semantic_decision.get("pin_columns") or []:
+        index = parse_column_index(item.get("column_index"))
+        if index is None:
+            continue
+        decisions.append(
+            ColumnDecision(
+                index=index,
+                raw_header=safe_header(headers, index),
+                field_name="pin_no",
+                score=8,
+            )
+        )
+
+    for item in semantic_decision.get("name_columns") or []:
+        index = parse_column_index(item.get("column_index"))
+        if index is None:
+            continue
+        role = str(item.get("field") or "pin_name").strip()
+        decisions.append(
+            ColumnDecision(
+                index=index,
+                raw_header=safe_header(headers, index),
+                field_name=semantic_role_to_field(role, default="pin_name"),
+                score=8,
+            )
+        )
+
+    for item in semantic_decision.get("type_columns") or []:
+        index = parse_column_index(item.get("column_index"))
+        if index is None:
+            continue
+        decisions.append(
+            ColumnDecision(
+                index=index,
+                raw_header=safe_header(headers, index),
+                field_name="type",
+                score=8,
+            )
+        )
+    return decisions
+
+
+def parse_column_index(value: Any) -> int | None:
+    try:
+        index = int(value)
+    except (TypeError, ValueError):
+        return None
+    return index if index >= 0 else None
+
+
+def safe_header(headers: list[str], index: int) -> str:
+    return headers[index] if 0 <= index < len(headers) else f"column_{index + 1}"
+
+
+def semantic_role_to_field(role: str, default: str) -> str:
+    role = normalize_header(role)
+    if role in {"ball name", "signal name", "terminal name", "pin name"}:
+        return role.replace(" ", "_")
+    if role in {"pin_no", "pin no", "pin number", "ball number", "terminal number"}:
+        return "pin_no"
+    return default
+
+
+def semantic_field_priority(field_name: str) -> int:
+    return {
+        "package_pin_no": 5,
+        "pin_no": 4,
+        "ball_no": 4,
+        "terminal_no": 4,
+        "pin_name": 3,
+        "ball_name": 3,
+        "signal_name": 3,
+        "terminal_name": 3,
+        "type": 2,
+        "io_type": 2,
+    }.get(field_name, 1)
+
+
+def is_generic_package_label(value: str) -> bool:
+    normalized = normalize_header(value)
+    return normalized in {
+        "",
+        "pin",
+        "pins",
+        "pin no",
+        "pin number",
+        "ball number",
+        "terminal number",
+        "package",
+        "package name",
+    }
 
 
 def score_package_column(header: str, values: list[str], title_context: str = "") -> int:
