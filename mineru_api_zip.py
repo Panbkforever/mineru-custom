@@ -405,9 +405,31 @@ def apply_post_table_correction(output_dir: Path):
             logging.info("Processing: %s", md_file.name)
             # fix_markdown_file 会原地修改文件（output_path=None 时覆盖原文件）
             fix_table_ocr(str(md_file), output_path=None)
+            write_final_markdown_json(md_file)
             logging.info("Corrected: %s", md_file.name)
         except Exception as e:
             logging.warning("Failed to correct %s: %s", md_file.name, e)
+
+
+def write_final_markdown_json(md_path: Path) -> Path:
+    """
+    将最终 Markdown 同步保存为同名 JSON。
+
+    这个 JSON 是最终 .md 的结构化副本，不是 MinerU 的 middle_json/model_json。
+    它在 Markdown 表格后处理完成后生成，确保内容和最终 .md 一致。
+    """
+    md_content = md_path.read_text(encoding="utf-8")
+    json_path = md_path.with_suffix(".json")
+    payload = {
+        "document_name": md_path.stem,
+        "markdown_file": md_path.name,
+        "markdown": md_content,
+    }
+    json_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return json_path
 
 
 def make_zip(output_dir: Path, zip_path: Path):

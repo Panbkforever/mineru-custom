@@ -190,6 +190,28 @@ from post_table.restore_cell_line_breaks import (  # noqa: E402
 )
 
 
+def write_final_markdown_json(md_path: Path) -> Path:
+    """
+    将最终 Markdown 同步保存为同名 JSON。
+
+    注意：这个 JSON 不是 MinerU 的 middle_json/model_json，而是最终 .md 的
+    结构化副本。它在所有 Markdown 后处理完成后生成，因此内容和最终 .md
+    一一对应，便于后续提取任务直接读取最终结果。
+    """
+    md_content = md_path.read_text(encoding="utf-8")
+    json_path = md_path.with_suffix(".json")
+    payload = {
+        "document_name": md_path.stem,
+        "markdown_file": md_path.name,
+        "markdown": md_content,
+    }
+    json_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return json_path
+
+
 def apply_post_table_correction(doc_output_dir: Path) -> tuple[int, int]:
     """
     对单个文档输出目录中的 Markdown 文件执行表格 OCR 后处理。
@@ -228,7 +250,8 @@ def apply_post_table_correction(doc_output_dir: Path) -> tuple[int, int]:
 
         for md_path in md_files:
             fix_markdown_file(str(md_path))  # output_path=None -> 覆盖原文件
-            print(f"  ✅ 已修正: {md_path.name}  ({md_path.parent.name})")
+            json_path = write_final_markdown_json(md_path)
+            print(f"  ✅ 已修正: {md_path.name}  ({md_path.parent.name})，同步 JSON: {json_path.name}")
             fixed_count += 1
 
     return fixed_count, skip_count
