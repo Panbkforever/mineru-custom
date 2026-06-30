@@ -984,40 +984,24 @@ def get_or_create_group(package_bucket: dict[str, Any], group_name: str) -> Extr
 
 
 def add_pin_record_to_group(group: ExtractedGroup, pin_record: dict[str, Any]) -> None:
-    pin_no = pin_record.get("pin_no", "")
-    if not pin_no:
-        group.pin_list.append(pin_record)
-        return
-
-    new_type_key = normalize_pin_type_key(pin_record.get("type", ""))
-    for existing_record in group.pin_list:
-        if existing_record.get("pin_no") == pin_no and pin_types_compatible(
-            normalize_pin_type_key(existing_record.get("type", "")),
-            new_type_key,
-        ):
-            merge_pin_record(existing_record, pin_record)
-            return
-    group.pin_list.append(pin_record)
+    # 项目规则：引脚记录不按 pin_no 合并。同一个 pin_no 多次出现时，
+    # 每条记录独立输出；这里只做输出前字段清洗。
+    group.pin_list.append(normalize_pin_record(pin_record))
 
 
-def normalize_pin_type_key(value: Any) -> str:
-    """Normalize type text used only for deciding whether duplicate pins merge."""
-    value = plain_text(str(value or "")).upper()
+def normalize_pin_record(pin_record: dict[str, Any]) -> dict[str, Any]:
+    record = dict(pin_record)
+    record["pin_no"] = plain_text(str(record.get("pin_no", ""))).strip()
+    record["pin_name"] = clean_pin_name(record.get("pin_name", ""))
+    return record
+
+
+def clean_pin_name(value: Any) -> str:
+    value = plain_text(str(value or "")).strip()
+    value = re.sub(r"\s*\(\s*\d+\s*\)\s*$", "", value)
+    value = re.sub(r"\s*\(\s*continued\s*\)\s*$", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\s+", " ", value).strip()
-    return value
-
-
-def pin_types_compatible(existing_type: str, new_type: str) -> bool:
-    """
-    Only merge repeated pin numbers when their type is the same.
-
-    Empty type is treated as incomplete data and can be filled by a typed record.
-    If both records have explicit but different types, they represent separate
-    rows in the final JSON.
-    """
-    if not existing_type or not new_type:
-        return True
-    return existing_type == new_type
+    return value or "Reserved"
 
 
 def merge_pin_record(existing_record: dict[str, Any], new_record: dict[str, Any]) -> None:
