@@ -193,7 +193,11 @@ def extract_pin_package_info_from_middle_json(
             continue
 
         default_pkg = association.package or infer_package_name(table.title)
-        group_name = infer_group_name(table.title) or "Pin/Package Table"
+        group_name = (
+            infer_group_name(table.title)
+            or infer_group_name_from_headers(headers, default_pkg)
+            or "Pin/Package Table"
+        )
         current_group_name = group_name
 
         for row in rows[header_index + 1:]:
@@ -214,7 +218,12 @@ def extract_pin_package_info_from_middle_json(
                     packages,
                     package_identity,
                 )
-                current_group = get_or_create_group(package_bucket, current_group_name)
+                record_group_name = (
+                    infer_group_name_from_headers(headers, record_pkg)
+                    if is_generic_group_name(current_group_name)
+                    else current_group_name
+                )
+                current_group = get_or_create_group(package_bucket, record_group_name)
                 if include_debug and source_name:
                     pin_record.setdefault("source", source_name)
                 if include_debug and table.page_idx is not None:
@@ -517,6 +526,9 @@ def classify_header(header: str) -> tuple[str, int]:
     if "pad name" in normalized:
         return "pad_name", 3
 
+    if normalized == "function" or normalized.endswith(" function"):
+        return "", 0
+
     if "signal type" in normalized or "pin type" in normalized:
         return "type", 4
     if normalized == "type" or normalized.endswith(" type"):
@@ -534,6 +546,8 @@ def is_value_inference_blocked_header(header: str) -> bool:
     normalized = normalize_header(header)
     if not normalized:
         return False
+    if normalized == "function" or normalized.endswith(" function"):
+        return True
     if has_ignored_header_keyword(normalized):
         return not any(keyword in normalized for keyword in ("signal type", "pin type", "io type"))
     return False
@@ -1121,6 +1135,46 @@ def infer_group_name(text: str) -> str:
     if section_match:
         return clean_group_name(section_match.group(1))
     return ""
+
+
+def infer_group_name_from_headers(headers: list[str], package_name: str = "") -> str:
+    """Infer table-level group when MinerU did not keep the table title nearby."""
+    normalized_headers = [normalize_header(header) for header in headers]
+    header_text = " ".join(normalized_headers)
+    suffix = package_group_suffix(package_name)
+
+    has_pin_no = any(
+        keyword in header_text
+        for keyword in ("pin no", "pin number", "ball number", "ball no", "terminal no", "terminal number")
+    )
+    has_signal_name = any(
+        keyword in header_text
+        for keyword in ("signal name", "pin name", "ball name", "terminal name")
+    )
+    if not (has_pin_no and has_signal_name):
+        return ""
+
+    if any(keyword in header_text for keyword in ("buffer type", "power source", "reset state after")):
+        return f"Pin Attributes{suffix}"
+    if "description" in header_text and ("function" in header_text or "signal type" in header_text):
+        return f"Signal Descriptions{suffix}"
+    if "connection requirements" in header_text or "connectivity requirements" in header_text:
+        return f"Connectivity Requirements{suffix}"
+    return ""
+
+
+def package_group_suffix(package_name: str) -> str:
+    package_name = clean_package_label(package_name)
+    if not package_name:
+        return ""
+    normalized = normalize_header(package_name)
+    if "package" in normalized:
+        return f", {package_name}"
+    return f", {package_name} Package"
+
+
+def is_generic_group_name(value: str) -> bool:
+    return clean_group_name(value) in {"", "Pin/Package Table"}
 
 
 def clean_group_name(value: str) -> str:
