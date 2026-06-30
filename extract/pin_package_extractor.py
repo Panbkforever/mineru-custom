@@ -989,11 +989,35 @@ def add_pin_record_to_group(group: ExtractedGroup, pin_record: dict[str, Any]) -
         group.pin_list.append(pin_record)
         return
 
+    new_type_key = normalize_pin_type_key(pin_record.get("type", ""))
     for existing_record in group.pin_list:
-        if existing_record.get("pin_no") == pin_no:
+        if existing_record.get("pin_no") == pin_no and pin_types_compatible(
+            normalize_pin_type_key(existing_record.get("type", "")),
+            new_type_key,
+        ):
             merge_pin_record(existing_record, pin_record)
             return
     group.pin_list.append(pin_record)
+
+
+def normalize_pin_type_key(value: Any) -> str:
+    """Normalize type text used only for deciding whether duplicate pins merge."""
+    value = plain_text(str(value or "")).upper()
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def pin_types_compatible(existing_type: str, new_type: str) -> bool:
+    """
+    Only merge repeated pin numbers when their type is the same.
+
+    Empty type is treated as incomplete data and can be filled by a typed record.
+    If both records have explicit but different types, they represent separate
+    rows in the final JSON.
+    """
+    if not existing_type or not new_type:
+        return True
+    return existing_type == new_type
 
 
 def merge_pin_record(existing_record: dict[str, Any], new_record: dict[str, Any]) -> None:
