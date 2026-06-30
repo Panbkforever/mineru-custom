@@ -185,6 +185,7 @@ def extract_pin_package_info_from_middle_json(
                 semantic_decision,
                 headers,
             )
+            decisions = keep_primary_type_decision(decisions, rows[header_index + 1:])
         elif not is_pin_package_table(decisions):
             continue
 
@@ -406,7 +407,71 @@ def classify_columns(
                     score=score,
                 )
             )
-    return decisions
+    return keep_primary_type_decision(decisions, data_rows)
+
+
+def keep_primary_type_decision(
+    decisions: list[ColumnDecision],
+    data_rows: list[list[str]],
+) -> list[ColumnDecision]:
+    """Keep only the most relevant type-like column.
+
+    Some tables contain both SIGNAL TYPE and BUFFER TYPE. The extractor should
+    output one `type` field, so we choose the column most likely to describe the
+    pin/signal itself by header meaning, value shape, and left-to-right order.
+    """
+    type_decisions = [
+        decision
+        for decision in decisions
+        if normalize_field_name(decision.field_name) == "type"
+    ]
+    if len(type_decisions) <= 1:
+        return decisions
+
+    best_type = max(
+        type_decisions,
+        key=lambda decision: score_type_column_relevance(decision, data_rows),
+    )
+    return [
+        decision
+        for decision in decisions
+        if normalize_field_name(decision.field_name) != "type" or decision.index == best_type.index
+    ]
+
+
+def score_type_column_relevance(
+    decision: ColumnDecision,
+    data_rows: list[list[str]],
+) -> tuple[int, int]:
+    normalized_header = normalize_header(decision.raw_header)
+    score = decision.score
+
+    if any(keyword in normalized_header for keyword in ("signal type", "pin type", "terminal type", "io type", "i o type", "i/o type")):
+        score += 20
+    if normalized_header in {"type", "i/o", "io", "i o"}:
+        score += 10
+    if any(keyword in normalized_header for keyword in ("buffer type", "buffer", "reset", "state", "power source", "supply", "source")):
+        score -= 15
+
+    values = [
+        row[decision.index]
+        for row in data_rows[:30]
+        if decision.index < len(row) and row[decision.index].strip()
+    ]
+    score += score_type_column_values(values)
+    # Earlier columns are preferred when semantic evidence is otherwise close.
+    return score, -decision.index
+
+
+def score_type_column_values(values: list[str]) -> int:
+    if not values:
+        return 0
+    sample = [normalize_header(value).replace(" ", "") for value in values[:20]]
+    signal_type_tokens = {"i", "o", "io", "ioz", "i/o", "i/o/z", "oz", "odz", "od", "p", "ipu", "ipd"}
+    buffer_type_tokens = {"analog", "digital", "power", "ground", "gnd", "supply", "buffer"}
+    signal_hits = sum(1 for value in sample if value in signal_type_tokens)
+    buffer_hits = sum(1 for value in sample if value in buffer_type_tokens)
+    return signal_hits * 3 - buffer_hits
 
 
 def classify_header(header: str) -> tuple[str, int]:
