@@ -975,7 +975,7 @@ def append_package_alias(package_bucket: dict[str, Any], alias: str) -> None:
 
 
 def get_or_create_group(package_bucket: dict[str, Any], group_name: str) -> ExtractedGroup:
-    group_name = group_name.strip() or "Pin/Package Table"
+    group_name = clean_group_name(group_name) or "Pin/Package Table"
     groups = package_bucket["_groups"]
     if group_name not in groups:
         groups[group_name] = ExtractedGroup(group=group_name)
@@ -1060,9 +1060,18 @@ def infer_group_name(text: str) -> str:
 
 def clean_group_name(value: str) -> str:
     value = re.sub(r"\s+", " ", plain_text(value)).strip()
+    # 续表标题和原表标题应归到同一个 group。
+    value = re.sub(r"\s*[\(（]\s*continued\s*[\)）]\s*", " ", value, flags=re.IGNORECASE)
+    # 输出 group 只保留语义标题，不保留 Table/表格 编号前缀。
+    value = re.sub(
+        r"^(?:table|表格?|表)\s*[\w.\-一二三四五六七八九十百千万]+\.?\s*[:：.\-–—]?\s*",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
     if len(value) > 180:
         value = value[:180].rsplit(" ", 1)[0].strip()
-    return value
+    return re.sub(r"\s+", " ", value).strip()
 
 
 def is_group_row(row: list[str]) -> bool:
