@@ -48,13 +48,19 @@ def build_prompt_payload(
     decisions: list[Any],
 ) -> dict[str, Any]:
     return {
-        "task": "Classify whether this table expresses package-to-physical-pin mapping.",
+        "task": "Classify whether this table expresses semiconductor pin/terminal/ball records.",
         "target_relation": {
-            "description": "A valid table must map package identities to physical pin/ball/terminal numbers, and connect those physical pins to pin/ball/signal names or types.",
+            "description": (
+                "A valid table may either map package identities to physical pin/ball/terminal "
+                "numbers, or directly map physical pin/ball/terminal numbers to signal names "
+                "and optional pin/signal types. A package name is useful but not required for "
+                "single-package signal description tables."
+            ),
             "valid_examples": [
                 "ZCE Ball Number | NZN Ball Number | Ball Name | Signal Name | Signal Type",
                 "64 LQFP | 48 VQFN | Pin Name | Type",
                 "TERMINAL NAME | NO. | I/O | DESCRIPTION",
+                "SIGNAL NAME | SIGNAL NO. | TYPE | DESCRIPTION",
                 "Connectivity Requirements - AM273x ZCE Package with BALL NUMBER and BALL NAME",
             ],
             "invalid_examples": [

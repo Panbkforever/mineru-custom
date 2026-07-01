@@ -804,8 +804,15 @@ def semantic_decision_allows_pin_creation(
 ) -> bool:
     if not semantic_decision:
         return False
+    fields = {decision.field_name for decision in decisions}
+    has_direct_pin_mapping = bool(
+        fields & {"pin_no", "ball_no", "terminal_no"}
+    ) and bool(
+        fields & {"pin_name", "ball_name", "signal_name", "terminal_name", "pad_name"}
+    )
     if (
-        not any(decision.field_name == "package_pin_no" for decision in decisions)
+        not has_direct_pin_mapping
+        and not any(decision.field_name == "package_pin_no" for decision in decisions)
         and not infer_package_name(title)
         and not has_associated_package
         and not semantic_decision.get("package_columns")
