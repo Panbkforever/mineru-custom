@@ -17,6 +17,7 @@ from pathlib import Path
 from extract.pin_package_extractor import (
     build_extraction_summary,
     extract_pin_package_info_from_middle_json_file,
+    extract_pin_package_info_from_markdown_json_file,
     strip_debug_fields,
     write_extraction_json,
 )
@@ -83,16 +84,23 @@ def main() -> int:
     if not args.skip_parse:
         run_parse_doc(args, output_dir)
 
-    middle_files = find_middle_json_files(input_path, output_dir)
-    if not middle_files:
-        print(f"未找到 middle_json: {output_dir}")
+    parsed_json_files = find_parsed_markdown_json_files(input_path, output_dir)
+    middle_files = [] if parsed_json_files else find_middle_json_files(input_path, output_dir)
+    source_files = parsed_json_files or middle_files
+    if not source_files:
+        print(f"未找到可提取的解析 JSON: {output_dir}")
         return 1
 
     extracted_with_debug = []
-    for middle_file in middle_files:
+    for source_file in source_files:
+        extractor = (
+            extract_pin_package_info_from_markdown_json_file
+            if source_file in parsed_json_files
+            else extract_pin_package_info_from_middle_json_file
+        )
         extracted_with_debug.extend(
-            extract_pin_package_info_from_middle_json_file(
-                middle_file,
+            extractor(
+                source_file,
                 use_semantic_classifier=args.semantic_classify,
                 include_debug=True,
             )
@@ -157,6 +165,28 @@ def find_middle_json_files(input_path: Path, output_dir: Path) -> list[Path]:
         if candidate_root.exists():
             return sorted(candidate_root.rglob("*_middle.json"))
     return sorted(output_dir.rglob("*_middle.json"))
+
+
+def find_parsed_markdown_json_files(input_path: Path, output_dir: Path) -> list[Path]:
+    """Prefer final post-processed JSON files that contain rendered markdown."""
+    candidates: list[Path]
+    if input_path.is_file():
+        candidate_root = output_dir / input_path.stem
+        candidates = sorted(candidate_root.rglob(f"{input_path.stem}.json")) if candidate_root.exists() else []
+    else:
+        candidates = sorted(output_dir.rglob("*.json"))
+    return [path for path in candidates if is_parsed_markdown_json(path)]
+
+
+def is_parsed_markdown_json(path: Path) -> bool:
+    if path.name.endswith(("_middle.json", "_model.json", "_info.json")):
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    markdown = data.get("markdown") if isinstance(data, dict) else None
+    return isinstance(markdown, str) and "<table" in markdown.lower()
 
 
 if __name__ == "__main__":

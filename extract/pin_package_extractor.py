@@ -260,6 +260,147 @@ def extract_pin_package_info_from_middle_json_file(
     )
 
 
+def extract_pin_package_info_from_markdown_json_file(
+    path: str | Path,
+    use_semantic_classifier: bool = False,
+    include_debug: bool = False,
+) -> list[dict[str, Any]]:
+    """Extract from the final post-processed JSON written beside the md file.
+
+    MinerU's middle_json is generated before some of our table post-processing.
+    The final `<pdf>.json` stores the same markdown shown to the user, so reading
+    it keeps extraction aligned with the corrected tables.
+    """
+    path = Path(path)
+    parsed_json = json.loads(path.read_text(encoding="utf-8"))
+    markdown = parsed_json.get("markdown") if isinstance(parsed_json, dict) else ""
+    if not isinstance(markdown, str) or "<table" not in markdown.lower():
+        return []
+    return extract_pin_package_info_from_table_candidates(
+        iter_table_candidates_from_markdown(markdown),
+        source_name=path.stem,
+        use_semantic_classifier=use_semantic_classifier,
+        include_debug=include_debug,
+    )
+
+
+def extract_pin_package_info_from_table_candidates(
+    tables: list[TableCandidate],
+    source_name: str = "",
+    include_debug: bool = False,
+    use_semantic_classifier: bool = False,
+) -> list[dict[str, Any]]:
+    packages: dict[str, dict[str, Any]] = {}
+
+    for table in tables:
+        rows = parse_html_table(table.html)
+        if len(rows) < 2:
+            continue
+
+        header_index, headers = choose_header_row(rows)
+        if header_index < 0 and use_semantic_classifier:
+            header_index, headers = choose_loose_header_row(rows, table.title)
+        if header_index < 0:
+            continue
+
+        if is_ordering_table(headers):
+            continue
+
+        decisions = classify_columns(headers, rows[header_index + 1:], table.title)
+        association = resolve_table_package_association(
+            table.title,
+            headers,
+            rows[header_index + 1:],
+            decisions,
+            build_package_snapshots(packages),
+        )
+        if use_semantic_classifier:
+            if not is_pin_package_table(decisions) and not is_semantic_candidate_table(
+                table.title,
+                headers,
+                rows[header_index + 1:],
+                decisions,
+            ):
+                continue
+            semantic_decision = classify_semantic_table(
+                table.title,
+                headers,
+                rows[header_index + 1:],
+                decisions,
+                include_debug=include_debug,
+            )
+            if not semantic_decision_allows_pin_creation(
+                semantic_decision,
+                decisions,
+                table.title,
+                has_associated_package=bool(association.package),
+            ):
+                continue
+            decisions = merge_semantic_column_decisions(
+                decisions,
+                semantic_decision,
+                headers,
+            )
+            decisions = keep_primary_type_decision(decisions, rows[header_index + 1:])
+        elif not is_pin_package_table(decisions):
+            continue
+
+        if not is_pin_package_table(decisions):
+            continue
+
+        default_pkg = association.package or infer_package_name(table.title)
+        group_name = (
+            infer_group_name(table.title)
+            or infer_group_name_from_headers(headers, default_pkg)
+            or "Pin/Package Table"
+        )
+        current_group_name = group_name
+
+        for row in rows[header_index + 1:]:
+            if is_group_row(row):
+                group_text = first_non_empty(row)
+                if group_text:
+                    current_group_name = group_text
+                continue
+
+            pin_records = extract_pin_records_from_row(row, decisions)
+            for pin_record in pin_records:
+                record_pkg = pin_record.pop("_pkg", default_pkg)
+                raw_fields = pin_record.pop("_raw_fields", None)
+                if include_debug and raw_fields:
+                    pin_record["raw_fields"] = raw_fields
+                package_identity = build_package_identity(record_pkg)
+                package_bucket = get_package_bucket(
+                    packages,
+                    package_identity,
+                )
+                record_group_name = (
+                    infer_group_name_from_headers(headers, record_pkg)
+                    if is_generic_group_name(current_group_name)
+                    else current_group_name
+                )
+                current_group = get_or_create_group(package_bucket, record_group_name)
+                if include_debug and source_name:
+                    pin_record.setdefault("source", source_name)
+                if include_debug and table.page_idx is not None:
+                    pin_record.setdefault("source_page", table.page_idx + 1)
+                add_pin_record_to_group(current_group, pin_record)
+
+    result = []
+    for package_bucket in packages.values():
+        groups = [
+            {"group": group.group, "pin_list": group.pin_list}
+            for group in package_bucket["_groups"].values()
+            if group.pin_list
+        ]
+        if groups:
+            package_result = {"pkg": package_bucket["pkg"], "group_list": groups}
+            if include_debug:
+                package_result["pkg_key"] = package_bucket["pkg_key"]
+            result.append(package_result)
+    return result
+
+
 def iter_table_candidates(middle_json: dict[str, Any]) -> list[TableCandidate]:
     """Return HTML tables with nearby text as weak title context."""
     candidates: list[TableCandidate] = []
@@ -286,6 +427,33 @@ def iter_table_candidates(middle_json: dict[str, Any]) -> list[TableCandidate]:
                     current_section_title = detected_group
                 recent_texts.append(text)
                 recent_texts = recent_texts[-10:]
+    return candidates
+
+
+def iter_table_candidates_from_markdown(markdown: str) -> list[TableCandidate]:
+    """Return HTML tables from final markdown with nearby heading text."""
+    candidates: list[TableCandidate] = []
+    table_re = re.compile(r"<table\b.*?</table>", re.DOTALL | re.IGNORECASE)
+    recent_texts: list[str] = []
+    current_section_title = ""
+    cursor = 0
+
+    for match in table_re.finditer(markdown):
+        before = markdown[cursor : match.start()]
+        for line in before.splitlines():
+            text = plain_text(line).strip()
+            if not text:
+                continue
+            detected_group = infer_group_name(text)
+            if detected_group:
+                current_section_title = detected_group
+            recent_texts.append(text)
+            recent_texts = recent_texts[-10:]
+
+        title = current_section_title or " ".join(dedupe_preserve_order(recent_texts[-5:])).strip()
+        candidates.append(TableCandidate(html=match.group(0), page_idx=None, title=title))
+        cursor = match.end()
+
     return candidates
 
 
@@ -506,7 +674,9 @@ def classify_header(header: str) -> tuple[str, int]:
 
     if "ball num" in normalized or "ball number" in normalized:
         return "pin_no", 5
-    if normalized in {"no", "no.", "number"} or "pin no" in normalized:
+    if normalized in {"no", "no.", "number", "signal no", "signal no."} or "pin no" in normalized:
+        return "pin_no", 4
+    if "signal number" in normalized:
         return "pin_no", 4
     if "terminal no" in normalized or "terminal number" in normalized:
         return "pin_no", 4
@@ -594,7 +764,12 @@ def is_pin_package_table(decisions: list[ColumnDecision]) -> bool:
         and classify_header(decision.raw_header)[1] >= 4
         for decision in decisions
     )
-    return has_number and has_name and has_explicit_number_header
+    has_explicit_name_header = any(
+        decision.field_name in {"pin_name", "ball_name", "signal_name", "terminal_name", "pad_name"}
+        and classify_header(decision.raw_header)[1] >= 3
+        for decision in decisions
+    )
+    return has_number and has_name and has_explicit_number_header and has_explicit_name_header
 
 
 def classify_semantic_table(
@@ -1395,7 +1570,7 @@ def merge_field_value(existing: str, value: str) -> str:
 def normalize_header(value: str) -> str:
     value = plain_text(value).lower()
     value = re.sub(r"\[[^\]]+\]", " ", value)
-    value = re.sub(r"[†‡*]+", " ", value)
+    value = re.sub(r"[$\\^†‡*]+", " ", value)
     value = re.sub(r"[、，,]+", " ", value)
     value = re.sub(r"[_\-/]+", " ", value)
     value = re.sub(r"\s+", " ", value).strip()
