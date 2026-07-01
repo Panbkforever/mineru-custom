@@ -262,6 +262,8 @@ def _expand_colspan_in_table(table_html: str) -> str:
         tr_close = tr_match.group(3)
 
         new_cells: list[str] = []
+        expanded_cell_values: list[str] = []
+        original_cells: list[tuple[str, str, str, int]] = []
 
         for cell_match in cell_pattern.finditer(tr_content):
             tag_open = cell_match.group(1)
@@ -276,6 +278,8 @@ def _expand_colspan_in_table(table_html: str) -> str:
             if cs_match:
                 colspan = int(cs_match.group(1))
 
+            original_cells.append((tag_open, inner, tag_close, colspan))
+
             if colspan > 1:
                 # 移除 colspan 属性，生成干净的单元格标签
                 clean_tag = _remove_colspan_attr(tag_open)
@@ -283,11 +287,16 @@ def _expand_colspan_in_table(table_html: str) -> str:
                 # 复制 colspan 份
                 for _ in range(colspan):
                     new_cells.append(cell_html)
+                    expanded_cell_values.append(_plain_cell_text(inner))
             else:
                 # 无 colspan，直接保留
                 new_cells.append(tag_open + inner + tag_close)
+                expanded_cell_values.append(_plain_cell_text(inner))
 
-        new_row_content = "".join(new_cells)
+        if _is_same_content_group_row(expanded_cell_values):
+            new_row_content = _build_group_row_cells(original_cells, len(expanded_cell_values))
+        else:
+            new_row_content = "".join(new_cells)
         result_rows.append(tr_open + new_row_content + tr_close)
 
     # 重新拼接表格
@@ -320,3 +329,46 @@ def _remove_colspan_attr(tag_open: str) -> str:
         flags=re.IGNORECASE
     )
     return result
+
+
+def _plain_cell_text(inner: str) -> str:
+    """Return normalized visible text for deciding whether a row is a group title."""
+    text = re.sub(r"<br\s*/?>", " ", inner, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"&nbsp;", " ", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_same_content_group_row(values: list[str]) -> bool:
+    """
+    True when colspan expansion would create a row full of identical text.
+
+    Those rows are usually sub-table headings such as "PCI INTERFACE". They
+    should remain a single spanning cell instead of being duplicated across
+    every column.
+    """
+    non_empty = [value for value in values if value]
+    return len(values) > 1 and bool(non_empty) and len(set(non_empty)) == 1
+
+
+def _build_group_row_cells(
+    original_cells: list[tuple[str, str, str, int]],
+    expanded_width: int,
+) -> str:
+    """
+    Build one spanning cell for a same-content group row.
+
+    If the original row already had a single colspan cell, keep it unchanged.
+    If prior processing already duplicated the same text into several cells,
+    collapse it back into one colspan cell.
+    """
+    if not original_cells:
+        return ""
+    if len(original_cells) == 1 and original_cells[0][3] > 1:
+        tag_open, inner, tag_close, _colspan = original_cells[0]
+        return tag_open + inner + tag_close
+
+    tag_open, inner, tag_close, _colspan = original_cells[0]
+    clean_tag = _remove_colspan_attr(tag_open)
+    clean_tag = re.sub(r"<(t[dh])", rf'<\1 colspan="{expanded_width}"', clean_tag, count=1, flags=re.IGNORECASE)
+    return clean_tag + inner + tag_close
