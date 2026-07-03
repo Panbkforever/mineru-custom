@@ -18,6 +18,7 @@ from extract.pin_package_extractor import (
     build_extraction_summary,
     extract_pin_package_info_from_middle_json_file,
     extract_pin_package_info_from_markdown_json_file,
+    get_last_extraction_debug,
     strip_debug_fields,
     write_extraction_json,
 )
@@ -72,6 +73,11 @@ def main() -> int:
         help="Output extraction summary JSON path. Default: <extract-output>_info.json",
     )
     parser.add_argument(
+        "--debug-output",
+        default=None,
+        help="Output table-level extraction debug JSON path. Default: <extract-output>_debug.json",
+    )
+    parser.add_argument(
         "--semantic-classify",
         action="store_true",
         help="Use DeepSeek semantic classification to filter non-pin tables. Requires DEEPSEEK_API_KEY.",
@@ -116,14 +122,26 @@ def main() -> int:
         if args.summary_output
         else output_path.with_name(f"{output_path.stem}_info.json")
     )
+    debug_path = (
+        Path(args.debug_output).resolve()
+        if args.debug_output
+        else output_path.with_name(f"{output_path.stem}_debug.json")
+    )
     extracted = strip_debug_fields(extracted_with_debug)
     pdf_name = input_path.name if input_path.is_file() else input_path.resolve().name
     summary = build_extraction_summary(extracted_with_debug, pdf_name=pdf_name)
+    debug_payload = {
+        "pdf_name": pdf_name,
+        "source_files": [str(path) for path in source_files],
+        "table_list": get_last_extraction_debug(),
+    }
 
     write_extraction_json(extracted, output_path)
     write_extraction_json(summary, summary_path)
+    write_extraction_json(debug_payload, debug_path)
     print(f"引脚/封装字段提取完成: {output_path}")
     print(f"提取信息文件完成: {summary_path}")
+    print(f"字段判断调试文件完成: {debug_path}")
     print(f"提取 package 数: {len(extracted)}")
     print(json.dumps(extracted[:1], ensure_ascii=False, indent=2))
     return 0

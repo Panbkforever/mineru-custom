@@ -127,6 +127,13 @@ class PackageIdentity:
     code: str = ""
 
 
+LAST_EXTRACTION_DEBUG: list[dict[str, Any]] = []
+
+
+def get_last_extraction_debug() -> list[dict[str, Any]]:
+    return LAST_EXTRACTION_DEBUG
+
+
 def extract_pin_package_info_from_middle_json(
     middle_json: dict[str, Any],
     source_name: str = "",
@@ -134,6 +141,14 @@ def extract_pin_package_info_from_middle_json(
     use_semantic_classifier: bool = False,
 ) -> list[dict[str, Any]]:
     """Extract package/group/pin records from one MinerU middle_json object."""
+    if use_semantic_classifier:
+        return extract_pin_package_info_from_table_candidates(
+            iter_table_candidates(middle_json),
+            source_name=source_name,
+            use_semantic_classifier=True,
+            include_debug=include_debug,
+        )
+
     packages: dict[str, dict[str, Any]] = {}
 
     for table in iter_table_candidates(middle_json):
@@ -290,6 +305,13 @@ def extract_pin_package_info_from_table_candidates(
     include_debug: bool = False,
     use_semantic_classifier: bool = False,
 ) -> list[dict[str, Any]]:
+    if use_semantic_classifier:
+        return extract_pin_package_info_with_semantic_schema(
+            tables,
+            source_name=source_name,
+            include_debug=include_debug,
+        )
+
     packages: dict[str, dict[str, Any]] = {}
 
     for table in tables:
@@ -399,6 +421,293 @@ def extract_pin_package_info_from_table_candidates(
                 package_result["pkg_key"] = package_bucket["pkg_key"]
             result.append(package_result)
     return result
+
+
+def extract_pin_package_info_with_semantic_schema(
+    tables: list[TableCandidate],
+    source_name: str = "",
+    include_debug: bool = False,
+) -> list[dict[str, Any]]:
+    """New extraction path: loose recall, LLM column schema, code validation."""
+    global LAST_EXTRACTION_DEBUG
+    LAST_EXTRACTION_DEBUG = []
+    packages: dict[str, dict[str, Any]] = {}
+
+    for table_id, table in enumerate(tables):
+        rows = parse_html_table(table.html)
+        table_debug: dict[str, Any] = {
+            "table_id": table_id,
+            "source": source_name,
+            "page": table.page_idx + 1 if isinstance(table.page_idx, int) else None,
+            "title": table.title,
+            "row_count": len(rows),
+            "status": "pending",
+            "skip_reason": "",
+        }
+        LAST_EXTRACTION_DEBUG.append(table_debug)
+
+        if len(rows) < 2:
+            table_debug.update({"status": "skipped", "skip_reason": "too_few_rows"})
+            continue
+
+        header_index, headers = choose_semantic_header_row(rows, table.title)
+        table_debug["header_index"] = header_index
+        table_debug["headers"] = headers
+        table_debug["sample_rows"] = rows[header_index + 1 : header_index + 6] if header_index >= 0 else rows[:5]
+        if header_index < 0:
+            table_debug.update({"status": "skipped", "skip_reason": "no_candidate_header"})
+            continue
+
+        data_rows = rows[header_index + 1 :]
+        if not is_loose_semantic_candidate(table.title, headers, data_rows):
+            table_debug.update({"status": "skipped", "skip_reason": "not_loose_candidate"})
+            continue
+
+        rule_decisions = classify_columns(headers, data_rows, table.title)
+        table_debug["rule_decisions"] = [
+            {
+                "index": decision.index,
+                "header": decision.raw_header,
+                "field": decision.field_name,
+                "score": decision.score,
+            }
+            for decision in rule_decisions
+        ]
+
+        schema = classify_schema_table(
+            table_id=table_id,
+            title=table.title,
+            headers=headers,
+            data_rows=data_rows,
+            decisions=rule_decisions,
+        )
+        table_debug["semantic_schema"] = schema
+        if not schema.get("should_extract"):
+            table_debug.update({"status": "skipped", "skip_reason": "semantic_rejected"})
+            continue
+
+        decisions = build_schema_column_decisions(schema, headers)
+        decisions = keep_primary_type_decision(decisions, data_rows)
+        table_debug["schema_decisions"] = [
+            {
+                "index": decision.index,
+                "header": decision.raw_header,
+                "field": decision.field_name,
+                "score": decision.score,
+            }
+            for decision in decisions
+        ]
+
+        valid, reason = validate_schema_decisions(decisions, data_rows)
+        if not valid:
+            table_debug.update({"status": "skipped", "skip_reason": reason})
+            continue
+
+        association = resolve_table_package_association(
+            table.title,
+            headers,
+            data_rows,
+            decisions,
+            build_package_snapshots(packages),
+        )
+        default_pkg = (
+            str(schema.get("pkg") or "").strip()
+            or association.package
+            or infer_package_name(table.title)
+        )
+        group_name = (
+            str(schema.get("group") or "").strip()
+            or infer_group_name(table.title)
+            or infer_group_name_from_headers(headers, default_pkg)
+            or "Pin/Package Table"
+        )
+        current_group_name = group_name
+        extracted_count = 0
+
+        for row in data_rows:
+            if is_group_row(row):
+                group_text = first_non_empty(row)
+                if group_text:
+                    current_group_name = group_text
+                continue
+
+            pin_records = extract_pin_records_from_row(row, decisions)
+            for pin_record in pin_records:
+                record_pkg = pin_record.pop("_pkg", default_pkg)
+                raw_fields = pin_record.pop("_raw_fields", None)
+                if include_debug and raw_fields:
+                    pin_record["raw_fields"] = raw_fields
+                package_identity = build_package_identity(record_pkg)
+                package_bucket = get_package_bucket(packages, package_identity)
+                current_group = get_or_create_group(package_bucket, current_group_name)
+                if include_debug and source_name:
+                    pin_record.setdefault("source", source_name)
+                if include_debug and table.page_idx is not None:
+                    pin_record.setdefault("source_page", table.page_idx + 1)
+                add_pin_record_to_group(current_group, pin_record)
+                extracted_count += 1
+
+        if extracted_count:
+            table_debug.update(
+                {
+                    "status": "extracted",
+                    "pin_count": extracted_count,
+                    "pkg": default_pkg,
+                    "group": clean_group_name(group_name) or "Pin/Package Table",
+                }
+            )
+        else:
+            table_debug.update({"status": "skipped", "skip_reason": "no_pin_records_after_mapping"})
+
+    result = []
+    for package_bucket in packages.values():
+        groups = [
+            {"group": group.group, "pin_list": group.pin_list}
+            for group in package_bucket["_groups"].values()
+            if group.pin_list
+        ]
+        if groups:
+            package_result = {"pkg": package_bucket["pkg"], "group_list": groups}
+            if include_debug:
+                package_result["pkg_key"] = package_bucket["pkg_key"]
+            result.append(package_result)
+    return result
+
+
+def choose_semantic_header_row(rows: list[list[str]], title: str = "") -> tuple[int, list[str]]:
+    """Looser header selection for LLM schema extraction."""
+    best_index = -1
+    best_score = -999
+    best_headers: list[str] = []
+    max_header_rows = min(6, len(rows))
+    for index in range(max_header_rows):
+        headers = build_combined_headers(rows, index)
+        header_text = normalize_header(" ".join(headers))
+        score = score_loose_table_evidence(title, headers, rows[index + 1 : index + 7])
+        score += sum(classify_header(header)[1] for header in headers)
+        if any(keyword in header_text for keyword in ("pin", "ball", "terminal", "signal", "package", "mux", "type", "i o", "gpio")):
+            score += 2
+        if is_ordering_table(headers):
+            score -= 6
+        if score > best_score:
+            best_index = index
+            best_score = score
+            best_headers = headers
+    if best_score < 1:
+        return -1, []
+    return best_index, best_headers
+
+
+def is_loose_semantic_candidate(title: str, headers: list[str], data_rows: list[list[str]]) -> bool:
+    """Recall-first candidate filter before spending an LLM call."""
+    text = normalize_header(
+        " ".join(
+            [
+                title,
+                " ".join(headers),
+                " ".join(" ".join(row[:10]) for row in data_rows[:6]),
+            ]
+        )
+    )
+    positive_keywords = (
+        "pin",
+        "ball",
+        "terminal",
+        "pad",
+        "signal",
+        "package",
+        "mux",
+        "type",
+        "i o",
+        "gpio",
+        "vdd",
+        "vss",
+        "gnd",
+        "端子",
+        "引脚",
+        "封装",
+        "信号",
+    )
+    if any(keyword in text for keyword in positive_keywords):
+        return True
+    sample_text = " ".join(" ".join(row[:10]) for row in data_rows[:8])
+    return bool(BALL_TOKEN_RE.search(sample_text))
+
+
+def classify_schema_table(
+    table_id: int,
+    title: str,
+    headers: list[str],
+    data_rows: list[list[str]],
+    decisions: list[ColumnDecision],
+) -> dict[str, Any]:
+    from extract.semantic_classifier import classify_table_schema
+
+    try:
+        return classify_table_schema(
+            table_id=table_id,
+            title=title,
+            headers=headers,
+            sample_rows=data_rows[:12],
+            rule_decisions=decisions,
+        )
+    except Exception as exc:
+        return {
+            "table_id": table_id,
+            "table_role": "error",
+            "should_extract": False,
+            "pkg": "",
+            "group": "",
+            "columns": [],
+            "confidence": 0.0,
+            "reason": f"schema_classification_failed: {exc}",
+        }
+
+
+def build_schema_column_decisions(schema: dict[str, Any], headers: list[str]) -> list[ColumnDecision]:
+    decisions: list[ColumnDecision] = []
+    for item in schema.get("columns") or []:
+        index = parse_column_index(item.get("column_index"))
+        if index is None:
+            continue
+        field = str(item.get("field") or "ignore").strip()
+        if field == "ignore":
+            continue
+        raw_header = str(item.get("pkg") or "").strip() if field == "package_pin_no" else safe_header(headers, index)
+        try:
+            score = int(float(item.get("confidence", 0.8)) * 10)
+        except (TypeError, ValueError):
+            score = 8
+        decisions.append(
+            ColumnDecision(
+                index=index,
+                raw_header=raw_header or safe_header(headers, index),
+                field_name=field,
+                score=max(score, 1),
+            )
+        )
+    return decisions
+
+
+def validate_schema_decisions(
+    decisions: list[ColumnDecision],
+    data_rows: list[list[str]],
+) -> tuple[bool, str]:
+    fields = {decision.field_name for decision in decisions}
+    has_pin_no = bool(fields & {"pin_no", "package_pin_no", "ball_no", "terminal_no"})
+    has_pin_name = bool(fields & {"pin_name", "ball_name", "signal_name", "terminal_name", "pad_name"})
+    if not has_pin_no:
+        return False, "missing_pin_number_column"
+    if not has_pin_name:
+        return False, "missing_pin_name_column"
+
+    probe_rows = [row for row in data_rows[:30] if not is_group_row(row)]
+    produced_records = 0
+    for row in probe_rows:
+        produced_records += len(extract_pin_records_from_row(row, decisions))
+        if produced_records >= 2:
+            return True, ""
+    return False, "schema_did_not_produce_pin_records"
 
 
 def iter_table_candidates(middle_json: dict[str, Any]) -> list[TableCandidate]:
@@ -1144,6 +1453,8 @@ def extract_pin_records_from_row(
             if key not in record:
                 record[key] = value
         record["pin_no"] = pin_no
+        if fields.get("package"):
+            record["_pkg"] = fields["package"]
         if raw_fields:
             record["_raw_fields"] = raw_fields
         records.append(record)
