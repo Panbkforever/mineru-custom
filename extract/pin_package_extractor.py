@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import html as html_lib
 import json
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -432,6 +434,7 @@ def extract_pin_package_info_with_semantic_schema(
     global LAST_EXTRACTION_DEBUG
     LAST_EXTRACTION_DEBUG = []
     packages: dict[str, dict[str, Any]] = {}
+    prepared: list[dict[str, Any]] = []
 
     for table_id, table in enumerate(tables):
         rows = parse_html_table(table.html)
@@ -462,6 +465,9 @@ def extract_pin_package_info_with_semantic_schema(
         if not is_loose_semantic_candidate(table.title, headers, data_rows):
             table_debug.update({"status": "skipped", "skip_reason": "not_loose_candidate"})
             continue
+        if is_non_physical_port_function_table(table.title, headers):
+            table_debug.update({"status": "skipped", "skip_reason": "non_physical_port_function_table"})
+            continue
 
         rule_decisions = classify_columns(headers, data_rows, table.title)
         table_debug["rule_decisions"] = [
@@ -473,17 +479,78 @@ def extract_pin_package_info_with_semantic_schema(
             }
             for decision in rule_decisions
         ]
-
-        schema = classify_schema_table(
-            table_id=table_id,
-            title=table.title,
-            headers=headers,
-            data_rows=data_rows,
-            decisions=rule_decisions,
+        prepared.append(
+            {
+                "table_id": table_id,
+                "table": table,
+                "rows": rows,
+                "headers": headers,
+                "data_rows": data_rows,
+                "rule_decisions": rule_decisions,
+                "debug": table_debug,
+            }
         )
+
+    schemas: dict[int, dict[str, Any]] = {}
+    worker_count = max(1, int(os.getenv("EXTRACT_SCHEMA_WORKERS", "6")))
+    if prepared:
+        print(f"语义字段判断: 候选表 {len(prepared)} 张, 并发 {worker_count}")
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_map = {
+            executor.submit(
+                classify_schema_table,
+                item["table_id"],
+                item["table"].title,
+                item["headers"],
+                item["data_rows"],
+                item["rule_decisions"],
+            ): item
+            for item in prepared
+        }
+        completed = 0
+        for future in as_completed(future_map):
+            item = future_map[future]
+            completed += 1
+            try:
+                schema = future.result()
+            except Exception as exc:
+                schema = {
+                    "table_id": item["table_id"],
+                    "table_role": "error",
+                    "should_extract": False,
+                    "pkg": "",
+                    "group": "",
+                    "columns": [],
+                    "confidence": 0.0,
+                    "reason": f"schema_classification_failed: {exc}",
+                }
+            schemas[item["table_id"]] = schema
+            if completed == 1 or completed == len(prepared) or completed % 10 == 0:
+                print(f"语义字段判断进度: {completed}/{len(prepared)}")
+
+    for item in prepared:
+        table_id = item["table_id"]
+        table = item["table"]
+        headers = item["headers"]
+        data_rows = item["data_rows"]
+        table_debug = item["debug"]
+        schema = schemas.get(table_id) or {
+            "table_id": table_id,
+            "table_role": "error",
+            "should_extract": False,
+            "pkg": "",
+            "group": "",
+            "columns": [],
+            "confidence": 0.0,
+            "reason": "missing_schema_result",
+        }
         table_debug["semantic_schema"] = schema
         if not schema.get("should_extract"):
             table_debug.update({"status": "skipped", "skip_reason": "semantic_rejected"})
+            continue
+        schema_valid, schema_reason = validate_semantic_schema(schema, table.title, headers)
+        if not schema_valid:
+            table_debug.update({"status": "skipped", "skip_reason": schema_reason})
             continue
 
         decisions = build_schema_column_decisions(schema, headers)
@@ -600,15 +667,59 @@ def choose_semantic_header_row(rows: list[list[str]], title: str = "") -> tuple[
 
 def is_loose_semantic_candidate(title: str, headers: list[str], data_rows: list[list[str]]) -> bool:
     """Recall-first candidate filter before spending an LLM call."""
+    header_text = normalize_header(" ".join(headers))
     text = normalize_header(
         " ".join(
             [
                 title,
-                " ".join(headers),
+                header_text,
                 " ".join(" ".join(row[:10]) for row in data_rows[:6]),
             ]
         )
     )
+    has_explicit_pin_header = any(
+        keyword in header_text
+        for keyword in (
+            "pin no",
+            "pin number",
+            "pin name",
+            "ball no",
+            "ball number",
+            "ball name",
+            "terminal no",
+            "terminal number",
+            "terminal name",
+            "signal name",
+            "device signal",
+            "input port pin",
+            "package pin",
+            "引脚",
+            "端子",
+            "信号名称",
+        )
+    )
+    if any(keyword in header_text for keyword in ("register description", "offset", "address")):
+        return False
+    if any(
+        keyword in header_text
+        for keyword in (
+            "orderable device",
+            "package qty",
+            "reel diameter",
+            "reel width",
+            "spq",
+            "unit array",
+            "lead finish",
+            "eco plan",
+            "msl peak temp",
+        )
+    ):
+        return False
+    if (
+        any(keyword in header_text for keyword in ("parameter", "test condition", "min", "typ", "max", "unit"))
+        and not has_explicit_pin_header
+    ):
+        return False
     positive_keywords = (
         "pin",
         "ball",
@@ -632,6 +743,81 @@ def is_loose_semantic_candidate(title: str, headers: list[str], data_rows: list[
         return True
     sample_text = " ".join(" ".join(row[:10]) for row in data_rows[:8])
     return bool(BALL_TOKEN_RE.search(sample_text))
+
+
+def is_non_physical_port_function_table(title: str, headers: list[str]) -> bool:
+    """Reject mux/port-function tables that do not expose physical package pins.
+
+    These tables are useful context, but they are not the final pin/ball package
+    mapping requested by the extraction output. A real physical pin table should
+    still pass because it has explicit PIN NO/BALL NUMBER/TERMINAL NO headers.
+    """
+    title_text = normalize_header(title)
+    header_text = normalize_header(" ".join(headers))
+    combined = f"{title_text} {header_text}"
+    has_physical_number_header = any(
+        keyword in header_text
+        for keyword in (
+            "pin no",
+            "pin number",
+            "ball no",
+            "ball number",
+            "terminal no",
+            "terminal number",
+            "package pin",
+            "引脚编号",
+            "端子编号",
+        )
+    )
+    if has_physical_number_header:
+        return False
+    if re.search(r"\bport\s+p[a-z0-9.]*\b", title_text):
+        return True
+    if any(keyword in combined for keyword in ("default mapping", "pin mux", "pinmux", "alternate function")):
+        return True
+    if "pin name (" in header_text and any(keyword in header_text for keyword in ("function", "module", "selection")):
+        return True
+    return False
+
+
+def validate_semantic_schema(schema: dict[str, Any], title: str, headers: list[str]) -> tuple[bool, str]:
+    role = re.sub(r"[^a-z0-9]+", "_", str(schema.get("table_role") or "").lower()).strip("_")
+    if role in {
+        "port_function_table",
+        "pin_mux_table",
+        "alternate_function_table",
+        "default_mapping_table",
+        "module_signal_connection",
+    }:
+        return False, f"non_physical_table_role:{role}"
+    if is_non_physical_port_function_table(title, headers):
+        return False, "non_physical_port_function_table"
+
+    pkg = str(schema.get("pkg") or "").strip()
+    if pkg and is_invalid_schema_package_name(pkg):
+        return False, "invalid_schema_package_name"
+    for column in schema.get("columns") or []:
+        field = str(column.get("field") or "").strip()
+        pkg_name = str(column.get("pkg") or "").strip()
+        if field == "package_pin_no" and is_invalid_schema_package_name(pkg_name):
+            return False, "invalid_package_pin_column"
+    return True, ""
+
+
+def is_invalid_schema_package_name(pkg: str) -> bool:
+    normalized = normalize_header(pkg)
+    if not normalized:
+        return False
+    if any(keyword in normalized for keyword in ("pin name", "port p", "default mapping", "function")):
+        return True
+    if re.search(r"\bp[a-z0-9.]*\)\b", normalized):
+        return True
+    # Device orderable names are not package names. Keep short package codes
+    # such as PZ/RGZ/ZCE, but reject long MCU part-number labels.
+    compact = re.sub(r"[^a-z0-9]", "", normalized)
+    if re.match(r"^(msp|am|tms)\d", compact) and len(compact) > 8:
+        return True
+    return False
 
 
 def classify_schema_table(
@@ -744,22 +930,29 @@ def iter_table_candidates_from_markdown(markdown: str) -> list[TableCandidate]:
     candidates: list[TableCandidate] = []
     table_re = re.compile(r"<table\b.*?</table>", re.DOTALL | re.IGNORECASE)
     recent_texts: list[str] = []
-    current_section_title = ""
     cursor = 0
 
     for match in table_re.finditer(markdown):
         before = markdown[cursor : match.start()]
+        segment_title = ""
+        segment_texts: list[str] = []
         for line in before.splitlines():
             text = plain_text(line).strip()
             if not text:
                 continue
             detected_group = infer_group_name(text)
             if detected_group:
-                current_section_title = detected_group
+                segment_title = detected_group
+            segment_texts.append(text)
             recent_texts.append(text)
             recent_texts = recent_texts[-10:]
 
-        title = current_section_title or " ".join(dedupe_preserve_order(recent_texts[-5:])).strip()
+        # Do not let a table title leak across the rest of the document. TI
+        # datasheets often have many unrelated tables after "Signal
+        # Descriptions"; using a stale title would send almost every later table
+        # to the semantic extractor.
+        title_source = segment_texts[-5:] if segment_texts else recent_texts[-3:]
+        title = segment_title or " ".join(dedupe_preserve_order(title_source)).strip()
         candidates.append(TableCandidate(html=match.group(0), page_idx=None, title=title))
         cursor = match.end()
 
@@ -1751,6 +1944,7 @@ def clean_package_label(header: str) -> str:
     label = re.sub(r"\[[^\]]+\]", " ", label)
     label = normalize_package_word_order(label)
     label = re.sub(r"\(\s*\d{1,2}\s*\)", " ", label)
+    label = re.sub(r"\bpackage\b", " ", label, flags=re.IGNORECASE)
     label = re.sub(
         r"(?:引脚编号|管脚编号|端子编号|pin\s*(?:number|no\.?)|pins?|ball\s*(?:number|no\.?)|terminal\s*(?:number|no\.?))",
         " ",
@@ -1763,7 +1957,7 @@ def clean_package_label(header: str) -> str:
 
 
 def build_package_identity(label: str) -> PackageIdentity:
-    display = clean_package_label(label) if label else ""
+    display = canonical_package_display(clean_package_label(label)) if label else ""
     parts = extract_package_identity_parts(display)
     key_parts = []
     if parts["pin_count"]:
@@ -1781,6 +1975,18 @@ def build_package_identity(label: str) -> PackageIdentity:
         family=parts["family"],
         code=parts["code"],
     )
+
+
+def canonical_package_display(label: str) -> str:
+    label = re.sub(r"\s+", " ", plain_text(label)).strip(" -:/")
+    parts = extract_package_identity_parts(label)
+    if parts["code"]:
+        return parts["code"].replace("_", " | ")
+    if parts["pin_count"] and parts["family"]:
+        return f"{parts['pin_count']} {parts['family']}"
+    if parts["family"]:
+        return parts["family"]
+    return label
 
 
 def extract_package_identity_parts(label: str) -> dict[str, str]:
