@@ -88,7 +88,7 @@ def main() -> int:
     output_dir = Path(args.output).resolve()
 
     if not args.skip_parse:
-        run_parse_doc(args, output_dir)
+        run_parse_doc(args, input_path, output_dir)
 
     parsed_json_files = find_parsed_markdown_json_files(input_path, output_dir)
     middle_files = [] if parsed_json_files else find_middle_json_files(input_path, output_dir)
@@ -147,7 +147,7 @@ def main() -> int:
     return 0
 
 
-def run_parse_doc(args: argparse.Namespace, output_dir: Path) -> None:
+def run_parse_doc(args: argparse.Namespace, input_path: Path, output_dir: Path) -> None:
     command = [
         sys.executable,
         str(Path(__file__).resolve().parent / "parse_doc.py"),
@@ -174,7 +174,22 @@ def run_parse_doc(args: argparse.Namespace, output_dir: Path) -> None:
     if args.no_images:
         command.append("--no-images")
 
-    subprocess.run(command, check=True)
+    try:
+        subprocess.run(command, check=True)
+    except subprocess.CalledProcessError:
+        # MinerU sometimes writes the final md/json successfully, then exits
+        # abnormally while releasing VLM/PyTorch multiprocessing resources. In
+        # that case extraction can continue from the existing parse artifacts.
+        parsed_json_files = find_parsed_markdown_json_files(input_path, output_dir)
+        middle_files = [] if parsed_json_files else find_middle_json_files(input_path, output_dir)
+        if parsed_json_files or middle_files:
+            usable_files = parsed_json_files or middle_files
+            print(
+                "WARNING: parse_doc.py exited abnormally, but parse artifacts "
+                f"already exist. Continue extraction from {len(usable_files)} file(s)."
+            )
+            return
+        raise
 
 
 def find_middle_json_files(input_path: Path, output_dir: Path) -> list[Path]:
