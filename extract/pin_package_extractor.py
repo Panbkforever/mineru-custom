@@ -34,7 +34,7 @@ NUMERIC_PIN_RE = re.compile(r"^\d{1,4}$")
 PACKAGE_HEADER_RE = re.compile(
     r"\b(?:\d{2,4}\s*)?(?:qfp|lqfp|tqfp|htqfp|vqfn|vssop|ssop|tssop|qfn|"
     r"bga|pbga|nfbga|fcbga|fc csp|soic|sop|pdip|pga|clcc|lccc|dfn|wqfn|"
-    r"pm|pt|pn|pnp|pzp|pz|peu|rgc|rtd|rgz|rha|rhb|rsh|dgs\d*|da|pw|n|rsa|"
+    r"pmq|pm|pt|pn|pnp|pzp|pz|peu|rgc|rtd|rgz|rha|rhb|rsh|dsg|dgs\d*|da|pw|nw|n|rsa|"
     r"zce\d*[a-z]*|nzn\d*[a-z]*|zwt|zjz|zhh|zay|alv|alx|am[a-z]|"
     r"abc|alw|alz|anf|anj|zqw|pwp|rgy|rsm|rge|rte)\b",
     re.IGNORECASE,
@@ -45,7 +45,7 @@ PACKAGE_FAMILY_RE = re.compile(
     re.IGNORECASE,
 )
 PACKAGE_CODE_RE = re.compile(
-    r"\b(pm|pt|pn|pnp|pzp|pz|peu|rgc|rtd|rgz|rha|rhb|rsh|dgs\d*|da|pw|n|rsa|"
+    r"\b(pmq|pm|pt|pn|pnp|pzp|pz|peu|rgc|rtd|rgz|rha|rhb|rsh|dsg|dgs\d*|da|pw|nw|n|rsa|"
     r"zce\d*[a-z]*|nzn\d*[a-z]*|zwt|zjz|zhh|zay|alv|alx|am[a-z]|abc|alw|"
     r"alz|anf|anj|zqw|pwp|rgy|rsm|rge|rte)\b",
     re.IGNORECASE,
@@ -852,6 +852,7 @@ def classify_schema_table(
 
 def build_schema_column_decisions(schema: dict[str, Any], headers: list[str]) -> list[ColumnDecision]:
     decisions: list[ColumnDecision] = []
+    schema_pkg = str(schema.get("pkg") or "").strip()
     for item in schema.get("columns") or []:
         index = parse_column_index(item.get("column_index"))
         if index is None:
@@ -859,7 +860,10 @@ def build_schema_column_decisions(schema: dict[str, Any], headers: list[str]) ->
         field = str(item.get("field") or "ignore").strip()
         if field == "ignore":
             continue
-        raw_header = str(item.get("pkg") or "").strip() if field == "package_pin_no" else safe_header(headers, index)
+        if field == "package_pin_no":
+            raw_header = combine_package_context(schema_pkg, str(item.get("pkg") or "").strip())
+        else:
+            raw_header = safe_header(headers, index)
         try:
             score = int(float(item.get("confidence", 0.8)) * 10)
         except (TypeError, ValueError):
@@ -873,6 +877,20 @@ def build_schema_column_decisions(schema: dict[str, Any], headers: list[str]) ->
             )
         )
     return decisions
+
+
+def combine_package_context(table_pkg: str, column_pkg: str) -> str:
+    table_pkg = table_pkg.strip()
+    column_pkg = column_pkg.strip()
+    if not table_pkg:
+        return column_pkg
+    if not column_pkg:
+        return table_pkg
+    if normalize_header(table_pkg) == normalize_header(column_pkg):
+        return column_pkg
+    if looks_like_device_model(column_pkg) and not looks_like_device_model(table_pkg):
+        return f"{table_pkg} {column_pkg}"
+    return column_pkg
 
 
 def validate_schema_decisions(
@@ -1876,7 +1894,24 @@ def clean_group_name(value: str) -> str:
     )
     if len(value) > 180:
         value = value[:180].rsplit(" ", 1)[0].strip()
-    return re.sub(r"\s+", " ", value).strip()
+    value = re.sub(r"\s+", " ", value).strip()
+    if is_package_or_device_title(value):
+        return "Pin/Package Table"
+    return value
+
+
+def is_package_or_device_title(value: str) -> bool:
+    normalized = normalize_header(value)
+    if not normalized:
+        return False
+    if "引脚排列" in value or "pinout" in normalized:
+        return True
+    if looks_like_device_model(value):
+        return True
+    compact = re.sub(r"[^a-z0-9]+", "", normalized)
+    if re.fullmatch(r"\d{1,4}(?:pin)?[a-z0-9]{1,8}package", compact):
+        return True
+    return False
 
 
 def is_group_row(row: list[str]) -> bool:
@@ -1942,6 +1977,7 @@ def is_package_pin_header(normalized_header: str) -> bool:
 def clean_package_label(header: str) -> str:
     label = plain_text(header)
     label = re.sub(r"\[[^\]]+\]", " ", label)
+    label = re.sub(r"\b(\d{2,4})\s*[-]?\s*(pin|引脚)\b", r"\1 ", label, flags=re.IGNORECASE)
     label = normalize_package_word_order(label)
     label = re.sub(r"\(\s*\d{1,2}\s*\)", " ", label)
     label = re.sub(r"\bpackage\b", " ", label, flags=re.IGNORECASE)
@@ -1960,7 +1996,9 @@ def build_package_identity(label: str) -> PackageIdentity:
     display = canonical_package_display(clean_package_label(label)) if label else ""
     parts = extract_package_identity_parts(display)
     key_parts = []
-    if parts["pin_count"]:
+    if extract_device_model(display):
+        key_parts.append(f"label={normalize_package_key(display)}")
+    elif parts["pin_count"]:
         key_parts.append(f"pins={parts['pin_count']}")
     if parts["family"]:
         key_parts.append(f"family={parts['family']}")
@@ -1982,11 +2020,29 @@ def canonical_package_display(label: str) -> str:
     parts = extract_package_identity_parts(label)
     if parts["code"]:
         return parts["code"].replace("_", " | ")
+    sot_match = re.search(r"\bSOT\s*[- ]?\s*(\d{1,3})\b", label, flags=re.IGNORECASE)
+    if sot_match:
+        device_model = extract_device_model(label)
+        if device_model:
+            return f"SOT-{sot_match.group(1)} {device_model}"
+        return f"SOT-{sot_match.group(1)}"
     if parts["pin_count"] and parts["family"]:
         return f"{parts['pin_count']} {parts['family']}"
     if parts["family"]:
         return parts["family"]
     return label
+
+
+def extract_device_model(value: str) -> str:
+    for match in re.finditer(r"\b[A-Z]{1,5}\d{2,}[A-Z0-9-]*\b", value):
+        token = match.group(0)
+        if not PACKAGE_HEADER_RE.fullmatch(token):
+            return token
+    return ""
+
+
+def looks_like_device_model(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Z]{1,5}\d{2,}[A-Z0-9-]*", value.strip()))
 
 
 def extract_package_identity_parts(label: str) -> dict[str, str]:
@@ -1998,6 +2054,15 @@ def extract_package_identity_parts(label: str) -> dict[str, str]:
     count_match = re.search(r"\b(\d{2,4})\b", normalized)
     if count_match:
         pin_count = count_match.group(1)
+
+    compact_match = re.search(
+        r"\b(\d{2,4})(pmq|pm|pt|pn|pnp|pzp|pz|peu|rgc|rtd|rgz|rha|rhb|rsh|dsg|dgs\d*|da|pw|nw|rsa|zce\d*[a-z]*|nzn\d*[a-z]*|zwt|zjz|zhh|zay|alv|alx|abc|alw|alz|anf|anj|zqw|pwp|rgy|rsm|rge|rte)\b",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if compact_match:
+        pin_count = compact_match.group(1)
+        code = compact_match.group(2).upper()
 
     family_match = PACKAGE_FAMILY_RE.search(normalized)
     if family_match:
@@ -2023,11 +2088,19 @@ def normalize_package_key(label: str) -> str:
 
 def normalize_package_word_order(label: str) -> str:
     label = re.sub(r"\s+", " ", label).strip()
+    label = re.sub(
+        r"\b(\d{2,4})(pmq|pm|pt|pn|pnp|pzp|pz|peu|rgc|rtd|rgz|rha|rhb|rsh|dsg|dgs\d*|da|pw|nw|rsa|zce\d*[a-z]*|nzn\d*[a-z]*|zwt|zjz|zhh|zay|alv|alx|abc|alw|alz|anf|anj|zqw|pwp|rgy|rsm|rge|rte)\b",
+        lambda match: f"{match.group(1)} {match.group(2).upper()}",
+        label,
+        flags=re.IGNORECASE,
+    )
     match = re.fullmatch(r"([A-Za-z0-9]+)\s*\(\s*(\d{2,4})\s*\)", label)
     if match:
         return f"{match.group(2)} {match.group(1)}"
     match = re.fullmatch(r"([A-Za-z0-9]+)\s*[- ]\s*(\d{2,4})", label)
     if match:
+        if match.group(1).lower() in {"sot", "tsot", "sc"}:
+            return f"{match.group(1).upper()}-{match.group(2)}"
         return f"{match.group(2)} {match.group(1)}"
     return label
 
