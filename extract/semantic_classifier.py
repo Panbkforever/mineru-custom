@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -234,7 +235,9 @@ def call_deepseek_json(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
     }
 
     last_error: Exception | None = None
-    for _attempt in range(2):
+    max_retries = max(1, int(os.getenv("DEEPSEEK_MAX_RETRIES", "4")))
+    retry_base = float(os.getenv("DEEPSEEK_RETRY_BASE_SECONDS", "2"))
+    for attempt in range(max_retries):
         request = urllib.request.Request(
             url,
             data=json.dumps(body).encode("utf-8"),
@@ -249,9 +252,23 @@ def call_deepseek_json(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"DeepSeek API 请求失败: HTTP {exc.code} {detail}") from exc
+            last_error = RuntimeError(f"DeepSeek API 请求失败: HTTP {exc.code} {detail}")
+            if exc.code == 429 and attempt < max_retries - 1:
+                time.sleep(retry_base * (2**attempt))
+                continue
+            raise last_error from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"DeepSeek API 请求失败: {exc}") from exc
+            last_error = RuntimeError(f"DeepSeek API 请求失败: {exc}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_base * (2**attempt))
+                continue
+            raise last_error from exc
+        except TimeoutError as exc:
+            last_error = RuntimeError(f"DeepSeek API 请求超时: {exc}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_base * (2**attempt))
+                continue
+            raise last_error from exc
 
         completion = json.loads(raw)
         content = str(completion["choices"][0]["message"].get("content") or "")
@@ -259,7 +276,10 @@ def call_deepseek_json(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
             return parse_json_content(content)
         except ValueError as exc:
             last_error = exc
-            continue
+            if attempt < max_retries - 1:
+                time.sleep(retry_base)
+                continue
+            break
     raise last_error or ValueError("DeepSeek returned invalid JSON")
 
 

@@ -492,9 +492,12 @@ def extract_pin_package_info_with_semantic_schema(
         )
 
     schemas: dict[int, dict[str, Any]] = {}
-    worker_count = max(1, int(os.getenv("EXTRACT_SCHEMA_WORKERS", "6")))
+    # GLM and similar OpenAI-compatible APIs often have strict rate limits.
+    # Keep the default conservative; callers can raise it with
+    # EXTRACT_SCHEMA_WORKERS after confirming their quota.
+    worker_count = max(1, int(os.getenv("EXTRACT_SCHEMA_WORKERS", "2")))
     if prepared:
-        print(f"语义字段判断: 候选表 {len(prepared)} 张, 并发 {worker_count}")
+        print(f"语义字段判断: 候选表 {len(prepared)} 张, 并发 {worker_count}", flush=True)
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         future_map = {
             executor.submit(
@@ -526,7 +529,7 @@ def extract_pin_package_info_with_semantic_schema(
                 }
             schemas[item["table_id"]] = schema
             if completed == 1 or completed == len(prepared) or completed % 10 == 0:
-                print(f"语义字段判断进度: {completed}/{len(prepared)}")
+                print(f"语义字段判断进度: {completed}/{len(prepared)}", flush=True)
 
     for item in prepared:
         table_id = item["table_id"]
@@ -1895,7 +1898,7 @@ def clean_group_name(value: str) -> str:
     if len(value) > 180:
         value = value[:180].rsplit(" ", 1)[0].strip()
     value = re.sub(r"\s+", " ", value).strip()
-    if is_package_or_device_title(value):
+    if is_package_or_device_title(value) or is_sentence_like_group_title(value):
         return "Pin/Package Table"
     return value
 
@@ -1910,6 +1913,15 @@ def is_package_or_device_title(value: str) -> bool:
         return True
     compact = re.sub(r"[^a-z0-9]+", "", normalized)
     if re.fullmatch(r"\d{1,4}(?:pin)?[a-z0-9]{1,8}package", compact):
+        return True
+    return False
+
+
+def is_sentence_like_group_title(value: str) -> bool:
+    normalized = normalize_header(value)
+    if len(value) > 90 and any(token in normalized for token in (" must ", " should ", " can ", " for example", " note ")):
+        return True
+    if len(value) > 120 and value.count(" ") >= 12:
         return True
     return False
 
@@ -1994,6 +2006,8 @@ def clean_package_label(header: str) -> str:
 
 def build_package_identity(label: str) -> PackageIdentity:
     display = canonical_package_display(clean_package_label(label)) if label else ""
+    if is_invalid_package_display(display):
+        display = ""
     parts = extract_package_identity_parts(display)
     key_parts = []
     if extract_device_model(display):
@@ -2013,6 +2027,35 @@ def build_package_identity(label: str) -> PackageIdentity:
         family=parts["family"],
         code=parts["code"],
     )
+
+
+def is_invalid_package_display(value: str) -> bool:
+    normalized = normalize_header(value)
+    if not normalized:
+        return False
+    if normalized in {
+        "no",
+        "no.",
+        "number",
+        "input",
+        "output",
+        "type",
+        "signal",
+        "signal name",
+        "signal name no",
+        "signal name no.",
+        "name",
+        "pin",
+        "pin no",
+        "pin name",
+        "terminal",
+        "terminal no",
+        "terminal name",
+    }:
+        return True
+    if any(keyword in normalized for keyword in ("description", "function", "condition", "table")):
+        return True
+    return False
 
 
 def canonical_package_display(label: str) -> str:
