@@ -495,7 +495,7 @@ def extract_pin_package_info_with_semantic_schema(
     # GLM and similar OpenAI-compatible APIs often have strict rate limits.
     # Keep the default conservative; callers can raise it with
     # EXTRACT_SCHEMA_WORKERS after confirming their quota.
-    worker_count = max(1, int(os.getenv("EXTRACT_SCHEMA_WORKERS", "2")))
+    worker_count = max(1, int(os.getenv("EXTRACT_SCHEMA_WORKERS", "4")))
     if prepared:
         print(f"语义字段判断: 候选表 {len(prepared)} 张, 并发 {worker_count}", flush=True)
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
