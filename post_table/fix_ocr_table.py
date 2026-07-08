@@ -609,7 +609,16 @@ def fix_markdown_file(input_path: str, output_path: Optional[str] = None) -> str
     from post_table.expand_rowspan import expand_colspan
     fixed_content = expand_colspan(fixed_content)
 
-    # 第五步：修复 tms320c6211b Terminal Functions 表格的前两列合并错误
+    # 第五步：修复跨页续表边界处被合并成一行的数据。
+    # 典型错误形态：
+    #   DA5-\nDA6+ | D11B10 | OO | ...
+    # 实际应为：
+    #   DA5- | D11 | O | ...
+    #   DA6+ | B10 | O | ...
+    # 这里在解析后处理阶段拆行，使最终 md/json 与后续抽取结果保持一致。
+    fixed_content = repair_cross_page_merged_pin_rows(fixed_content)
+
+    # 第六步：修复 tms320c6211b Terminal Functions 表格的前两列合并错误
     # 该问题发生在 colspan 展开之后：部分续表的前两列本应是
     # SIGNAL NAME / NO.，但模型输出为重复的 "SIGNAL PIN"。
     fixed_content = tms320c6211b_TerminalFunctions_table(fixed_content)
@@ -1033,6 +1042,195 @@ def tms320c6211b_TerminalFunctions_table(md_content: str) -> str:
         md_content,
         flags=re.DOTALL | re.IGNORECASE,
     )
+
+
+COMPACT_PIN_TOKEN_RE = re.compile(r"[A-Z]{1,2}\d{1,2}")
+TYPE_TOKEN_CANDIDATES = (
+    "I/O/Z",
+    "O/Z",
+    "I/O",
+    "IO",
+    "O",
+    "I",
+    "A",
+    "P",
+    "S",
+)
+
+
+def repair_cross_page_merged_pin_rows(md_content: str) -> str:
+    """
+    拆分跨页续表边界处被 MinerU 合并成一行的 pin 数据。
+
+    这类错误通常出现在上一页最后一条数据和下一页续表表头下第一条数据
+    被合并到同一个 <tr> 中。解析结果里关键字段仍然存在，但变成：
+        pin_name: DA5-\\nDA6+
+        pin_no:   D11B10
+        type:     OO
+
+    本函数只在 HTML 表格层面修复结构：
+      - 找到可拆成多个 BGA/ball 坐标的单元格，例如 D11B10 -> D11, B10
+      - 同步拆分换行的名称字段和重复的 type 字段
+      - description 若能按同样行数拆开就拆，否则复制原值
+
+    这样最终 md/json 中就是多行，后续抽取逻辑不需要知道这个异常。
+    """
+
+    def _fix_html_block(match: re.Match) -> str:
+        return _repair_cross_page_merged_pin_rows_in_table(match.group(0))
+
+    return re.sub(
+        r"<table[^>]*>.*?</table>",
+        _fix_html_block,
+        md_content,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+
+def _repair_cross_page_merged_pin_rows_in_table(html: str) -> str:
+    if not _looks_like_pin_table_html(html):
+        return html
+
+    tr_pattern = re.compile(r"(<tr[^>]*>)(.*?)(</tr>)", re.DOTALL | re.IGNORECASE)
+    cell_pattern = re.compile(
+        r"(<t[dh][^>]*>)(.*?)(</t[dh]>)",
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    rebuilt_parts: list[str] = []
+    last_end = 0
+    fixed_count = 0
+
+    for tr_match in tr_pattern.finditer(html):
+        rebuilt_parts.append(html[last_end:tr_match.start()])
+
+        tr_open = tr_match.group(1)
+        tr_content = tr_match.group(2)
+        tr_close = tr_match.group(3)
+        cells = [
+            {
+                "open": cell_match.group(1),
+                "inner": cell_match.group(2),
+                "close": cell_match.group(3),
+            }
+            for cell_match in cell_pattern.finditer(tr_content)
+        ]
+
+        split_rows = _split_cross_page_merged_cells(cells)
+        if split_rows:
+            for row_cells in split_rows:
+                rebuilt_parts.append(
+                    tr_open
+                    + "".join(cell["open"] + cell["inner"] + cell["close"] for cell in row_cells)
+                    + tr_close
+                )
+            fixed_count += 1
+        else:
+            rebuilt_parts.append(tr_match.group(0))
+
+        last_end = tr_match.end()
+
+    rebuilt_parts.append(html[last_end:])
+    if fixed_count:
+        logger.info("跨页续表合并行修复: 拆分 %d 行", fixed_count)
+    return "".join(rebuilt_parts)
+
+
+def _looks_like_pin_table_html(html: str) -> bool:
+    text = _html_cell_plain_text(html).lower()
+    has_pin_no = any(keyword in text for keyword in ("pin", "ball", "terminal", "端子", "引脚"))
+    has_name = any(keyword in text for keyword in ("name", "signal", "function", "名称", "信号"))
+    return has_pin_no and has_name
+
+
+def _split_cross_page_merged_cells(cells: list[dict]) -> list[list[dict]] | None:
+    if len(cells) < 3:
+        return None
+
+    pin_col = -1
+    pin_numbers: list[str] = []
+    for index, cell in enumerate(cells):
+        pin_numbers = _split_compact_pin_numbers(cell["inner"])
+        if len(pin_numbers) > 1:
+            pin_col = index
+            break
+
+    if pin_col < 0:
+        return None
+
+    split_count = len(pin_numbers)
+    column_parts: list[list[str]] = []
+    split_evidence = 0
+
+    for index, cell in enumerate(cells):
+        if index == pin_col:
+            parts = pin_numbers
+            split_evidence += 1
+        else:
+            parts = _split_cell_value_for_cross_page_row(cell["inner"], split_count)
+            if len(parts) == split_count:
+                split_evidence += 1
+            else:
+                parts = [cell["inner"]] * split_count
+        column_parts.append(parts)
+
+    # 至少 pin_no 加另一个关键字段可拆，才认为这是跨页合并行。
+    if split_evidence < 2:
+        return None
+
+    split_rows: list[list[dict]] = []
+    for row_index in range(split_count):
+        split_rows.append([
+            {
+                "open": cell["open"],
+                "inner": column_parts[col_index][row_index],
+                "close": cell["close"],
+            }
+            for col_index, cell in enumerate(cells)
+        ])
+    return split_rows
+
+
+def _split_compact_pin_numbers(inner_html: str) -> list[str]:
+    text = _html_cell_plain_text(inner_html).upper()
+    compact = re.sub(r"[\s,;/|]+", "", text)
+    if not compact:
+        return []
+    tokens = COMPACT_PIN_TOKEN_RE.findall(compact)
+    if len(tokens) > 1 and "".join(tokens) == compact:
+        return tokens
+    return []
+
+
+def _split_cell_value_for_cross_page_row(inner_html: str, split_count: int) -> list[str]:
+    visual_lines = _split_cell_visual_lines(inner_html)
+    if len(visual_lines) == split_count:
+        return visual_lines
+
+    type_parts = _split_repeated_type_value(inner_html, split_count)
+    if type_parts:
+        return type_parts
+
+    return []
+
+
+def _split_cell_visual_lines(inner_html: str) -> list[str]:
+    text = re.sub(r"<br\s*/?>", "\n", inner_html, flags=re.IGNORECASE)
+    parts = [part.strip() for part in re.split(r"\r?\n+", text)]
+    return [part for part in parts if _html_cell_plain_text(part)]
+
+
+def _split_repeated_type_value(inner_html: str, split_count: int) -> list[str]:
+    text = _html_cell_plain_text(inner_html).upper()
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return []
+
+    for token in TYPE_TOKEN_CANDIDATES:
+        normalized_token = re.sub(r"\s+", "", token.upper())
+        if compact == normalized_token * split_count:
+            return [token] * split_count
+    return []
 
 
 # =============================================================================
