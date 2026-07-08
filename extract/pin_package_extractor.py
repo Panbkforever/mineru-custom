@@ -30,6 +30,7 @@ CELL_RE = re.compile(
 )
 TAG_RE = re.compile(r"<[^>]+>")
 BALL_TOKEN_RE = re.compile(r"\b[A-Z]{1,2}\d{1,2}\b")
+RAW_BALL_TOKEN_RE = re.compile(r"[A-Z]{1,2}\d{1,2}")
 NUMERIC_PIN_RE = re.compile(r"^\d{1,4}$")
 PACKAGE_HEADER_RE = re.compile(
     r"\b(?:\d{2,4}\s*)?(?:qfp|lqfp|tqfp|htqfp|vqfn|vssop|ssop|tssop|qfn|"
@@ -1660,19 +1661,64 @@ def extract_pin_records_from_row(
     if not pin_numbers:
         return []
 
+    parallel_values = split_parallel_merged_pin_fields(fields, pin_numbers)
     records = []
-    for pin_no in pin_numbers:
-        record = {key: fields[key] for key in PIN_FIELD_ORDER if key in fields}
-        for key, value in fields.items():
+    for index, pin_no in enumerate(pin_numbers):
+        record_fields = fields
+        if parallel_values:
+            record_fields = dict(fields)
+            for field_name, values in parallel_values.items():
+                record_fields[field_name] = values[index]
+        record = {key: record_fields[key] for key in PIN_FIELD_ORDER if key in record_fields}
+        for key, value in record_fields.items():
             if key not in record:
                 record[key] = value
         record["pin_no"] = pin_no
-        if fields.get("package"):
-            record["_pkg"] = fields["package"]
+        if record_fields.get("package"):
+            record["_pkg"] = record_fields["package"]
         if raw_fields:
             record["_raw_fields"] = raw_fields
         records.append(record)
     return records
+
+
+def split_parallel_merged_pin_fields(
+    fields: dict[str, str],
+    pin_numbers: list[str],
+) -> dict[str, list[str]]:
+    """Split rows accidentally merged at a cross-page table boundary."""
+    if len(pin_numbers) <= 1:
+        return {}
+
+    split_fields: dict[str, list[str]] = {}
+    for field_name in ("pin_name", "signal_name", "ball_name", "terminal_name", "pad_name"):
+        parts = split_visual_lines(fields.get(field_name, ""))
+        if len(parts) == len(pin_numbers):
+            split_fields[field_name] = parts
+
+    type_parts = split_merged_type_value(fields.get("type", ""), len(pin_numbers))
+    if type_parts:
+        split_fields["type"] = type_parts
+
+    return split_fields
+
+
+def split_visual_lines(value: str) -> list[str]:
+    parts = [part.strip() for part in re.split(r"(?:\r?\n|<br\s*/?>)+", str(value), flags=re.IGNORECASE)]
+    return [part for part in parts if part]
+
+
+def split_merged_type_value(value: str, expected_count: int) -> list[str]:
+    value = plain_text(str(value)).strip()
+    if expected_count <= 1 or not value:
+        return []
+    line_parts = split_visual_lines(value)
+    if len(line_parts) == expected_count and all(looks_like_type_value(part) for part in line_parts):
+        return line_parts
+    compact = re.sub(r"\s+", "", value)
+    if len(compact) == expected_count and all(looks_like_type_value(char) for char in compact):
+        return list(compact)
+    return []
 
 
 def get_package_bucket(
@@ -1948,6 +1994,10 @@ def split_pin_numbers(value: str) -> list[str]:
     tokens = BALL_TOKEN_RE.findall(value)
     if tokens:
         return tokens
+    compact = re.sub(r"[\s,;/|]+", "", plain_text(str(value)).upper())
+    compact_tokens = RAW_BALL_TOKEN_RE.findall(compact)
+    if len(compact_tokens) > 1 and "".join(compact_tokens) == compact:
+        return compact_tokens
     value = value.strip()
     if NUMERIC_PIN_RE.fullmatch(value):
         return [value]
