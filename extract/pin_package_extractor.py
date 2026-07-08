@@ -1945,6 +1945,16 @@ def first_non_empty(row: list[str]) -> str:
 
 
 def split_pin_numbers(value: str) -> list[str]:
+    normalized_value = plain_text(str(value)).upper()
+    if "[" in normalized_value or "]" in normalized_value:
+        return []
+    if has_unsupported_pin_range(normalized_value):
+        return []
+
+    range_expanded = expand_same_prefix_pin_ranges(value)
+    if range_expanded:
+        return range_expanded
+
     tokens = BALL_TOKEN_RE.findall(value)
     if tokens:
         return tokens
@@ -1953,6 +1963,55 @@ def split_pin_numbers(value: str) -> list[str]:
         return [value]
     numeric_tokens = re.findall(r"\b\d{1,4}\b", value)
     return numeric_tokens
+
+
+def has_unsupported_pin_range(value: str) -> bool:
+    for match in re.finditer(
+        r"([A-Z]{1,2})(\d{1,2})\s*[-–—]\s*([A-Z]{1,2})(\d{1,2})",
+        value,
+    ):
+        if match.group(1) != match.group(3):
+            return True
+    return False
+
+
+def expand_same_prefix_pin_ranges(value: str) -> list[str]:
+    """Expand compact pin ranges such as H1-H5 while leaving A1-C3 alone."""
+    text = plain_text(str(value)).upper()
+    if not text or "[" in text or "]" in text:
+        return []
+
+    parts = [part.strip() for part in re.split(r"[,;/|]+", text) if part.strip()]
+    if not parts:
+        return []
+
+    expanded: list[str] = []
+    saw_range = False
+    for part in parts:
+        range_match = re.fullmatch(
+            r"([A-Z]{1,2})(\d{1,2})\s*[-–—]\s*([A-Z]{1,2})(\d{1,2})",
+            part,
+        )
+        if range_match:
+            start_prefix, start_num, end_prefix, end_num = range_match.groups()
+            if start_prefix != end_prefix:
+                return []
+            start = int(start_num)
+            end = int(end_num)
+            if start > end or end - start > 200:
+                return []
+            expanded.extend(f"{start_prefix}{number}" for number in range(start, end + 1))
+            saw_range = True
+            continue
+
+        tokens = BALL_TOKEN_RE.findall(part)
+        if tokens and " ".join(tokens).replace(" ", "") == re.sub(r"\s+", "", part):
+            expanded.extend(tokens)
+            continue
+
+        return []
+
+    return expanded if saw_range else []
 
 
 def is_ordering_table(headers: list[str]) -> bool:
