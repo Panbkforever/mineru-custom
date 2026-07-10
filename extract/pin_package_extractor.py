@@ -1,9 +1,21 @@
-"""
-Extract pin/package fields from MinerU middle_json tables.
+"""从 MinerU 的表格结果中提取器件引脚和封装信息。
 
-The extractor does not copy full tables. It first classifies table columns by
-pin/package semantics, keeps only relevant columns, and groups extracted rows by
-package and table/group title.
+本文件只做一件事：把表格转换为项目约定的 JSON 结构。
+
+处理流程固定为四个阶段，阶段之间不互相调用：
+
+1. 表格判断：判断当前表是不是“物理引脚/封装关系表”。
+2. 字段判断：只判断每一列的语义，不读取行来生成输出记录。
+3. 行提取：按照已经确定的字段映射，完整读取所有数据行。
+4. 结果整理：拆分显式 pin_no 分隔符、清洗 pin_name、分组和合并封装别名。
+
+特别重要的项目规则：
+
+* 一列一旦被判定为需要字段，就不因为某一行为空而跳过该行。
+* pin_no 只有在原文有空格、逗号、斜杠等显式分隔符时才拆分；A1-C3 不拆。
+* pin_name 为空填 ``Reserved``；去掉末尾的 ``(数字)`` 和 ``(continued)``。
+* 同一个 pin_no 出现多次时不合并记录；不同 type 也不合并。
+* “Pin Configuration and Function” 这类坐标矩阵不是物理引脚表，表级直接排除。
 """
 
 from __future__ import annotations
@@ -15,7 +27,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from extract.table_association_rules import (
     PackageSnapshot,
@@ -23,80 +35,9 @@ from extract.table_association_rules import (
 )
 
 
-TR_RE = re.compile(r"(<tr[^>]*>)(.*?)(</tr>)", re.DOTALL | re.IGNORECASE)
-CELL_RE = re.compile(
-    r"(<t[dh][^>]*>)(.*?)(</t[dh]>)",
-    re.DOTALL | re.IGNORECASE,
-)
-TAG_RE = re.compile(r"<[^>]+>")
-BALL_TOKEN_RE = re.compile(r"\b[A-Z]{1,2}\d{1,2}\b")
-NUMERIC_PIN_RE = re.compile(r"^\d{1,4}$")
-PACKAGE_HEADER_RE = re.compile(
-    r"\b(?:\d{2,4}\s*)?(?:qfp|lqfp|tqfp|htqfp|vqfn|vssop|ssop|tssop|qfn|"
-    r"bga|pbga|nfbga|fcbga|fc csp|soic|sop|pdip|pga|clcc|lccc|dfn|wqfn|"
-    r"pmq|pm|pt|pn|pnp|pzp|pz|peu|rgc|rtd|rgz|rha|rhb|rsh|dsg|dgs\d*|da|pw|nw|n|rsa|"
-    r"zce\d*[a-z]*|nzn\d*[a-z]*|zwt|zjz|zhh|zay|alv|alx|am[a-z]|"
-    r"abc|alw|alz|anf|anj|zqw|pwp|rgy|rsm|rge|rte)\b",
-    re.IGNORECASE,
-)
-PACKAGE_FAMILY_RE = re.compile(
-    r"\b(qfp|lqfp|tqfp|htqfp|vqfn|vssop|ssop|tssop|qfn|bga|pbga|nfbga|"
-    r"fcbga|soic|sop|pdip|pga|clcc|lccc|dfn|wqfn)\b",
-    re.IGNORECASE,
-)
-PACKAGE_CODE_RE = re.compile(
-    r"\b(pmq|pm|pt|pn|pnp|pzp|pz|peu|rgc|rtd|rgz|rha|rhb|rsh|dsg|dgs\d*|da|pw|nw|n|rsa|"
-    r"zce\d*[a-z]*|nzn\d*[a-z]*|zwt|zjz|zhh|zay|alv|alx|am[a-z]|abc|alw|"
-    r"alz|anf|anj|zqw|pwp|rgy|rsm|rge|rte)\b",
-    re.IGNORECASE,
-)
-PIN_FIELD_ORDER = [
-    "pin_no",
-    "pin_name",
-    "ball_no",
-    "ball_name",
-    "signal_name",
-    "terminal_no",
-    "terminal_name",
-    "pad_name",
-    "type",
-    "io_type",
-    "package",
-]
-
-IGNORE_HEADER_KEYWORDS = {
-    "description",
-    "test condition",
-    "condition",
-    "min",
-    "typ",
-    "nom",
-    "max",
-    "unit",
-    "voltage",
-    "reset",
-    "pull",
-    "power",
-    "hys",
-    "ret",
-    "note",
-    "comment",
-    "address",
-    "register",
-}
-
-ORDERING_TABLE_KEYWORDS = {
-    "orderable device",
-    "device",
-    "status",
-    "package type",
-    "package drawing",
-    "package qty",
-    "eco plan",
-    "lead finish",
-    "msl peak temp",
-    "samples",
-}
+# ---------------------------------------------------------------------------
+# 数据结构：判断阶段的结果和输出阶段的结果分开
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -111,7 +52,20 @@ class ColumnDecision:
     index: int
     raw_header: str
     field_name: str
-    score: int
+    score: int = 0
+
+
+@dataclass
+class TableDecision:
+    """表级判断结果，不包含任何已经提取出的 pin 记录。"""
+
+    should_extract: bool
+    table_role: str = ""
+    pkg: str = ""
+    group: str = ""
+    reason: str = ""
+    confidence: float = 0.0
+    columns: list[ColumnDecision] = field(default_factory=list)
 
 
 @dataclass
@@ -132,8 +86,9 @@ class PackageIdentity:
 LAST_EXTRACTION_DEBUG: list[dict[str, Any]] = []
 
 
-def get_last_extraction_debug() -> list[dict[str, Any]]:
-    return LAST_EXTRACTION_DEBUG
+# ---------------------------------------------------------------------------
+# 对外入口：所有入口都使用同一条流水线
+# ---------------------------------------------------------------------------
 
 
 def extract_pin_package_info_from_middle_json(
@@ -142,124 +97,12 @@ def extract_pin_package_info_from_middle_json(
     include_debug: bool = False,
     use_semantic_classifier: bool = False,
 ) -> list[dict[str, Any]]:
-    """Extract package/group/pin records from one MinerU middle_json object."""
-    if use_semantic_classifier:
-        return extract_pin_package_info_from_table_candidates(
-            iter_table_candidates(middle_json),
-            source_name=source_name,
-            use_semantic_classifier=True,
-            include_debug=include_debug,
-        )
-
-    packages: dict[str, dict[str, Any]] = {}
-
-    for table in iter_table_candidates(middle_json):
-        rows = parse_html_table(table.html)
-        if len(rows) < 2:
-            continue
-
-        header_index, headers = choose_header_row(rows)
-        if header_index < 0 and use_semantic_classifier:
-            header_index, headers = choose_loose_header_row(rows, table.title)
-        if header_index < 0:
-            continue
-
-        if is_ordering_table(headers):
-            continue
-
-        decisions = classify_columns(headers, rows[header_index + 1:], table.title)
-        association = resolve_table_package_association(
-            table.title,
-            headers,
-            rows[header_index + 1:],
-            decisions,
-            build_package_snapshots(packages),
-        )
-        if use_semantic_classifier:
-            if not is_pin_package_table(decisions) and not is_semantic_candidate_table(
-                table.title,
-                headers,
-                rows[header_index + 1:],
-                decisions,
-            ):
-                continue
-            semantic_decision = classify_semantic_table(
-                table.title,
-                headers,
-                rows[header_index + 1:],
-                decisions,
-                include_debug=include_debug,
-            )
-            if not semantic_decision_allows_pin_creation(
-                semantic_decision,
-                decisions,
-                table.title,
-                has_associated_package=bool(association.package),
-            ):
-                continue
-            decisions = merge_semantic_column_decisions(
-                decisions,
-                semantic_decision,
-                headers,
-            )
-            decisions = keep_primary_type_decision(decisions, rows[header_index + 1:])
-        elif not is_pin_package_table(decisions):
-            continue
-
-        if not is_pin_package_table(decisions):
-            continue
-
-        default_pkg = association.package or infer_package_name(table.title)
-        group_name = (
-            infer_group_name(table.title)
-            or infer_group_name_from_headers(headers, default_pkg)
-            or "Pin/Package Table"
-        )
-        current_group_name = group_name
-
-        for row in rows[header_index + 1:]:
-            if is_group_row(row):
-                group_text = first_non_empty(row)
-                if group_text:
-                    current_group_name = group_text
-                continue
-
-            pin_records = extract_pin_records_from_row(row, decisions)
-            for pin_record in pin_records:
-                record_pkg = pin_record.pop("_pkg", default_pkg)
-                raw_fields = pin_record.pop("_raw_fields", None)
-                if include_debug and raw_fields:
-                    pin_record["raw_fields"] = raw_fields
-                package_identity = build_package_identity(record_pkg)
-                package_bucket = get_package_bucket(
-                    packages,
-                    package_identity,
-                )
-                record_group_name = (
-                    infer_group_name_from_headers(headers, record_pkg)
-                    if is_generic_group_name(current_group_name)
-                    else current_group_name
-                )
-                current_group = get_or_create_group(package_bucket, record_group_name)
-                if include_debug and source_name:
-                    pin_record.setdefault("source", source_name)
-                if include_debug and table.page_idx is not None:
-                    pin_record.setdefault("source_page", table.page_idx + 1)
-                add_pin_record_to_group(current_group, pin_record)
-
-    result = []
-    for package_bucket in packages.values():
-        groups = [
-            {"group": group.group, "pin_list": group.pin_list}
-            for group in package_bucket["_groups"].values()
-            if group.pin_list
-        ]
-        if groups:
-            package_result = {"pkg": package_bucket["pkg"], "group_list": groups}
-            if include_debug:
-                package_result["pkg_key"] = package_bucket["pkg_key"]
-            result.append(package_result)
-    return result
+    return extract_pin_package_info_from_table_candidates(
+        iter_table_candidates(middle_json),
+        source_name=source_name,
+        include_debug=include_debug,
+        use_semantic_classifier=use_semantic_classifier,
+    )
 
 
 def extract_pin_package_info_from_middle_json_file(
@@ -268,9 +111,8 @@ def extract_pin_package_info_from_middle_json_file(
     include_debug: bool = False,
 ) -> list[dict[str, Any]]:
     path = Path(path)
-    middle_json = json.loads(path.read_text(encoding="utf-8"))
     return extract_pin_package_info_from_middle_json(
-        middle_json,
+        json.loads(path.read_text(encoding="utf-8")),
         source_name=path.stem,
         use_semantic_classifier=use_semantic_classifier,
         include_debug=include_debug,
@@ -282,163 +124,39 @@ def extract_pin_package_info_from_markdown_json_file(
     use_semantic_classifier: bool = False,
     include_debug: bool = False,
 ) -> list[dict[str, Any]]:
-    """Extract from the final post-processed JSON written beside the md file.
+    """从最终的 ``<pdf>.json`` 中提取，确保使用后处理后的表格。"""
 
-    MinerU's middle_json is generated before some of our table post-processing.
-    The final `<pdf>.json` stores the same markdown shown to the user, so reading
-    it keeps extraction aligned with the corrected tables.
-    """
     path = Path(path)
-    parsed_json = json.loads(path.read_text(encoding="utf-8"))
-    markdown = parsed_json.get("markdown") if isinstance(parsed_json, dict) else ""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    markdown = payload.get("markdown", "") if isinstance(payload, dict) else ""
     if not isinstance(markdown, str) or "<table" not in markdown.lower():
         return []
     return extract_pin_package_info_from_table_candidates(
         iter_table_candidates_from_markdown(markdown),
         source_name=path.stem,
-        use_semantic_classifier=use_semantic_classifier,
         include_debug=include_debug,
+        use_semantic_classifier=use_semantic_classifier,
     )
 
 
 def extract_pin_package_info_from_table_candidates(
-    tables: list[TableCandidate],
+    tables: Iterable[TableCandidate],
     source_name: str = "",
     include_debug: bool = False,
     use_semantic_classifier: bool = False,
 ) -> list[dict[str, Any]]:
-    if use_semantic_classifier:
-        return extract_pin_package_info_with_semantic_schema(
-            tables,
-            source_name=source_name,
-            include_debug=include_debug,
-        )
+    """按“先判断、后提取”的顺序处理表格。"""
 
-    packages: dict[str, dict[str, Any]] = {}
-
-    for table in tables:
-        rows = parse_html_table(table.html)
-        if len(rows) < 2:
-            continue
-
-        header_index, headers = choose_header_row(rows)
-        if header_index < 0 and use_semantic_classifier:
-            header_index, headers = choose_loose_header_row(rows, table.title)
-        if header_index < 0:
-            continue
-
-        if is_ordering_table(headers):
-            continue
-
-        decisions = classify_columns(headers, rows[header_index + 1:], table.title)
-        association = resolve_table_package_association(
-            table.title,
-            headers,
-            rows[header_index + 1:],
-            decisions,
-            build_package_snapshots(packages),
-        )
-        if use_semantic_classifier:
-            if not is_pin_package_table(decisions) and not is_semantic_candidate_table(
-                table.title,
-                headers,
-                rows[header_index + 1:],
-                decisions,
-            ):
-                continue
-            semantic_decision = classify_semantic_table(
-                table.title,
-                headers,
-                rows[header_index + 1:],
-                decisions,
-                include_debug=include_debug,
-            )
-            if not semantic_decision_allows_pin_creation(
-                semantic_decision,
-                decisions,
-                table.title,
-                has_associated_package=bool(association.package),
-            ):
-                continue
-            decisions = merge_semantic_column_decisions(
-                decisions,
-                semantic_decision,
-                headers,
-            )
-            decisions = keep_primary_type_decision(decisions, rows[header_index + 1:])
-        elif not is_pin_package_table(decisions):
-            continue
-
-        if not is_pin_package_table(decisions):
-            continue
-
-        default_pkg = association.package or infer_package_name(table.title)
-        group_name = (
-            infer_group_name(table.title)
-            or infer_group_name_from_headers(headers, default_pkg)
-            or "Pin/Package Table"
-        )
-        current_group_name = group_name
-
-        for row in rows[header_index + 1:]:
-            if is_group_row(row):
-                group_text = first_non_empty(row)
-                if group_text:
-                    current_group_name = group_text
-                continue
-
-            pin_records = extract_pin_records_from_row(row, decisions)
-            for pin_record in pin_records:
-                record_pkg = pin_record.pop("_pkg", default_pkg)
-                raw_fields = pin_record.pop("_raw_fields", None)
-                if include_debug and raw_fields:
-                    pin_record["raw_fields"] = raw_fields
-                package_identity = build_package_identity(record_pkg)
-                package_bucket = get_package_bucket(
-                    packages,
-                    package_identity,
-                )
-                record_group_name = (
-                    infer_group_name_from_headers(headers, record_pkg)
-                    if is_generic_group_name(current_group_name)
-                    else current_group_name
-                )
-                current_group = get_or_create_group(package_bucket, record_group_name)
-                if include_debug and source_name:
-                    pin_record.setdefault("source", source_name)
-                if include_debug and table.page_idx is not None:
-                    pin_record.setdefault("source_page", table.page_idx + 1)
-                add_pin_record_to_group(current_group, pin_record)
-
-    result = []
-    for package_bucket in packages.values():
-        groups = [
-            {"group": group.group, "pin_list": group.pin_list}
-            for group in package_bucket["_groups"].values()
-            if group.pin_list
-        ]
-        if groups:
-            package_result = {"pkg": package_bucket["pkg"], "group_list": groups}
-            if include_debug:
-                package_result["pkg_key"] = package_bucket["pkg_key"]
-            result.append(package_result)
-    return result
-
-
-def extract_pin_package_info_with_semantic_schema(
-    tables: list[TableCandidate],
-    source_name: str = "",
-    include_debug: bool = False,
-) -> list[dict[str, Any]]:
-    """New extraction path: loose recall, LLM column schema, code validation."""
     global LAST_EXTRACTION_DEBUG
     LAST_EXTRACTION_DEBUG = []
+    candidates = list(tables)
     packages: dict[str, dict[str, Any]] = {}
-    prepared: list[dict[str, Any]] = []
 
-    for table_id, table in enumerate(tables):
+    # 第一阶段：只准备候选表，不创建任何 pin 记录。
+    prepared = []
+    for table_id, table in enumerate(candidates):
         rows = parse_html_table(table.html)
-        table_debug: dict[str, Any] = {
+        debug = {
             "table_id": table_id,
             "source": source_name,
             "page": table.page_idx + 1 if isinstance(table.page_idx, int) else None,
@@ -447,1861 +165,771 @@ def extract_pin_package_info_with_semantic_schema(
             "status": "pending",
             "skip_reason": "",
         }
-        LAST_EXTRACTION_DEBUG.append(table_debug)
+        LAST_EXTRACTION_DEBUG.append(debug)
 
         if len(rows) < 2:
-            table_debug.update({"status": "skipped", "skip_reason": "too_few_rows"})
+            skip(debug, "too_few_rows")
+            continue
+        if is_pinout_matrix_table(rows, table.title):
+            skip(debug, "pinout_matrix_table")
             continue
 
-        header_index, headers = choose_semantic_header_row(rows, table.title)
-        table_debug["header_index"] = header_index
-        table_debug["headers"] = headers
-        table_debug["sample_rows"] = rows[header_index + 1 : header_index + 6] if header_index >= 0 else rows[:5]
+        header_index, headers = choose_header_row(rows, table.title, semantic=use_semantic_classifier)
         if header_index < 0:
-            table_debug.update({"status": "skipped", "skip_reason": "no_candidate_header"})
+            skip(debug, "no_candidate_header")
             continue
-
         data_rows = rows[header_index + 1 :]
-        if not is_loose_semantic_candidate(table.title, headers, data_rows):
-            table_debug.update({"status": "skipped", "skip_reason": "not_loose_candidate"})
+        if is_ordering_table(headers):
+            skip(debug, "ordering_table")
+            continue
+        if not is_loose_candidate(table.title, headers, data_rows):
+            skip(debug, "not_pin_table_candidate")
             continue
         if is_non_physical_port_function_table(table.title, headers):
-            table_debug.update({"status": "skipped", "skip_reason": "non_physical_port_function_table"})
+            skip(debug, "non_physical_port_function_table")
             continue
 
-        rule_decisions = classify_columns(headers, data_rows, table.title)
-        table_debug["rule_decisions"] = [
-            {
-                "index": decision.index,
-                "header": decision.raw_header,
-                "field": decision.field_name,
-                "score": decision.score,
-            }
-            for decision in rule_decisions
-        ]
+        rule_columns = classify_columns(headers, data_rows, table.title)
         prepared.append(
             {
                 "table_id": table_id,
                 "table": table,
                 "rows": rows,
+                "header_index": header_index,
                 "headers": headers,
                 "data_rows": data_rows,
-                "rule_decisions": rule_decisions,
-                "debug": table_debug,
+                "rule_columns": rule_columns,
+                "debug": debug,
             }
         )
+        debug["headers"] = headers
+        debug["rule_columns"] = decisions_to_debug(rule_columns)
 
-    schemas: dict[int, dict[str, Any]] = {}
-    # GLM and similar OpenAI-compatible APIs often have strict rate limits.
-    # Keep the default conservative; callers can raise it with
-    # EXTRACT_SCHEMA_WORKERS after confirming their quota.
-    worker_count = max(1, int(os.getenv("EXTRACT_SCHEMA_WORKERS", "4")))
-    if prepared:
-        print(f"语义字段判断: 候选表 {len(prepared)} 张, 并发 {worker_count}", flush=True)
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_map = {
-            executor.submit(
-                classify_schema_table,
-                item["table_id"],
-                item["table"].title,
-                item["headers"],
-                item["data_rows"],
-                item["rule_decisions"],
-            ): item
-            for item in prepared
-        }
-        completed = 0
-        for future in as_completed(future_map):
-            item = future_map[future]
-            completed += 1
-            try:
-                schema = future.result()
-            except Exception as exc:
-                schema = {
-                    "table_id": item["table_id"],
-                    "table_role": "error",
-                    "should_extract": False,
-                    "pkg": "",
-                    "group": "",
-                    "columns": [],
-                    "confidence": 0.0,
-                    "reason": f"schema_classification_failed: {exc}",
-                }
-            schemas[item["table_id"]] = schema
-            if completed == 1 or completed == len(prepared) or completed % 10 == 0:
-                print(f"语义字段判断进度: {completed}/{len(prepared)}", flush=True)
+    # 第二阶段：先完成所有表级和字段级判断，再进入任何行提取。
+    decisions = decide_all_tables(prepared, use_semantic_classifier, include_debug)
 
+    # 第三阶段：只有已经通过判断的表才允许进入行提取。
     for item in prepared:
-        table_id = item["table_id"]
-        table = item["table"]
-        headers = item["headers"]
-        data_rows = item["data_rows"]
-        table_debug = item["debug"]
-        schema = schemas.get(table_id) or {
-            "table_id": table_id,
-            "table_role": "error",
-            "should_extract": False,
-            "pkg": "",
-            "group": "",
-            "columns": [],
-            "confidence": 0.0,
-            "reason": "missing_schema_result",
-        }
-        table_debug["semantic_schema"] = schema
-        if not schema.get("should_extract"):
-            table_debug.update({"status": "skipped", "skip_reason": "semantic_rejected"})
-            continue
-        schema_valid, schema_reason = validate_semantic_schema(schema, table.title, headers)
-        if not schema_valid:
-            table_debug.update({"status": "skipped", "skip_reason": schema_reason})
-            continue
-
-        decisions = build_schema_column_decisions(schema, headers)
-        decisions = keep_primary_type_decision(decisions, data_rows)
-        table_debug["schema_decisions"] = [
-            {
-                "index": decision.index,
-                "header": decision.raw_header,
-                "field": decision.field_name,
-                "score": decision.score,
-            }
-            for decision in decisions
-        ]
-
-        valid, reason = validate_schema_decisions(decisions, data_rows)
-        if not valid:
-            table_debug.update({"status": "skipped", "skip_reason": reason})
+        table_decision = decisions[item["table_id"]]
+        debug = item["debug"]
+        debug["decision"] = decision_to_debug(table_decision)
+        if not table_decision.should_extract:
+            skip(debug, table_decision.reason or "table_rejected")
             continue
 
         association = resolve_table_package_association(
-            table.title,
-            headers,
-            data_rows,
-            decisions,
+            item["table"].title,
+            item["headers"],
+            item["data_rows"],
+            table_decision.columns,
             build_package_snapshots(packages),
         )
         default_pkg = (
-            str(schema.get("pkg") or "").strip()
+            table_decision.pkg
             or association.package
-            or infer_package_name(table.title)
+            or infer_package_name(item["table"].title)
         )
-        group_name = (
-            str(schema.get("group") or "").strip()
-            or infer_group_name(table.title)
-            or infer_group_name_from_headers(headers, default_pkg)
+        group_name = clean_group_name(
+            table_decision.group
+            or infer_group_name(item["table"].title)
+            or infer_group_name_from_headers(item["headers"], default_pkg)
             or "Pin/Package Table"
         )
+
+        # 行提取函数只做列映射，不再决定表格是否有效。
         current_group_name = group_name
         extracted_count = 0
-
-        for row in data_rows:
+        for row in item["data_rows"]:
             if is_group_row(row):
-                group_text = first_non_empty(row)
-                if group_text:
-                    current_group_name = group_text
+                current_group_name = clean_group_name(first_non_empty(row)) or current_group_name
                 continue
-
-            pin_records = extract_pin_records_from_row(row, decisions)
-            for pin_record in pin_records:
-                record_pkg = pin_record.pop("_pkg", default_pkg)
-                raw_fields = pin_record.pop("_raw_fields", None)
-                if include_debug and raw_fields:
-                    pin_record["raw_fields"] = raw_fields
-                package_identity = build_package_identity(record_pkg)
-                package_bucket = get_package_bucket(packages, package_identity)
-                current_group = get_or_create_group(package_bucket, current_group_name)
+            for record in extract_records_from_row(row, table_decision.columns):
+                record_pkg = record.pop("_pkg", default_pkg)
+                record.pop("_raw_fields", None)
                 if include_debug and source_name:
-                    pin_record.setdefault("source", source_name)
-                if include_debug and table.page_idx is not None:
-                    pin_record.setdefault("source_page", table.page_idx + 1)
-                add_pin_record_to_group(current_group, pin_record)
+                    record["source"] = source_name
+                if include_debug and item["table"].page_idx is not None:
+                    record["source_page"] = item["table"].page_idx + 1
+                identity = build_package_identity(record_pkg)
+                bucket = get_package_bucket(packages, identity)
+                group = get_or_create_group(bucket, current_group_name)
+                add_pin_record_to_group(group, record)
                 extracted_count += 1
 
         if extracted_count:
-            table_debug.update(
-                {
-                    "status": "extracted",
-                    "pin_count": extracted_count,
-                    "pkg": default_pkg,
-                    "group": clean_group_name(group_name) or "Pin/Package Table",
-                }
-            )
+            debug.update({
+                "status": "extracted",
+                "pin_count": extracted_count,
+                "pkg": default_pkg,
+                "group": group_name,
+            })
         else:
-            table_debug.update({"status": "skipped", "skip_reason": "no_pin_records_after_mapping"})
+            skip(debug, "no_pin_records_after_mapping")
 
-    result = []
-    for package_bucket in packages.values():
-        groups = [
-            {"group": group.group, "pin_list": group.pin_list}
-            for group in package_bucket["_groups"].values()
-            if group.pin_list
-        ]
-        if groups:
-            package_result = {"pkg": package_bucket["pkg"], "group_list": groups}
-            if include_debug:
-                package_result["pkg_key"] = package_bucket["pkg_key"]
-            result.append(package_result)
-    return result
+    return build_public_result(packages, include_debug)
 
 
-def choose_semantic_header_row(rows: list[list[str]], title: str = "") -> tuple[int, list[str]]:
-    """Looser header selection for LLM schema extraction."""
-    best_index = -1
-    best_score = -999
-    best_headers: list[str] = []
-    max_header_rows = min(6, len(rows))
-    for index in range(max_header_rows):
-        headers = build_combined_headers(rows, index)
-        header_text = normalize_header(" ".join(headers))
-        score = score_loose_table_evidence(title, headers, rows[index + 1 : index + 7])
-        score += sum(classify_header(header)[1] for header in headers)
-        if any(keyword in header_text for keyword in ("pin", "ball", "terminal", "signal", "package", "mux", "type", "i o", "gpio")):
-            score += 2
-        if is_ordering_table(headers):
-            score -= 6
-        if score > best_score:
-            best_index = index
-            best_score = score
-            best_headers = headers
-    if best_score < 1:
-        return -1, []
-    return best_index, best_headers
+def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, include_debug: bool) -> dict[int, TableDecision]:
+    """完成全部表格判断；此函数绝不调用行提取函数。"""
+
+    if not prepared:
+        return {}
+    if not use_semantic:
+        return {
+            item["table_id"]: decide_table_by_rules(item)
+            for item in prepared
+        }
+
+    from extract.semantic_classifier import classify_table_schema
+
+    workers = max(1, int(os.getenv("EXTRACT_SCHEMA_WORKERS", "2")))
+    print(f"语义字段判断: 候选表 {len(prepared)} 张, 并发 {workers}", flush=True)
+    results: dict[int, TableDecision] = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                classify_table_schema,
+                item["table_id"],
+                item["table"].title,
+                item["headers"],
+                item["data_rows"][:12],
+                item["rule_columns"],
+            ): item
+            for item in prepared
+        }
+        for index, future in enumerate(as_completed(futures), 1):
+            item = futures[future]
+            try:
+                schema = future.result()
+                decision = decision_from_schema(schema, item)
+            except Exception as exc:
+                decision = TableDecision(False, reason=f"semantic_classification_failed:{exc}")
+            results[item["table_id"]] = decision
+            print(f"语义字段判断进度: {index}/{len(prepared)}", flush=True)
+    return results
 
 
-def is_loose_semantic_candidate(title: str, headers: list[str], data_rows: list[list[str]]) -> bool:
-    """Recall-first candidate filter before spending an LLM call."""
+def decide_table_by_rules(item: dict[str, Any]) -> TableDecision:
+    """无 LLM 时的确定性表级/字段级判断。"""
+
+    columns = keep_primary_type_decision(item["rule_columns"], item["data_rows"])
+    if not is_pin_package_table(columns):
+        return TableDecision(False, reason="missing_pin_name_or_number_column", columns=columns)
+    return TableDecision(
+        True,
+        table_role="rule_pin_table",
+        pkg=infer_package_name(item["table"].title),
+        group=infer_group_name(item["table"].title),
+        confidence=1.0,
+        columns=columns,
+        reason="rule_mapping_shape_valid",
+    )
+
+
+def decision_from_schema(schema: dict[str, Any], item: dict[str, Any]) -> TableDecision:
+    """把模型返回的 schema 转成内部决定，并做最小确定性校验。"""
+
+    role = normalize_header(str(schema.get("table_role") or ""))
+    if role in {"port function table", "pin mux table", "alternate function table", "default mapping table", "module signal connection", "irrelevant", "timing table", "electrical conditions", "ordering table", "boot mode table"}:
+        return TableDecision(False, table_role=role, reason=f"semantic_role_rejected:{role}")
+    if not bool(schema.get("should_extract")):
+        return TableDecision(False, table_role=role, reason="semantic_rejected")
+
+    columns = build_schema_column_decisions(schema, item["headers"])
+    columns = keep_primary_type_decision(columns, item["data_rows"])
+    if not has_required_columns(columns):
+        return TableDecision(False, table_role=role, reason="semantic_schema_missing_required_columns", columns=columns)
+    pkg = str(schema.get("pkg") or "").strip()
+    if is_invalid_schema_package_name(pkg):
+        pkg = ""
+    group = clean_group_name(str(schema.get("group") or ""))
+    return TableDecision(
+        True,
+        table_role=role,
+        pkg=pkg,
+        group=group,
+        confidence=float(schema.get("confidence") or 0.0),
+        reason=str(schema.get("reason") or "semantic_schema_valid"),
+        columns=columns,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 表格判断：只判断“是不是目标表”，不生成输出记录
+# ---------------------------------------------------------------------------
+
+
+def is_pinout_matrix_table(rows: list[list[str]], title: str = "") -> bool:
+    """排除坐标矩阵/引脚排列图对应的表格。
+
+    这类表格常见形式是：表头包含 1、2、3...，第一列数据是 A、B、C...，
+    单元格内容是坐标交叉关系。它不是“每行一个物理引脚”的表，不能把
+    A/B/C 误当成 pin_no，也不能把整行矩阵内容当成 pin_name。
+    """
+
+    text = normalize_header(title)
+    if any(word in text for word in ("pin configuration", "pinout", "pin map", "pin assignment")):
+        title_signal = True
+    else:
+        title_signal = False
+    if len(rows) < 3:
+        return False
+    header = [normalize_header(cell) for cell in rows[0]]
+    explicit_pin_header = any(
+        any(token in cell for token in ("pin no", "pin number", "ball number", "terminal no", "signal name"))
+        for cell in header
+    )
+    if explicit_pin_header and not title_signal:
+        return False
+
+    numeric_header = sum(bool(re.fullmatch(r"\d{1,3}", cell)) for cell in header if cell)
+    row_label_hits = 0
+    for row in rows[1: min(len(rows), 12)]:
+        first = normalize_header(row[0]) if row else ""
+        if re.fullmatch(r"[a-z]", first):
+            row_label_hits += 1
+    return (title_signal and numeric_header >= 2 and row_label_hits >= 2) or (numeric_header >= 4 and row_label_hits >= 3 and not explicit_pin_header)
+
+
+def is_loose_candidate(title: str, headers: list[str], rows: list[list[str]]) -> bool:
+    """召回候选表；宽松，但只负责决定是否值得做字段判断。"""
+
     header_text = normalize_header(" ".join(headers))
-    text = normalize_header(
-        " ".join(
-            [
-                title,
-                header_text,
-                " ".join(" ".join(row[:10]) for row in data_rows[:6]),
-            ]
-        )
-    )
-    has_explicit_pin_header = any(
-        keyword in header_text
-        for keyword in (
-            "pin no",
-            "pin number",
-            "pin name",
-            "ball no",
-            "ball number",
-            "ball name",
-            "terminal no",
-            "terminal number",
-            "terminal name",
-            "signal name",
-            "device signal",
-            "input port pin",
-            "package pin",
-            "引脚",
-            "端子",
-            "信号名称",
-        )
-    )
-    if any(keyword in header_text for keyword in ("register description", "offset", "address")):
+    title_text = normalize_header(title)
+    if is_ordering_table(headers):
         return False
-    if any(
-        keyword in header_text
-        for keyword in (
-            "orderable device",
-            "package qty",
-            "reel diameter",
-            "reel width",
-            "spq",
-            "unit array",
-            "lead finish",
-            "eco plan",
-            "msl peak temp",
-        )
-    ):
+    if any(word in header_text for word in ("register description", "offset address", "timing requirement")):
         return False
-    if (
-        any(keyword in header_text for keyword in ("parameter", "test condition", "min", "typ", "max", "unit"))
-        and not has_explicit_pin_header
-    ):
-        return False
-    positive_keywords = (
-        "pin",
-        "ball",
-        "terminal",
-        "pad",
-        "signal",
-        "package",
-        "mux",
-        "type",
-        "i o",
-        "gpio",
-        "vdd",
-        "vss",
-        "gnd",
-        "端子",
-        "引脚",
-        "封装",
-        "信号",
-    )
-    if any(keyword in text for keyword in positive_keywords):
+    if any(word in header_text for word in ("pin", "ball", "terminal", "signal", "引脚", "端子", "信号")):
         return True
-    sample_text = " ".join(" ".join(row[:10]) for row in data_rows[:8])
-    return bool(BALL_TOKEN_RE.search(sample_text))
+    if any(word in title_text for word in ("pin attributes", "terminal functions", "signal descriptions", "connectivity requirements")):
+        return True
+    return bool(re.search(r"\b[A-Z]{1,2}\d{1,3}\b", " ".join(" ".join(row) for row in rows[:8])))
 
 
 def is_non_physical_port_function_table(title: str, headers: list[str]) -> bool:
-    """Reject mux/port-function tables that do not expose physical package pins.
+    """排除功能复用表，但不排除有明确物理 pin 编号的表。"""
 
-    These tables are useful context, but they are not the final pin/ball package
-    mapping requested by the extraction output. A real physical pin table should
-    still pass because it has explicit PIN NO/BALL NUMBER/TERMINAL NO headers.
-    """
-    title_text = normalize_header(title)
-    header_text = normalize_header(" ".join(headers))
-    combined = f"{title_text} {header_text}"
-    has_physical_number_header = any(
-        keyword in header_text
-        for keyword in (
-            "pin no",
-            "pin number",
-            "ball no",
-            "ball number",
-            "terminal no",
-            "terminal number",
-            "package pin",
-            "引脚编号",
-            "端子编号",
-        )
-    )
-    if has_physical_number_header:
+    h = normalize_header(" ".join(headers))
+    t = normalize_header(title)
+    physical = any(word in h for word in ("pin no", "pin number", "ball number", "terminal no", "terminal number", "引脚编号", "端子编号"))
+    if physical:
         return False
-    if re.search(r"\bport\s+p[a-z0-9.]*\b", title_text):
-        return True
-    if any(keyword in combined for keyword in ("default mapping", "pin mux", "pinmux", "alternate function")):
-        return True
-    if "pin name (" in header_text and any(keyword in header_text for keyword in ("function", "module", "selection")):
-        return True
-    return False
+    return bool(re.search(r"\bport\s+p[a-z0-9.]*\b", t) or any(word in h + " " + t for word in ("pin mux", "pinmux", "alternate function", "default mapping")))
 
 
-def validate_semantic_schema(schema: dict[str, Any], title: str, headers: list[str]) -> tuple[bool, str]:
-    role = re.sub(r"[^a-z0-9]+", "_", str(schema.get("table_role") or "").lower()).strip("_")
-    if role in {
-        "port_function_table",
-        "pin_mux_table",
-        "alternate_function_table",
-        "default_mapping_table",
-        "module_signal_connection",
-    }:
-        return False, f"non_physical_table_role:{role}"
-    if is_non_physical_port_function_table(title, headers):
-        return False, "non_physical_port_function_table"
-
-    pkg = str(schema.get("pkg") or "").strip()
-    if pkg and is_invalid_schema_package_name(pkg):
-        return False, "invalid_schema_package_name"
-    for column in schema.get("columns") or []:
-        field = str(column.get("field") or "").strip()
-        pkg_name = str(column.get("pkg") or "").strip()
-        if field == "package_pin_no" and is_invalid_schema_package_name(pkg_name):
-            return False, "invalid_package_pin_column"
-    return True, ""
+def is_ordering_table(headers: list[str]) -> bool:
+    text = normalize_header(" ".join(headers))
+    words = ("orderable device", "package qty", "package type", "package drawing", "eco plan", "lead finish", "msl peak temp")
+    return "orderable device" in text and sum(word in text for word in words) >= 2
 
 
-def is_invalid_schema_package_name(pkg: str) -> bool:
-    normalized = normalize_header(pkg)
-    if not normalized:
+def has_required_columns(columns: list[ColumnDecision]) -> bool:
+    fields = {normalize_field_name(c.field_name) for c in columns}
+    return bool(fields & {"pin_no", "package_pin_no"}) and bool(fields & {"pin_name"})
+
+
+def is_pin_package_table(columns: list[ColumnDecision]) -> bool:
+    if not has_required_columns(columns):
         return False
-    if any(keyword in normalized for keyword in ("pin name", "port p", "default mapping", "function")):
-        return True
-    if re.search(r"\bp[a-z0-9.]*\)\b", normalized):
-        return True
-    # Device orderable names are not package names. Keep short package codes
-    # such as PZ/RGZ/ZCE, but reject long MCU part-number labels.
-    compact = re.sub(r"[^a-z0-9]", "", normalized)
-    if re.match(r"^(msp|am|tms)\d", compact) and len(compact) > 8:
-        return True
-    return False
+    number = [c for c in columns if normalize_field_name(c.field_name) in {"pin_no", "package_pin_no"}]
+    name = [c for c in columns if normalize_field_name(c.field_name) == "pin_name"]
+    return any(classify_header(c.raw_header)[1] >= 3 for c in number) and any(classify_header(c.raw_header)[1] >= 3 for c in name)
 
 
-def classify_schema_table(
-    table_id: int,
-    title: str,
-    headers: list[str],
-    data_rows: list[list[str]],
-    decisions: list[ColumnDecision],
-) -> dict[str, Any]:
-    from extract.semantic_classifier import classify_table_schema
+# ---------------------------------------------------------------------------
+# 字段判断：规则或 LLM 只返回 ColumnDecision
+# ---------------------------------------------------------------------------
 
-    try:
-        return classify_table_schema(
-            table_id=table_id,
-            title=title,
-            headers=headers,
-            sample_rows=data_rows[:12],
-            rule_decisions=decisions,
-        )
-    except Exception as exc:
-        return {
-            "table_id": table_id,
-            "table_role": "error",
-            "should_extract": False,
-            "pkg": "",
-            "group": "",
-            "columns": [],
-            "confidence": 0.0,
-            "reason": f"schema_classification_failed: {exc}",
-        }
+
+def classify_columns(headers: list[str], rows: list[list[str]], title: str = "") -> list[ColumnDecision]:
+    decisions = []
+    width = max([len(headers)] + [len(row) for row in rows[:30]] or [0])
+    for index in range(width):
+        header = headers[index] if index < len(headers) else ""
+        values = [row[index] for row in rows[:30] if index < len(row)]
+        field, header_score = classify_header(header)
+        value_field, value_score = classify_values(values)
+        if not field and value_field:
+            field = value_field
+        if field and header_score + value_score > 0:
+            decisions.append(ColumnDecision(index, header, field, header_score + value_score))
+    return keep_primary_type_decision(decisions, rows)
 
 
 def build_schema_column_decisions(schema: dict[str, Any], headers: list[str]) -> list[ColumnDecision]:
-    decisions: list[ColumnDecision] = []
-    schema_pkg = str(schema.get("pkg") or "").strip()
+    result = []
     for item in schema.get("columns") or []:
         index = parse_column_index(item.get("column_index"))
-        if index is None:
-            continue
         field = str(item.get("field") or "ignore").strip()
-        if field == "ignore":
+        if index is None or field == "ignore":
             continue
         if field == "package_pin_no":
-            raw_header = combine_package_context(schema_pkg, str(item.get("pkg") or "").strip())
+            raw = str(item.get("pkg") or "").strip() or safe_header(headers, index)
         else:
-            raw_header = safe_header(headers, index)
+            raw = safe_header(headers, index)
         try:
-            score = int(float(item.get("confidence", 0.8)) * 10)
+            score = max(1, int(float(item.get("confidence", 0.8)) * 10))
         except (TypeError, ValueError):
             score = 8
-        decisions.append(
-            ColumnDecision(
-                index=index,
-                raw_header=raw_header or safe_header(headers, index),
-                field_name=field,
-                score=max(score, 1),
-            )
-        )
-    return decisions
+        result.append(ColumnDecision(index, raw, field, score))
+    return result
 
 
-def combine_package_context(table_pkg: str, column_pkg: str) -> str:
-    table_pkg = table_pkg.strip()
-    column_pkg = column_pkg.strip()
-    if not table_pkg:
-        return column_pkg
-    if not column_pkg:
-        return table_pkg
-    if normalize_header(table_pkg) == normalize_header(column_pkg):
-        return column_pkg
-    if looks_like_device_model(column_pkg) and not looks_like_device_model(table_pkg):
-        return f"{table_pkg} {column_pkg}"
-    return column_pkg
+def keep_primary_type_decision(columns: list[ColumnDecision], rows: list[list[str]]) -> list[ColumnDecision]:
+    """多个 type 列时只保留最接近 signal/pin 语义的那一列。"""
+
+    types = [c for c in columns if normalize_field_name(c.field_name) == "type"]
+    if len(types) <= 1:
+        return columns
+    best = max(types, key=lambda c: score_type_column(c, rows))
+    return [c for c in columns if normalize_field_name(c.field_name) != "type" or c.index == best.index]
 
 
-def validate_schema_decisions(
-    decisions: list[ColumnDecision],
-    data_rows: list[list[str]],
-) -> tuple[bool, str]:
-    fields = {decision.field_name for decision in decisions}
-    has_pin_no = bool(fields & {"pin_no", "package_pin_no", "ball_no", "terminal_no"})
-    has_pin_name = bool(fields & {"pin_name", "ball_name", "signal_name", "terminal_name", "pad_name"})
-    if not has_pin_no:
-        return False, "missing_pin_number_column"
-    if not has_pin_name:
-        return False, "missing_pin_name_column"
-
-    probe_rows = [row for row in data_rows[:30] if not is_group_row(row)]
-    produced_records = 0
-    for row in probe_rows:
-        produced_records += len(extract_pin_records_from_row(row, decisions))
-        if produced_records >= 2:
-            return True, ""
-    return False, "schema_did_not_produce_pin_records"
-
-
-def iter_table_candidates(middle_json: dict[str, Any]) -> list[TableCandidate]:
-    """Return HTML tables with nearby text as weak title context."""
-    candidates: list[TableCandidate] = []
-    current_section_title = ""
-    for page_info in middle_json.get("pdf_info", []):
-        page_idx = page_info.get("page_idx")
-        recent_texts: list[str] = []
-        for span in iter_spans_in_reading_order(page_info):
-            html = span.get("html")
-            text = plain_text(span.get("content") or span.get("text") or "")
-            if isinstance(html, str) and "<table" in html.lower():
-                title = current_section_title or " ".join(dedupe_preserve_order(recent_texts[-5:])).strip()
-                candidates.append(
-                    TableCandidate(
-                        html=html,
-                        page_idx=page_idx if isinstance(page_idx, int) else None,
-                        title=title,
-                    )
-                )
-                continue
-            if text:
-                detected_group = infer_group_name(text)
-                if detected_group:
-                    current_section_title = detected_group
-                recent_texts.append(text)
-                recent_texts = recent_texts[-10:]
-    return candidates
-
-
-def iter_table_candidates_from_markdown(markdown: str) -> list[TableCandidate]:
-    """Return HTML tables from final markdown with nearby heading text."""
-    candidates: list[TableCandidate] = []
-    table_re = re.compile(r"<table\b.*?</table>", re.DOTALL | re.IGNORECASE)
-    recent_texts: list[str] = []
-    cursor = 0
-
-    for match in table_re.finditer(markdown):
-        before = markdown[cursor : match.start()]
-        segment_title = ""
-        segment_texts: list[str] = []
-        for line in before.splitlines():
-            text = plain_text(line).strip()
-            if not text:
-                continue
-            detected_group = infer_group_name(text)
-            if detected_group:
-                segment_title = detected_group
-            segment_texts.append(text)
-            recent_texts.append(text)
-            recent_texts = recent_texts[-10:]
-
-        # Do not let a table title leak across the rest of the document. TI
-        # datasheets often have many unrelated tables after "Signal
-        # Descriptions"; using a stale title would send almost every later table
-        # to the semantic extractor.
-        title_source = segment_texts[-5:] if segment_texts else recent_texts[-3:]
-        title = segment_title or " ".join(dedupe_preserve_order(title_source)).strip()
-        candidates.append(TableCandidate(html=match.group(0), page_idx=None, title=title))
-        cursor = match.end()
-
-    return candidates
-
-
-def dedupe_preserve_order(values: list[str]) -> list[str]:
-    deduped = []
-    for value in values:
-        value = value.strip()
-        if value and value not in deduped:
-            deduped.append(value)
-    return deduped
-
-
-def iter_spans_in_reading_order(value: Any):
-    if isinstance(value, dict):
-        if "spans" in value and isinstance(value["spans"], list):
-            for span in value["spans"]:
-                if isinstance(span, dict):
-                    yield span
-        for key in ("para_blocks", "blocks", "lines", "spans"):
-            child = value.get(key)
-            if isinstance(child, list):
-                for item in child:
-                    yield from iter_spans_in_reading_order(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from iter_spans_in_reading_order(item)
-
-
-def parse_html_table(table_html: str) -> list[list[str]]:
-    rows = []
-    for tr_match in TR_RE.finditer(table_html):
-        row = []
-        for cell_match in CELL_RE.finditer(tr_match.group(2)):
-            row.append(plain_text(cell_match.group(2)))
-        if row:
-            rows.append(row)
-    return rows
-
-
-def choose_header_row(rows: list[list[str]]) -> tuple[int, list[str]]:
-    """Choose the row with the strongest pin/package header evidence."""
-    best_index = -1
-    best_score = 0
-    best_headers: list[str] = []
-    for index, row in enumerate(rows[:4]):
-        headers = build_combined_headers(rows, index)
-        score = sum(classify_header(cell)[1] for cell in headers)
-        if is_ordering_table(headers):
-            score = 0
-        if score > best_score:
-            best_index = index
-            best_score = score
-            best_headers = headers
-    if best_score < 4:
-        return -1, []
-    return best_index, best_headers
-
-
-def choose_loose_header_row(rows: list[list[str]], title: str = "") -> tuple[int, list[str]]:
-    """Choose a possible header row for semantic classification."""
-    best_index = -1
-    best_score = 0
-    best_headers: list[str] = []
-    for index, _row in enumerate(rows[:4]):
-        headers = build_combined_headers(rows, index)
-        score = score_loose_table_evidence(title, headers, rows[index + 1 : index + 6])
-        if is_ordering_table(headers):
-            score -= 4
-        if score > best_score:
-            best_index = index
-            best_score = score
-            best_headers = headers
-    if best_score < 3:
-        return -1, []
-    return best_index, best_headers
-
-
-def build_combined_headers(rows: list[list[str]], header_index: int) -> list[str]:
-    """Merge stacked header rows so Chinese multi-row package headers stay visible."""
-    max_columns = max((len(row) for row in rows[: header_index + 1]), default=0)
-    headers = []
-    for column_index in range(max_columns):
-        parts = []
-        for row in rows[: header_index + 1]:
-            if column_index < len(row) and row[column_index].strip():
-                value = row[column_index].strip()
-                if value not in parts:
-                    parts.append(value)
-        headers.append(" ".join(parts).strip())
-    return headers
-
-
-def classify_columns(
-    headers: list[str],
-    data_rows: list[list[str]],
-    title_context: str = "",
-) -> list[ColumnDecision]:
-    decisions = []
-    max_columns = max([len(headers), *(len(row) for row in data_rows[:20])] or [0])
-    for index in range(max_columns):
-        header = headers[index] if index < len(headers) else ""
-        column_values = [row[index] for row in data_rows[:30] if index < len(row)]
-        package_score = score_package_column(header, column_values, title_context)
-        if package_score >= 6:
-            decisions.append(
-                ColumnDecision(
-                    index=index,
-                    raw_header=header,
-                    field_name="package_pin_no",
-                    score=package_score,
-                )
-            )
-            continue
-        field_name, header_score = classify_header(header)
-        if is_value_inference_blocked_header(header):
-            value_field, value_score = "", 0
-        else:
-            value_field, value_score = classify_values(column_values)
-        if value_score > header_score and field_name == "":
-            field_name = value_field
-        score = header_score + value_score
-        if field_name and score > 0:
-            decisions.append(
-                ColumnDecision(
-                    index=index,
-                    raw_header=header,
-                    field_name=field_name,
-                    score=score,
-                )
-            )
-    return keep_primary_type_decision(decisions, data_rows)
-
-
-def keep_primary_type_decision(
-    decisions: list[ColumnDecision],
-    data_rows: list[list[str]],
-) -> list[ColumnDecision]:
-    """Keep only the most relevant type-like column.
-
-    Some tables contain both SIGNAL TYPE and BUFFER TYPE. The extractor should
-    output one `type` field, so we choose the column most likely to describe the
-    pin/signal itself by header meaning, value shape, and left-to-right order.
-    """
-    type_decisions = [
-        decision
-        for decision in decisions
-        if normalize_field_name(decision.field_name) == "type"
-    ]
-    if len(type_decisions) <= 1:
-        return decisions
-
-    best_type = max(
-        type_decisions,
-        key=lambda decision: score_type_column_relevance(decision, data_rows),
-    )
-    return [
-        decision
-        for decision in decisions
-        if normalize_field_name(decision.field_name) != "type" or decision.index == best_type.index
-    ]
-
-
-def score_type_column_relevance(
-    decision: ColumnDecision,
-    data_rows: list[list[str]],
-) -> tuple[int, int]:
-    normalized_header = normalize_header(decision.raw_header)
-    score = decision.score
-
-    if any(keyword in normalized_header for keyword in ("signal type", "pin type", "terminal type", "io type", "i o type", "i/o type")):
+def score_type_column(column: ColumnDecision, rows: list[list[str]]) -> tuple[int, int]:
+    header = normalize_header(column.raw_header)
+    score = column.score
+    if any(word in header for word in ("signal type", "pin type", "terminal type", "io type", "i o type")):
         score += 20
-    if normalized_header in {"type", "i/o", "io", "i o"}:
+    if header in {"type", "i o", "io", "i/o"}:
         score += 10
-    if any(keyword in normalized_header for keyword in ("buffer type", "buffer", "reset", "state", "power source", "supply", "source")):
+    if any(word in header for word in ("buffer type", "buffer", "reset state", "power source")):
         score -= 15
-
-    values = [
-        row[decision.index]
-        for row in data_rows[:30]
-        if decision.index < len(row) and row[decision.index].strip()
-    ]
-    score += score_type_column_values(values)
-    # Earlier columns are preferred when semantic evidence is otherwise close.
-    return score, -decision.index
-
-
-def score_type_column_values(values: list[str]) -> int:
-    if not values:
-        return 0
-    sample = [normalize_header(value).replace(" ", "") for value in values[:20]]
-    signal_type_tokens = {"i", "o", "io", "ioz", "i/o", "i/o/z", "oz", "odz", "od", "p", "ipu", "ipd"}
-    buffer_type_tokens = {"analog", "digital", "power", "ground", "gnd", "supply", "buffer"}
-    signal_hits = sum(1 for value in sample if value in signal_type_tokens)
-    buffer_hits = sum(1 for value in sample if value in buffer_type_tokens)
-    return signal_hits * 3 - buffer_hits
+    values = [row[column.index] for row in rows[:30] if column.index < len(row)]
+    score += 3 * sum(looks_like_signal_type(value) for value in values[:20])
+    return score, -column.index
 
 
 def classify_header(header: str) -> tuple[str, int]:
-    normalized = normalize_header(header)
-    if not normalized:
+    h = normalize_header(header)
+    if not h:
         return "", 0
-
-    if is_package_pin_header(normalized):
-        return "package_pin_no", 6
-
-    if any(keyword in normalized for keyword in ("引脚编号", "管脚编号", "端子编号", "pin 编号")):
+    if any(word in h for word in ("pin no", "pin number", "ball no", "ball number", "terminal no", "terminal number", "引脚编号", "端子编号")):
         return "pin_no", 5
-    if any(keyword in normalized for keyword in ("引脚名称", "管脚名称", "端子名称", "引脚名")):
+    if any(word in h for word in ("pin name", "ball name", "signal name", "terminal name", "引脚名称", "信号名称", "引脚名")):
         return "pin_name", 5
-    if "信号名称" in normalized or normalized == "信号":
-        return "pin_name", 5
-    if any(keyword in normalized for keyword in ("引脚类型", "信号类型", "管脚类型", "端子类型", "io 结构", "i o 结构")):
-        return "type", 4
-
-    if has_ignored_header_keyword(normalized):
-        if not any(keyword in normalized for keyword in ("signal type", "pin type", "io type")):
-            return "", 0
-
-    if "ball num" in normalized or "ball number" in normalized:
-        return "pin_no", 5
-    if normalized in {"no", "no.", "number", "signal no", "signal no."} or "pin no" in normalized:
+    if any(word in h for word in ("signal type", "pin type", "terminal type", "io type", "i o type", "引脚类型", "信号类型")):
+        return "type", 5
+    if h in {"no", "no.", "number", "signal no", "signal no."}:
         return "pin_no", 4
-    if "signal number" in normalized:
-        return "pin_no", 4
-    if "terminal no" in normalized or "terminal number" in normalized:
-        return "pin_no", 4
-    if "pin number" in normalized:
-        return "pin_no", 4
-
-    if "signal name" in normalized:
-        return "pin_name", 5
-    if "ball name" in normalized:
-        return "ball_name", 5
-    if "pin name" in normalized:
-        return "pin_name", 4
-    if "terminal name" in normalized:
-        return "pin_name", 4
-    if normalized in {"signal", "name", "function name"}:
+    if h in {"signal", "name"}:
         return "pin_name", 3
-    if "pad name" in normalized:
-        return "pad_name", 3
-
-    if normalized == "function" or normalized.endswith(" function"):
-        return "", 0
-
-    if "signal type" in normalized or "pin type" in normalized:
-        return "type", 4
-    if normalized == "type" or normalized.endswith(" type"):
+    if h in {"type", "io", "i o", "i/o"} or h.endswith(" type"):
         return "type", 3
-    if "i/o" in normalized or normalized == "io" or normalized.startswith("i o"):
-        return "io_type", 3
-
-    if "package" in normalized and "pin" not in normalized:
-        return "package", 3
-
+    if "package" in h and "pin" not in h:
+        return "package", 2
     return "", 0
-
-
-def is_value_inference_blocked_header(header: str) -> bool:
-    normalized = normalize_header(header)
-    if not normalized:
-        return False
-    if normalized == "function" or normalized.endswith(" function"):
-        return True
-    if has_ignored_header_keyword(normalized):
-        return not any(keyword in normalized for keyword in ("signal type", "pin type", "io type"))
-    return False
-
-
-def has_ignored_header_keyword(normalized_header: str) -> bool:
-    """Avoid substring mistakes such as matching MIN inside TERMINAL."""
-    for keyword in IGNORE_HEADER_KEYWORDS:
-        if keyword in {"min", "typ", "nom", "max", "unit", "ret"}:
-            if re.search(rf"\b{re.escape(keyword)}\b", normalized_header):
-                return True
-            continue
-        if keyword in normalized_header:
-            return True
-    return False
 
 
 def classify_values(values: list[str]) -> tuple[str, int]:
-    values = [value for value in values if value]
-    if not values:
+    sample = [str(value).strip() for value in values if str(value).strip()][:20]
+    if not sample:
         return "", 0
-
-    sample = values[:20]
-    pin_like = sum(looks_like_pin_list(value) for value in sample)
-    signal_like = sum(looks_like_signal_name(value) for value in sample)
-    type_like = sum(looks_like_type_value(value) for value in sample)
-
-    threshold = max(2, len(sample) // 3)
-    if pin_like >= threshold:
+    if sum(looks_like_pin_list(v) for v in sample) >= max(2, len(sample) // 3):
         return "pin_no", 3
-    if type_like >= threshold:
+    if sum(looks_like_signal_type(v) for v in sample) >= max(2, len(sample) // 3):
         return "type", 2
-    if signal_like >= threshold:
-        return "pin_name", 1
     return "", 0
 
 
-def is_pin_package_table(decisions: list[ColumnDecision]) -> bool:
-    fields = {decision.field_name for decision in decisions}
-    has_number = bool(fields & {"pin_no", "ball_no", "terminal_no", "package_pin_no"})
-    has_name = bool(fields & {"pin_name", "ball_name", "signal_name", "terminal_name", "pad_name"})
-    has_explicit_number_header = any(
-        decision.field_name in {"pin_no", "ball_no", "terminal_no", "package_pin_no"}
-        and classify_header(decision.raw_header)[1] >= 4
-        for decision in decisions
-    )
-    has_explicit_name_header = any(
-        decision.field_name in {"pin_name", "ball_name", "signal_name", "terminal_name", "pad_name"}
-        and classify_header(decision.raw_header)[1] >= 3
-        for decision in decisions
-    )
-    return has_number and has_name and has_explicit_number_header and has_explicit_name_header
+# ---------------------------------------------------------------------------
+# 行提取和清洗：这里不再决定表格是否有效
+# ---------------------------------------------------------------------------
 
 
-def classify_semantic_table(
-    title: str,
-    headers: list[str],
-    data_rows: list[list[str]],
-    decisions: list[ColumnDecision],
-    include_debug: bool = False,
-) -> dict[str, Any]:
-    from extract.semantic_classifier import classify_table_semantics
+def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> list[dict[str, Any]]:
+    """按已确定的列映射读取一整行；空值不触发表级过滤。"""
 
-    try:
-        decision = classify_table_semantics(
-            title=title,
-            headers=headers,
-            sample_rows=data_rows[:8],
-            decisions=decisions,
-        )
-    except Exception as exc:
-        print(f"语义分类失败，跳过当前表格: {exc}")
-        return {}
-    if include_debug:
-        print(f"semantic decision: {decision}")
-    return decision
-
-
-def semantic_decision_allows_pin_creation(
-    semantic_decision: dict[str, Any],
-    decisions: list[ColumnDecision],
-    title: str,
-    has_associated_package: bool = False,
-) -> bool:
-    if not semantic_decision:
-        return False
-    fields = {decision.field_name for decision in decisions}
-    has_direct_pin_mapping = bool(
-        fields & {"pin_no", "ball_no", "terminal_no"}
-    ) and bool(
-        fields & {"pin_name", "ball_name", "signal_name", "terminal_name", "pad_name"}
-    )
-    if (
-        not has_direct_pin_mapping
-        and not any(decision.field_name == "package_pin_no" for decision in decisions)
-        and not infer_package_name(title)
-        and not has_associated_package
-        and not semantic_decision.get("package_columns")
-    ):
-        return False
-    return bool(semantic_decision.get("should_create_pins")) and float(semantic_decision.get("confidence", 0)) >= 0.6
-
-
-def is_semantic_candidate_table(
-    title: str,
-    headers: list[str],
-    data_rows: list[list[str]],
-    decisions: list[ColumnDecision],
-) -> bool:
-    """Loose recall before DeepSeek; final extraction still needs strict checks."""
-    if is_ordering_table(headers):
-        return False
-    if is_pin_package_table(decisions):
-        return True
-    return score_loose_table_evidence(title, headers, data_rows[:5]) >= 3 and has_loose_pin_mapping_shape(title, headers)
-
-
-def score_loose_table_evidence(
-    title: str,
-    headers: list[str],
-    sample_rows: list[list[str]],
-) -> int:
-    title_text = normalize_header(title)
-    header_text = normalize_header(" ".join(headers))
-    text = " ".join([title_text, header_text]).strip()
-    score = 0
-    if any(keyword in header_text for keyword in ("pin", "ball", "terminal", "signal", "package", "引脚", "端子", "封装", "信号")):
-        score += 2
-    if any(keyword in title_text for keyword in ("pin attributes", "signal descriptions", "terminal functions", "connectivity requirements")):
-        score += 1
-    if any(keyword in header_text for keyword in ("pin attributes", "signal descriptions", "terminal functions", "connectivity requirements")):
-        score += 2
-    if "i/o" in header_text or "i o" in header_text or "type" in header_text:
-        score += 1
-    if PACKAGE_HEADER_RE.search(header_text):
-        score += 1
-    sample_text = " ".join(" ".join(row[:8]) for row in sample_rows)
-    if BALL_TOKEN_RE.search(sample_text):
-        score += 1
-    if has_ignored_header_keyword(header_text) and not any(keyword in header_text for keyword in ("pin", "ball", "terminal", "signal", "package")):
-        score -= 2
-    return score
-
-
-def has_loose_pin_mapping_shape(title: str, headers: list[str]) -> bool:
-    """Require mapping-like columns before spending an LLM call."""
-    title_text = normalize_header(title)
-    header_text = normalize_header(" ".join(headers))
-    has_number_column = any(
-        keyword in header_text
-        for keyword in (
-            "pin no",
-            "pin number",
-            "ball number",
-            "ball no",
-            "terminal no",
-            "terminal number",
-            "引脚编号",
-            "端子编号",
-        )
-    )
-    has_name_column = any(
-        keyword in header_text
-        for keyword in (
-            "pin name",
-            "ball name",
-            "terminal name",
-            "signal name",
-            "device signal",
-            "引脚名称",
-            "端子名称",
-            "信号名称",
-        )
-    )
-    if has_number_column and has_name_column:
-        return True
-    if "connectivity requirements" in title_text and has_number_column:
-        return True
-    if "package" in title_text and has_number_column and any(keyword in header_text for keyword in ("name", "signal")):
-        return True
-    return False
-
-
-def merge_semantic_column_decisions(
-    rule_decisions: list[ColumnDecision],
-    semantic_decision: dict[str, Any],
-    headers: list[str],
-) -> list[ColumnDecision]:
-    semantic_decisions = build_semantic_column_decisions(semantic_decision, headers)
-    if not semantic_decisions:
-        return rule_decisions
-
-    merged_by_index: dict[int, ColumnDecision] = {decision.index: decision for decision in rule_decisions}
-    for decision in semantic_decisions:
-        existing = merged_by_index.get(decision.index)
-        if not existing or semantic_field_priority(decision.field_name) >= semantic_field_priority(existing.field_name):
-            merged_by_index[decision.index] = decision
-    return sorted(merged_by_index.values(), key=lambda decision: decision.index)
-
-
-def build_semantic_column_decisions(
-    semantic_decision: dict[str, Any],
-    headers: list[str],
-) -> list[ColumnDecision]:
-    decisions: list[ColumnDecision] = []
-    for item in semantic_decision.get("package_columns") or []:
-        index = parse_column_index(item.get("column_index"))
-        pkg = str(item.get("pkg") or "").strip()
-        if index is None or is_generic_package_label(pkg):
-            continue
-        decisions.append(
-            ColumnDecision(
-                index=index,
-                raw_header=pkg or safe_header(headers, index),
-                field_name="package_pin_no",
-                score=10,
-            )
-        )
-
-    for item in semantic_decision.get("pin_columns") or []:
-        index = parse_column_index(item.get("column_index"))
-        if index is None:
-            continue
-        decisions.append(
-            ColumnDecision(
-                index=index,
-                raw_header=safe_header(headers, index),
-                field_name="pin_no",
-                score=8,
-            )
-        )
-
-    for item in semantic_decision.get("name_columns") or []:
-        index = parse_column_index(item.get("column_index"))
-        if index is None:
-            continue
-        role = str(item.get("field") or "pin_name").strip()
-        decisions.append(
-            ColumnDecision(
-                index=index,
-                raw_header=safe_header(headers, index),
-                field_name=semantic_role_to_field(role, default="pin_name"),
-                score=8,
-            )
-        )
-
-    for item in semantic_decision.get("type_columns") or []:
-        index = parse_column_index(item.get("column_index"))
-        if index is None:
-            continue
-        decisions.append(
-            ColumnDecision(
-                index=index,
-                raw_header=safe_header(headers, index),
-                field_name="type",
-                score=8,
-            )
-        )
-    return decisions
-
-
-def parse_column_index(value: Any) -> int | None:
-    try:
-        index = int(value)
-    except (TypeError, ValueError):
-        return None
-    return index if index >= 0 else None
-
-
-def safe_header(headers: list[str], index: int) -> str:
-    return headers[index] if 0 <= index < len(headers) else f"column_{index + 1}"
-
-
-def semantic_role_to_field(role: str, default: str) -> str:
-    role = normalize_header(role)
-    if role in {"ball name", "signal name", "terminal name", "pin name"}:
-        return role.replace(" ", "_")
-    if role in {"pin_no", "pin no", "pin number", "ball number", "terminal number"}:
-        return "pin_no"
-    return default
-
-
-def semantic_field_priority(field_name: str) -> int:
-    return {
-        "package_pin_no": 5,
-        "pin_no": 4,
-        "ball_no": 4,
-        "terminal_no": 4,
-        "pin_name": 3,
-        "ball_name": 3,
-        "signal_name": 3,
-        "terminal_name": 3,
-        "type": 2,
-        "io_type": 2,
-    }.get(field_name, 1)
-
-
-def is_generic_package_label(value: str) -> bool:
-    normalized = normalize_header(value)
-    return normalized in {
-        "",
-        "pin",
-        "pins",
-        "pin no",
-        "pin number",
-        "ball number",
-        "terminal number",
-        "package",
-        "package name",
-    }
-
-
-def score_package_column(header: str, values: list[str], title_context: str = "") -> int:
-    """Score whether a column is a package-specific pin-number column."""
-    normalized_header = normalize_header(header)
-    if not normalized_header:
-        return 0
-    if any(keyword in normalized_header for keyword in ("orderable", "package qty", "package type", "package drawing")):
-        return 0
-
-    score = 0
-    has_package_name = bool(PACKAGE_HEADER_RE.search(normalized_header))
-    has_pin_header = any(
-        keyword in normalized_header
-        for keyword in (
-            "引脚编号",
-            "管脚编号",
-            "端子编号",
-            "pin number",
-            "pin no",
-            "ball number",
-            "ball no",
-            "terminal number",
-            "terminal no",
-        )
-    )
-    if has_package_name:
-        score += 3
-    if has_pin_header:
-        score += 2
-    if extract_package_identity_parts(header)["pin_count"]:
-        score += 1
-    if extract_package_identity_parts(header)["code"]:
-        score += 1
-
-    sample = [value for value in values if value.strip() and value.strip() not in {"-", "—", "NA", "N/A"}][:20]
-    if sample:
-        pin_like = sum(looks_like_pin_list(value) for value in sample)
-        if pin_like / len(sample) >= 0.65:
-            score += 3
-        elif pin_like / len(sample) >= 0.35:
-            score += 1
-
-    context = normalize_header(title_context)
-    if any(keyword in context for keyword in ("pin attributes", "terminal functions", "pin assignment", "引脚属性", "引脚分配")):
-        score += 1
-
-    if not has_package_name:
-        return 0
-    return score
-
-
-def extract_pin_records_from_row(
-    row: list[str],
-    decisions: list[ColumnDecision],
-) -> list[dict[str, Any]]:
-    raw_fields: dict[str, str] = {}
     fields: dict[str, str] = {}
-    package_pin_values: list[tuple[str, str]] = []
-    for decision in decisions:
-        value = row[decision.index].strip() if decision.index < len(row) else ""
-        raw_key = decision.raw_header or f"column_{decision.index + 1}"
-        raw_fields[raw_key] = value
-        if decision.field_name == "package_pin_no":
-            package_pin_values.append((raw_key, value))
-            continue
-        field_name = normalize_field_name(decision.field_name)
-        fields[field_name] = merge_field_value(fields.get(field_name, ""), value)
+    package_columns: list[tuple[str, str]] = []
+    raw_fields: dict[str, str] = {}
+    for column in columns:
+        value = row[column.index].strip() if column.index < len(row) else ""
+        raw_fields[column.raw_header or f"column_{column.index + 1}"] = value
+        field_name = normalize_field_name(column.field_name)
+        if column.field_name == "package_pin_no":
+            package_columns.append((column.raw_header, value))
+        elif field_name:
+            # 同一个字段有多个列时保留原始信息，不在这里合并 pin 记录。
+            fields[field_name] = merge_field_value(fields.get(field_name, ""), value)
 
-    if not fields:
-        return []
-
-    if package_pin_values:
-        records = []
-        for package_header, pin_no_value in package_pin_values:
-            pin_numbers = split_pin_numbers(pin_no_value)
-            if not pin_numbers:
-                continue
-            package_name = clean_package_label(package_header)
-            for pin_no in pin_numbers:
-                record = {key: fields[key] for key in PIN_FIELD_ORDER if key in fields}
-                for key, value in fields.items():
-                    if key not in record:
-                        record[key] = value
+    records = []
+    if package_columns:
+        for package_header, value in package_columns:
+            for pin_no in split_pin_numbers(value):
+                record = dict(fields)
                 record["pin_no"] = pin_no
-                record["_pkg"] = package_name
-                if raw_fields:
-                    record["_raw_fields"] = raw_fields
+                record["_pkg"] = clean_package_label(package_header)
+                record["_raw_fields"] = raw_fields
                 records.append(record)
         if records:
             return records
-        # 如果 package-specific pin 列在当前行为空，不再直接丢弃整行。
-        # 字段列已经被判定为需要抽取，行级阶段只做映射和清洗，
-        # 继续尝试普通 pin_no。
 
-    pin_no_value = fields.get("pin_no", "")
-    if not pin_no_value:
-        return []
-
-    pin_numbers = split_pin_numbers(pin_no_value)
-    if not pin_numbers:
-        return []
-
-    records = []
-    for pin_no in pin_numbers:
-        record = {key: fields[key] for key in PIN_FIELD_ORDER if key in fields}
-        for key, value in fields.items():
-            if key not in record:
-                record[key] = value
+    pin_value = fields.get("pin_no", "")
+    for pin_no in split_pin_numbers(pin_value):
+        record = dict(fields)
         record["pin_no"] = pin_no
-        if fields.get("package"):
-            record["_pkg"] = fields["package"]
-        if raw_fields:
-            record["_raw_fields"] = raw_fields
+        record["_raw_fields"] = raw_fields
         records.append(record)
     return records
 
 
-def get_package_bucket(
-    packages: dict[str, dict[str, Any]],
-    identity: PackageIdentity,
-) -> dict[str, Any]:
-    """Return the bucket for the same package identity and append new aliases."""
-    bucket_key = find_compatible_package_key(packages, identity) or identity.key
-    bucket = packages.get(bucket_key)
+def split_pin_numbers(value: str) -> list[str]:
+    """只按原文显式分隔符拆 pin_no，保留 A1-C3 等无分隔范围文本。"""
 
-    if not bucket:
-        bucket = {
-            "pkg": identity.display,
-            "pkg_key": bucket_key,
-            "group_list": [],
-            "_groups": {},
-            "_identity": identity,
-            "_aliases": [],
-        }
-        packages[bucket_key] = bucket
-    append_package_alias(bucket, identity.display)
-    return bucket
+    value = plain_text(str(value or "")).strip()
+    if not value:
+        return []
+    parts = [part.strip() for part in re.split(r"[\s,，;/／、|]+", value) if part.strip()]
+    return parts or [value]
 
 
-def build_package_snapshots(packages: dict[str, dict[str, Any]]) -> list[PackageSnapshot]:
-    """Collect known package pin/name evidence for later table association."""
-    snapshots = []
-    for package in packages.values():
-        pin_numbers: set[str] = set()
-        pin_names: set[str] = set()
-        for group in package.get("_groups", {}).values():
-            for record in group.pin_list:
-                pin_no = str(record.get("pin_no", "")).strip()
-                pin_name = str(record.get("pin_name") or record.get("ball_name") or "").strip()
-                if pin_no:
-                    pin_numbers.add(pin_no)
-                if pin_name:
-                    pin_names.add(pin_name.upper())
-        snapshots.append(
-            PackageSnapshot(
-                pkg=package.get("pkg", ""),
-                pin_numbers=pin_numbers,
-                pin_names=pin_names,
-            )
-        )
-    return snapshots
-
-
-def find_compatible_package_key(
-    packages: dict[str, dict[str, Any]],
-    identity: PackageIdentity,
-) -> str:
-    if identity.key in packages:
-        return identity.key
-
-    for bucket_key, bucket in packages.items():
-        existing_identity = bucket.get("_identity")
-        if isinstance(existing_identity, PackageIdentity) and package_identities_compatible(existing_identity, identity):
-            return bucket_key
-    return ""
-
-
-def package_identities_compatible(left: PackageIdentity, right: PackageIdentity) -> bool:
-    """Merge aliases such as ZCE and ZCE-64 when the stable package code matches."""
-    if left.key == right.key:
-        return True
-    if left.code and right.code and left.code == right.code:
-        return compatible_pin_count(left.pin_count, right.pin_count)
-    if left.family and right.family and left.family == right.family:
-        return compatible_pin_count(left.pin_count, right.pin_count)
-    return False
-
-
-def compatible_pin_count(left: str, right: str) -> bool:
-    return not left or not right or left == right
-
-
-def append_package_alias(package_bucket: dict[str, Any], alias: str) -> None:
-    alias = alias.strip()
-    if not alias:
-        return
-    aliases = package_bucket.setdefault("_aliases", [])
-    if alias not in aliases:
-        aliases.append(alias)
-    package_bucket["pkg"] = " | ".join(aliases)
-
-
-def get_or_create_group(package_bucket: dict[str, Any], group_name: str) -> ExtractedGroup:
-    group_name = clean_group_name(group_name) or "Pin/Package Table"
-    groups = package_bucket["_groups"]
-    if group_name not in groups:
-        groups[group_name] = ExtractedGroup(group=group_name)
-        package_bucket["group_list"].append(groups[group_name])
-    return groups[group_name]
-
-
-def add_pin_record_to_group(group: ExtractedGroup, pin_record: dict[str, Any]) -> None:
-    # 项目规则：引脚记录不按 pin_no 合并。同一个 pin_no 多次出现时，
-    # 每条记录独立输出；这里只做输出前字段清洗。
-    group.pin_list.append(normalize_pin_record(pin_record))
-
-
-def normalize_pin_record(pin_record: dict[str, Any]) -> dict[str, Any]:
-    record = dict(pin_record)
-    record["pin_no"] = plain_text(str(record.get("pin_no", ""))).strip()
-    record["pin_name"] = clean_pin_name(record.get("pin_name", ""))
-    return record
+def normalize_pin_record(record: dict[str, Any]) -> dict[str, Any]:
+    result = dict(record)
+    result["pin_no"] = plain_text(str(result.get("pin_no", ""))).strip()
+    result["pin_name"] = clean_pin_name(result.get("pin_name", ""))
+    return result
 
 
 def clean_pin_name(value: Any) -> str:
     value = plain_text(str(value or "")).strip()
     value = re.sub(r"\s*\(\s*\d+\s*\)\s*$", "", value)
-    value = re.sub(r"\s*\(\s*continued\s*\)\s*$", "", value, flags=re.IGNORECASE)
-    value = re.sub(r"\s+", " ", value).strip()
-    return value or "Reserved"
+    value = re.sub(r"\s*[（(]\s*continued\s*[）)]\s*$", "", value, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", value).strip() or "Reserved"
 
 
-def merge_pin_record(existing_record: dict[str, Any], new_record: dict[str, Any]) -> None:
-    for key, value in new_record.items():
-        if not value:
-            continue
-        if key not in existing_record or not existing_record[key]:
-            existing_record[key] = value
-            continue
-        if existing_record[key] == value:
-            continue
-        if key == "pin_no":
-            continue
-        existing_record[key] = merge_field_value(str(existing_record[key]), str(value))
+def add_pin_record_to_group(group: ExtractedGroup, record: dict[str, Any]) -> None:
+    # 项目规则：每条行记录独立保留，绝不按 pin_no 去重或合并。
+    group.pin_list.append(normalize_pin_record(record))
 
 
-def infer_package_name(text: str) -> str:
-    text = plain_text(text)
-    patterns = [
-        r"\(([A-Z0-9][A-Z0-9_\-/ ]{0,30}\s+Package)\)",
-        r"\b([A-Z0-9][A-Z0-9_\-/]{1,20}\s+Package)\b",
-        r"\bPackage\s+([A-Z0-9][A-Z0-9_\-/]{1,20})\b",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return re.sub(r"\s+", " ", match.group(1)).strip()
-    return ""
+# ---------------------------------------------------------------------------
+# 表格读取、标题、分组和封装归并
+# ---------------------------------------------------------------------------
+
+
+TR_RE = re.compile(r"(<tr[^>]*>)(.*?)(</tr>)", re.DOTALL | re.IGNORECASE)
+CELL_RE = re.compile(r"(<t[dh][^>]*>)(.*?)(</t[dh]>)", re.DOTALL | re.IGNORECASE)
+TAG_RE = re.compile(r"<[^>]+>")
+BALL_TOKEN_RE = re.compile(r"\b[A-Z]{1,2}\d{1,3}\b")
+PACKAGE_RE = re.compile(r"\b(?:\d{2,4}\s*)?(?:qfp|lqfp|tqfp|qfn|bga|soic|sop|pdip|dfn|wqfn|zce\d*[a-z]*|nzn\d*[a-z]*|zwt|zjz|zay|rgz|rha|rhb|pz|pm|pw)\b", re.IGNORECASE)
+TYPE_VALUES = {"i", "o", "io", "i/o", "i/o/z", "oz", "od", "odz", "p", "ipu", "ipd", "analog", "digital", "power", "ground", "gnd", "supply", "input", "output"}
+
+
+def parse_html_table(html: str) -> list[list[str]]:
+    rows = []
+    for tr in TR_RE.finditer(html):
+        row = [plain_text(match.group(2)) for match in CELL_RE.finditer(tr.group(2))]
+        if row:
+            rows.append(row)
+    return rows
+
+
+def choose_header_row(rows: list[list[str]], title: str = "", semantic: bool = False) -> tuple[int, list[str]]:
+    best = (-1, -1, [])
+    for index in range(min(6, len(rows))):
+        headers = build_combined_headers(rows, index)
+        score = sum(classify_header(header)[1] for header in headers)
+        if score > best[1]:
+            best = (index, score, headers)
+    if best[1] < (2 if semantic else 4):
+        return -1, []
+    return best[0], best[2]
+
+
+def build_combined_headers(rows: list[list[str]], header_index: int) -> list[str]:
+    width = max((len(row) for row in rows[: header_index + 1]), default=0)
+    result = []
+    for index in range(width):
+        parts = []
+        for row in rows[: header_index + 1]:
+            if index < len(row) and row[index].strip() and row[index].strip() not in parts:
+                parts.append(row[index].strip())
+        result.append(" ".join(parts))
+    return result
+
+
+def is_group_row(row: list[str]) -> bool:
+    values = [cell.strip() for cell in row if cell.strip()]
+    return bool(values) and (len(values) == 1 or len(set(values)) == 1) and not looks_like_pin_list(values[0])
+
+
+def first_non_empty(row: list[str]) -> str:
+    return next((cell.strip() for cell in row if cell.strip()), "")
 
 
 def infer_group_name(text: str) -> str:
     text = plain_text(text)
     if not text:
         return ""
-    group_keywords = (
-        r"Pin Attributes|Terminal Functions|Pin Assignment|Terminal Assignment|"
-        r"Package Pins?|Signal Descriptions|Connectivity Requirements|"
-        r"Connection Requirements|引脚属性|引脚分配|封装引脚"
-    )
-    table_match = re.search(
-        rf"((?:Table|表)\s+\S+\.?\s+[^。\n]{{0,140}}?(?:{group_keywords})[^。\n]{{0,80}})",
-        text,
-        re.IGNORECASE,
-    )
-    if table_match:
-        return clean_group_name(table_match.group(1))
-    section_match = re.search(
-        rf"(\d+(?:\.\d+)+\s+[^。\n]{{0,120}}?(?:{group_keywords})[^。\n]{{0,80}})",
-        text,
-        re.IGNORECASE,
-    )
-    if section_match:
-        return clean_group_name(section_match.group(1))
-    return ""
+    match = re.search(r"((?:Table|表格?|表)\s*[\w.\-一二三四五六七八九十百千万]*\s*[^\n]{0,160}(?:Pin|Terminal|Signal|Connectivity|Connection|引脚|端子|信号|封装)[^\n]{0,100})", text, re.IGNORECASE)
+    return clean_group_name(match.group(1) if match else "")
 
 
-def infer_group_name_from_headers(headers: list[str], package_name: str = "") -> str:
-    """Infer table-level group when MinerU did not keep the table title nearby."""
-    normalized_headers = [normalize_header(header) for header in headers]
-    header_text = " ".join(normalized_headers)
-    suffix = package_group_suffix(package_name)
-
-    has_pin_no = any(
-        keyword in header_text
-        for keyword in ("pin no", "pin number", "ball number", "ball no", "terminal no", "terminal number")
-    )
-    has_signal_name = any(
-        keyword in header_text
-        for keyword in ("signal name", "pin name", "ball name", "terminal name")
-    )
-    if not (has_pin_no and has_signal_name):
-        return ""
-
-    if any(keyword in header_text for keyword in ("buffer type", "power source", "reset state after")):
-        return f"Pin Attributes{suffix}"
-    if "description" in header_text and ("function" in header_text or "signal type" in header_text):
-        return f"Signal Descriptions{suffix}"
-    if "connection requirements" in header_text or "connectivity requirements" in header_text:
+def infer_group_name_from_headers(headers: list[str], package: str = "") -> str:
+    h = normalize_header(" ".join(headers))
+    suffix = f", {package}" if package else ""
+    if "connection requirements" in h or "connectivity requirements" in h:
         return f"Connectivity Requirements{suffix}"
+    if "description" in h and ("function" in h or "signal type" in h):
+        return f"Signal Descriptions{suffix}"
+    if "pin" in h or "ball" in h or "terminal" in h:
+        return f"Pin Attributes{suffix}"
     return ""
-
-
-def package_group_suffix(package_name: str) -> str:
-    package_name = clean_package_label(package_name)
-    if not package_name:
-        return ""
-    normalized = normalize_header(package_name)
-    if "package" in normalized:
-        return f", {package_name}"
-    return f", {package_name} Package"
-
-
-def is_generic_group_name(value: str) -> bool:
-    return clean_group_name(value) in {"", "Pin/Package Table"}
 
 
 def clean_group_name(value: str) -> str:
     value = re.sub(r"\s+", " ", plain_text(value)).strip()
-    # 续表标题和原表标题应归到同一个 group。
-    value = re.sub(r"\s*[\(（]\s*continued\s*[\)）]\s*", " ", value, flags=re.IGNORECASE)
-    # 输出 group 只保留语义标题，不保留 Table/表格 编号前缀。
-    value = re.sub(
-        r"^(?:table|表格?|表)\s*[\w.\-一二三四五六七八九十百千万]+\.?\s*[:：.\-–—]?\s*",
-        "",
-        value,
-        flags=re.IGNORECASE,
-    )
-    if len(value) > 180:
-        value = value[:180].rsplit(" ", 1)[0].strip()
-    value = re.sub(r"\s+", " ", value).strip()
-    if is_package_or_device_title(value) or is_sentence_like_group_title(value):
-        return "Pin/Package Table"
-    return value
+    value = re.sub(r"\s*[（(]\s*continued\s*[）)]", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"^(?:table|表格?|表)\s*[\w.\-一二三四五六七八九十百千万]+\s*[:：.\-–—]?\s*", "", value, flags=re.IGNORECASE)
+    return value or ""
 
 
-def is_package_or_device_title(value: str) -> bool:
-    normalized = normalize_header(value)
-    if not normalized:
-        return False
-    if "引脚排列" in value or "pinout" in normalized:
-        return True
-    if looks_like_device_model(value):
-        return True
-    compact = re.sub(r"[^a-z0-9]+", "", normalized)
-    if re.fullmatch(r"\d{1,4}(?:pin)?[a-z0-9]{1,8}package", compact):
-        return True
-    return False
-
-
-def is_sentence_like_group_title(value: str) -> bool:
-    normalized = normalize_header(value)
-    if len(value) > 90 and any(token in normalized for token in (" must ", " should ", " can ", " for example", " note ")):
-        return True
-    if len(value) > 120 and value.count(" ") >= 12:
-        return True
-    return False
-
-
-def is_group_row(row: list[str]) -> bool:
-    non_empty = [cell for cell in row if cell.strip()]
-    if not non_empty:
-        return False
-    if len(non_empty) == 1 and not looks_like_pin_list(non_empty[0]):
-        return True
-    if len(set(non_empty)) == 1 and not looks_like_pin_list(non_empty[0]):
-        return True
-    return False
-
-
-def first_non_empty(row: list[str]) -> str:
-    for cell in row:
-        if cell.strip():
-            return cell.strip()
-    return ""
-
-
-def split_pin_numbers(value: str) -> list[str]:
-    """Split pin_no by explicit separators, otherwise keep the original value.
-
-    项目规则：
-      - 不合并引脚；
-      - 以空格、逗号、斜杠等显式分隔符拼接的 pin_no 拆成多条；
-      - 没有显式分隔符时不主观拆分，保留原值交给后续专项处理。
-    """
-    value = plain_text(str(value or "")).strip()
-    if not value:
-        return []
-
-    parts = [
-        part.strip()
-        for part in re.split(r"[\s,，;/／、|]+", value)
-        if part.strip()
-    ]
-    if len(parts) > 1:
-        return parts
-
-    return [value]
-
-def is_ordering_table(headers: list[str]) -> bool:
-    normalized_headers = [normalize_header(header) for header in headers if header.strip()]
-    joined = " ".join(normalized_headers)
-    hit_count = sum(1 for keyword in ORDERING_TABLE_KEYWORDS if keyword in joined)
-    return "orderable device" in joined and hit_count >= 3
-
-
-def is_package_pin_header(normalized_header: str) -> bool:
-    if not PACKAGE_HEADER_RE.search(normalized_header):
-        return False
-    if any(keyword in normalized_header for keyword in ("orderable", "package qty", "package type", "package drawing")):
-        return False
-    if any(
-        keyword in normalized_header
-        for keyword in (
-            "引脚编号",
-            "管脚编号",
-            "端子编号",
-            "pin number",
-            "pin no",
-            "ball number",
-            "ball no",
-            "terminal number",
-            "terminal no",
-        )
-    ):
-        return True
-    # In stacked package tables, the leaf header can be just "64 PM" or "RHB".
-    return bool(re.fullmatch(r"(?:\d{2,4}\s*)?(?:[a-z0-9]+(?:\s+[a-z0-9]+){0,2})", normalized_header))
-
-
-def clean_package_label(header: str) -> str:
-    label = plain_text(header)
-    label = re.sub(r"\[[^\]]+\]", " ", label)
-    label = re.sub(r"\b(\d{2,4})\s*[-]?\s*(pin|引脚)\b", r"\1 ", label, flags=re.IGNORECASE)
-    label = normalize_package_word_order(label)
-    label = re.sub(r"\(\s*\d{1,2}\s*\)", " ", label)
-    label = re.sub(r"\bpackage\b", " ", label, flags=re.IGNORECASE)
-    label = re.sub(
-        r"(?:引脚编号|管脚编号|端子编号|pin\s*(?:number|no\.?)|pins?|ball\s*(?:number|no\.?)|terminal\s*(?:number|no\.?))",
-        " ",
-        label,
-        flags=re.IGNORECASE,
-    )
-    label = normalize_package_word_order(label)
-    label = re.sub(r"\s+", " ", label).strip(" -:/")
-    return label
+def infer_package_name(text: str) -> str:
+    text = plain_text(text)
+    match = re.search(r"\b([A-Z0-9][A-Z0-9-]{1,20})\s+Package\b", text, re.IGNORECASE)
+    return match.group(1).upper() if match else ""
 
 
 def build_package_identity(label: str) -> PackageIdentity:
-    display = canonical_package_display(clean_package_label(label)) if label else ""
-    if is_invalid_package_display(display):
+    display = clean_package_label(label)
+    if looks_like_pin_list(display):
         display = ""
-    parts = extract_package_identity_parts(display)
-    key_parts = []
-    if extract_device_model(display):
-        key_parts.append(f"label={normalize_package_key(display)}")
-    elif parts["pin_count"]:
-        key_parts.append(f"pins={parts['pin_count']}")
-    if parts["family"]:
-        key_parts.append(f"family={parts['family']}")
-    if parts["code"]:
-        key_parts.append(f"code={parts['code']}")
-    if not key_parts:
-        key_parts.append(f"label={normalize_package_key(display)}")
-    return PackageIdentity(
-        display=display,
-        key="|".join(key_parts),
-        pin_count=parts["pin_count"],
-        family=parts["family"],
-        code=parts["code"],
-    )
-
-
-def is_invalid_package_display(value: str) -> bool:
-    normalized = normalize_header(value)
-    if not normalized:
-        return False
-    if normalized in {
-        "no",
-        "no.",
-        "number",
-        "input",
-        "output",
-        "type",
-        "signal",
-        "signal name",
-        "signal name no",
-        "signal name no.",
-        "name",
-        "pin",
-        "pin no",
-        "pin name",
-        "terminal",
-        "terminal no",
-        "terminal name",
-    }:
-        return True
-    if any(keyword in normalized for keyword in ("description", "function", "condition", "table")):
-        return True
-    return False
-
-
-def canonical_package_display(label: str) -> str:
-    label = re.sub(r"\s+", " ", plain_text(label)).strip(" -:/")
-    parts = extract_package_identity_parts(label)
-    if parts["code"]:
-        return parts["code"].replace("_", " | ")
-    sot_match = re.search(r"\bSOT\s*[- ]?\s*(\d{1,3})\b", label, flags=re.IGNORECASE)
-    if sot_match:
-        device_model = extract_device_model(label)
-        if device_model:
-            return f"SOT-{sot_match.group(1)} {device_model}"
-        return f"SOT-{sot_match.group(1)}"
-    if parts["pin_count"] and parts["family"]:
-        return f"{parts['pin_count']} {parts['family']}"
-    if parts["family"]:
-        return parts["family"]
-    return label
-
-
-def extract_device_model(value: str) -> str:
-    for match in re.finditer(r"\b[A-Z]{1,5}\d{2,}[A-Z0-9-]*\b", value):
-        token = match.group(0)
-        if not PACKAGE_HEADER_RE.fullmatch(token):
-            return token
-    return ""
-
-
-def looks_like_device_model(value: str) -> bool:
-    return bool(re.fullmatch(r"[A-Z]{1,5}\d{2,}[A-Z0-9-]*", value.strip()))
-
-
-def extract_package_identity_parts(label: str) -> dict[str, str]:
-    normalized = normalize_package_word_order(plain_text(label))
-    pin_count = ""
-    family = ""
+    compact = normalize_header(display)
     code = ""
-
-    count_match = re.search(r"\b(\d{2,4})\b", normalized)
-    if count_match:
-        pin_count = count_match.group(1)
-
-    compact_match = re.search(
-        r"\b(\d{2,4})(pmq|pm|pt|pn|pnp|pzp|pz|peu|rgc|rtd|rgz|rha|rhb|rsh|dsg|dgs\d*|da|pw|nw|rsa|zce\d*[a-z]*|nzn\d*[a-z]*|zwt|zjz|zhh|zay|alv|alx|abc|alw|alz|anf|anj|zqw|pwp|rgy|rsm|rge|rte)\b",
-        normalized,
-        flags=re.IGNORECASE,
-    )
-    if compact_match:
-        pin_count = compact_match.group(1)
-        code = compact_match.group(2).upper()
-
-    family_match = PACKAGE_FAMILY_RE.search(normalized)
-    if family_match:
-        family = family_match.group(1).upper().replace(" ", "")
-
-    code_matches = [
-        match.group(1).upper()
-        for match in PACKAGE_CODE_RE.finditer(normalized)
-        if match.group(1).upper() != family
-    ]
-    if code_matches:
-        code = "_".join(dict.fromkeys(code_matches))
-
-    return {"pin_count": pin_count, "family": family, "code": code}
-
-
-def normalize_package_key(label: str) -> str:
-    label = normalize_package_word_order(label)
-    label = normalize_header(label)
-    label = re.sub(r"[^a-z0-9]+", "_", label).strip("_")
-    return label or "unknown"
-
-
-def normalize_package_word_order(label: str) -> str:
-    label = re.sub(r"\s+", " ", label).strip()
-    label = re.sub(
-        r"\b(\d{2,4})(pmq|pm|pt|pn|pnp|pzp|pz|peu|rgc|rtd|rgz|rha|rhb|rsh|dsg|dgs\d*|da|pw|nw|rsa|zce\d*[a-z]*|nzn\d*[a-z]*|zwt|zjz|zhh|zay|alv|alx|abc|alw|alz|anf|anj|zqw|pwp|rgy|rsm|rge|rte)\b",
-        lambda match: f"{match.group(1)} {match.group(2).upper()}",
-        label,
-        flags=re.IGNORECASE,
-    )
-    match = re.fullmatch(r"([A-Za-z0-9]+)\s*\(\s*(\d{2,4})\s*\)", label)
+    match = PACKAGE_RE.search(display)
     if match:
-        return f"{match.group(2)} {match.group(1)}"
-    match = re.fullmatch(r"([A-Za-z0-9]+)\s*[- ]\s*(\d{2,4})", label)
-    if match:
-        if match.group(1).lower() in {"sot", "tsot", "sc"}:
-            return f"{match.group(1).upper()}-{match.group(2)}"
-        return f"{match.group(2)} {match.group(1)}"
-    return label
+        code = match.group(0).upper().replace(" ", "")
+    key = f"code={code}" if code else f"label={compact or 'unknown'}"
+    return PackageIdentity(display, key, code=code)
+
+
+def get_package_bucket(packages: dict[str, dict[str, Any]], identity: PackageIdentity) -> dict[str, Any]:
+    key = identity.key
+    if key not in packages:
+        packages[key] = {"pkg": "", "pkg_key": key, "_groups": {}, "_aliases": [], "_identity": identity}
+    bucket = packages[key]
+    if identity.display and identity.display not in bucket["_aliases"]:
+        bucket["_aliases"].append(identity.display)
+        bucket["pkg"] = " | ".join(bucket["_aliases"])
+    return bucket
+
+
+def build_package_snapshots(packages: dict[str, dict[str, Any]]) -> list[PackageSnapshot]:
+    snapshots = []
+    for bucket in packages.values():
+        pins, names = set(), set()
+        for group in bucket["_groups"].values():
+            for pin in group.pin_list:
+                pins.add(pin.get("pin_no", ""))
+                names.add(pin.get("pin_name", "").upper())
+        snapshots.append(PackageSnapshot(bucket.get("pkg", ""), pins, names))
+    return snapshots
+
+
+def get_or_create_group(bucket: dict[str, Any], name: str) -> ExtractedGroup:
+    name = clean_group_name(name) or "Pin/Package Table"
+    if name not in bucket["_groups"]:
+        bucket["_groups"][name] = ExtractedGroup(name)
+    return bucket["_groups"][name]
+
+
+def build_public_result(packages: dict[str, dict[str, Any]], include_debug: bool) -> list[dict[str, Any]]:
+    result = []
+    for bucket in packages.values():
+        groups = [{"group": group.group, "pin_list": group.pin_list} for group in bucket["_groups"].values() if group.pin_list]
+        if groups:
+            item = {"pkg": bucket["pkg"], "group_list": groups}
+            if include_debug:
+                item["pkg_key"] = bucket["pkg_key"]
+            result.append(item)
+    return result
+
+
+def clean_package_label(value: str) -> str:
+    value = plain_text(value)
+    value = re.sub(r"\[[^]]+\]", "", value)
+    value = re.sub(r"\bpackage\b", "", value, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", value).strip(" -:/")
+
+
+# ---------------------------------------------------------------------------
+# 候选表来源
+# ---------------------------------------------------------------------------
+
+
+def iter_table_candidates(middle_json: dict[str, Any]) -> list[TableCandidate]:
+    result = []
+    current_title = ""
+    for page in middle_json.get("pdf_info", []):
+        page_idx = page.get("page_idx") if isinstance(page, dict) else None
+        recent = []
+        for span in iter_spans_in_reading_order(page):
+            html = span.get("html") if isinstance(span, dict) else None
+            text = plain_text((span.get("content") or span.get("text") or "") if isinstance(span, dict) else "")
+            if isinstance(html, str) and "<table" in html.lower():
+                result.append(TableCandidate(html, page_idx if isinstance(page_idx, int) else None, current_title or " ".join(recent[-5:])))
+            elif text:
+                current_title = infer_group_name(text) or current_title
+                recent.append(text)
+                recent = recent[-10:]
+    return result
+
+
+def iter_table_candidates_from_markdown(markdown: str) -> list[TableCandidate]:
+    result = []
+    table_re = re.compile(r"<table\b.*?</table>", re.DOTALL | re.IGNORECASE)
+    cursor = 0
+    last_title = ""
+    for match in table_re.finditer(markdown):
+        before = markdown[cursor : match.start()]
+        texts = [plain_text(line).strip() for line in before.splitlines() if plain_text(line).strip()]
+        for text in texts:
+            last_title = infer_group_name(text) or last_title
+        result.append(TableCandidate(match.group(0), None, last_title or " ".join(texts[-5:])))
+        cursor = match.end()
+    return result
+
+
+def iter_spans_in_reading_order(value: Any):
+    if isinstance(value, dict):
+        for key in ("spans", "para_blocks", "blocks", "lines"):
+            child = value.get(key)
+            if isinstance(child, list):
+                for item in child:
+                    yield from iter_spans_in_reading_order(item)
+        if any(key in value for key in ("html", "content", "text")):
+            yield value
+    elif isinstance(value, list):
+        for item in value:
+            yield from iter_spans_in_reading_order(item)
+
+
+# ---------------------------------------------------------------------------
+# 小工具、输出和调试
+# ---------------------------------------------------------------------------
+
+
+def normalize_field_name(name: str) -> str:
+    if name in {"ball_no", "terminal_no"}:
+        return "pin_no"
+    if name in {"ball_name", "signal_name", "terminal_name", "pad_name"}:
+        return "pin_name"
+    if name == "io_type":
+        return "type"
+    return name
 
 
 def looks_like_pin_list(value: str) -> bool:
-    value = value.strip()
-    if not value:
-        return False
-    if NUMERIC_PIN_RE.fullmatch(value):
-        return True
-    return bool(BALL_TOKEN_RE.search(value))
+    value = str(value).strip()
+    return bool(re.fullmatch(r"\d{1,4}", value) or BALL_TOKEN_RE.search(value))
 
 
-def looks_like_signal_name(value: str) -> bool:
-    value = value.strip()
-    if not value or len(value) > 80:
-        return False
-    if re.search(r"\s{2,}|[.!?;]", value):
-        return False
-    return bool(re.fullmatch(r"[A-Za-z0-9_/\-+().#]+(?:\s+[A-Za-z0-9_/\-+().#]+){0,3}", value))
+def looks_like_signal_type(value: str) -> bool:
+    return normalize_header(str(value)).replace(" ", "") in TYPE_VALUES
 
 
-def looks_like_type_value(value: str) -> bool:
-    normalized = normalize_header(value).replace(" ", "")
-    return normalized in {
-        "i",
-        "o",
-        "io",
-        "i/o",
-        "oz",
-        "odz",
-        "od",
-        "power",
-        "ground",
-        "gnd",
-        "pwr",
-        "input",
-        "output",
-        "ipu",
-        "ipd",
-        "analog",
-        "supply",
-    }
-
-
-def normalize_field_name(field_name: str) -> str:
-    if field_name in {"ball_no", "terminal_no"}:
-        return "pin_no"
-    if field_name in {"ball_name", "signal_name", "terminal_name"}:
-        return "pin_name"
-    if field_name == "io_type":
-        return "type"
-    return field_name
-
-
-def merge_field_value(existing: str, value: str) -> str:
-    if not existing:
-        return value
-    if existing == value:
-        return existing
-    return f"{existing} | {value}"
+def merge_field_value(left: str, right: str) -> str:
+    if not left:
+        return right
+    if not right or left == right:
+        return left
+    return f"{left} | {right}"
 
 
 def normalize_header(value: str) -> str:
     value = plain_text(value).lower()
-    value = re.sub(r"\[[^\]]+\]", " ", value)
+    value = re.sub(r"\[[^]]+\]", " ", value)
     value = re.sub(r"[$\\^†‡*]+", " ", value)
-    value = re.sub(r"[、，,]+", " ", value)
     value = re.sub(r"[_\-/]+", " ", value)
-    value = re.sub(r"\s+", " ", value).strip()
-    return value
+    return re.sub(r"\s+", " ", value).strip()
 
 
 def plain_text(value: str) -> str:
     value = re.sub(r"<br\s*/?>", " ", str(value), flags=re.IGNORECASE)
-    value = TAG_RE.sub("", value)
-    value = html_lib.unescape(value)
-    return re.sub(r"\s+", " ", value).strip()
+    return re.sub(r"\s+", " ", html_lib.unescape(TAG_RE.sub("", value))).strip()
 
 
-def write_extraction_json(result: list[dict[str, Any]], output_path: str | Path) -> None:
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(
-        json.dumps(result, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+def parse_column_index(value: Any) -> int | None:
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def safe_header(headers: list[str], index: int) -> str:
+    return headers[index] if 0 <= index < len(headers) else f"column_{index + 1}"
+
+
+def is_invalid_schema_package_name(value: str) -> bool:
+    normalized = normalize_header(value)
+    if not normalized:
+        return False
+    if any(word in normalized for word in ("pin name", "default mapping", "function", "description")):
+        return True
+    # 例如模型误把“A1 B4 A4”当作封装名。
+    tokens = re.findall(r"\b[A-Z]{1,2}\d{1,3}\b", value.upper())
+    return len(tokens) >= 2 and len(tokens) == len(value.split())
+
+
+def skip(debug: dict[str, Any], reason: str) -> None:
+    debug["status"] = "skipped"
+    debug["skip_reason"] = reason
+
+
+def decisions_to_debug(columns: list[ColumnDecision]) -> list[dict[str, Any]]:
+    return [{"index": c.index, "header": c.raw_header, "field": c.field_name, "score": c.score} for c in columns]
+
+
+def decision_to_debug(decision: TableDecision) -> dict[str, Any]:
+    return {
+        "should_extract": decision.should_extract,
+        "table_role": decision.table_role,
+        "pkg": decision.pkg,
+        "group": decision.group,
+        "confidence": decision.confidence,
+        "reason": decision.reason,
+        "columns": decisions_to_debug(decision.columns),
+    }
+
+
+def get_last_extraction_debug() -> list[dict[str, Any]]:
+    return LAST_EXTRACTION_DEBUG
 
 
 def strip_debug_fields(result: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Remove extraction metadata before writing the user-facing JSON."""
-    stripped: list[dict[str, Any]] = []
+    clean = []
     for package in result:
-        new_package = {"pkg": package.get("pkg", ""), "group_list": []}
+        item = {"pkg": package.get("pkg", ""), "group_list": []}
         for group in package.get("group_list", []):
-            new_group = {"group": group.get("group", ""), "pin_list": []}
+            pins = []
             for pin in group.get("pin_list", []):
-                new_group["pin_list"].append(
-                    {
-                        key: value
-                        for key, value in pin.items()
-                        if key not in {"source", "source_page", "raw_fields"}
-                    }
-                )
-            if new_group["pin_list"]:
-                new_package["group_list"].append(new_group)
-        if new_package["group_list"]:
-            stripped.append(new_package)
-    return stripped
+                pins.append({k: v for k, v in pin.items() if k not in {"source", "source_page", "raw_fields"}})
+            if pins:
+                item["group_list"].append({"group": group.get("group", ""), "pin_list": pins})
+        if item["group_list"]:
+            clean.append(item)
+    return clean
 
 
-def build_extraction_summary(
-    result: list[dict[str, Any]],
-    pdf_name: str = "",
-) -> dict[str, Any]:
-    """Build package/group counts and page spans for manual comparison."""
+def write_extraction_json(result: Any, output_path: str | Path) -> None:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def build_extraction_summary(result: list[dict[str, Any]], pdf_name: str = "") -> dict[str, Any]:
     packages = []
-    total_pins = 0
+    total = 0
     for package in result:
         groups = []
-        package_pin_count = 0
+        count = 0
         for group in package.get("group_list", []):
             pins = group.get("pin_list", [])
-            pages = sorted(
-                {
-                    pin.get("source_page")
-                    for pin in pins
-                    if isinstance(pin.get("source_page"), int)
-                }
-            )
-            pin_count = len(pins)
-            package_pin_count += pin_count
-            groups.append(
-                {
-                    "group": group.get("group", ""),
-                    "pin_count": pin_count,
-                    "page_start": pages[0] if pages else None,
-                    "page_end": pages[-1] if pages else None,
-                    "pages": pages,
-                }
-            )
-        total_pins += package_pin_count
-        packages.append(
-            {
-                "pkg": package.get("pkg", ""),
-                "pin_count": package_pin_count,
-                "table_count": len(groups),
-                "group_list": groups,
-            }
-        )
-    return {
-        "pdf": pdf_name,
-        "package_count": len(packages),
-        "pin_count": total_pins,
-        "packages": packages,
-    }
+            pages = sorted({p.get("source_page") for p in pins if isinstance(p.get("source_page"), int)})
+            count += len(pins)
+            groups.append({"group": group.get("group", ""), "pin_count": len(pins), "page_start": pages[0] if pages else None, "page_end": pages[-1] if pages else None, "pages": pages})
+        total += count
+        packages.append({"pkg": package.get("pkg", ""), "pin_count": count, "table_count": len(groups), "group_list": groups})
+    return {"pdf": pdf_name, "package_count": len(packages), "pin_count": total, "packages": packages}
