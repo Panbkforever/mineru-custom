@@ -609,14 +609,11 @@ def fix_markdown_file(input_path: str, output_path: Optional[str] = None) -> str
     from post_table.expand_rowspan import expand_colspan
     fixed_content = expand_colspan(fixed_content)
 
-    # 第五步：修复跨页续表边界处被合并成一行的数据。
-    # 典型错误形态：
-    #   DA5-\nDA6+ | D11B10 | OO | ...
-    # 实际应为：
-    #   DA5- | D11 | O | ...
-    #   DA6+ | B10 | O | ...
-    # 这里在解析后处理阶段拆行，使最终 md/json 与后续抽取结果保持一致。
-    fixed_content = repair_cross_page_merged_pin_rows(fixed_content)
+    # 第五步：修复跨页续表边界处的行合并问题
+    # 该逻辑独立放在 merged_cell_repair.py 中：只处理引脚类表格里
+    # 无逗号/斜杠/横线等显式分隔符的粘连行，避免误拆正常多 pin 单元格。
+    from post_table.merged_cell_repair import repair_merged_cells_in_markdown
+    fixed_content = repair_merged_cells_in_markdown(fixed_content)
 
     # 第六步：修复 tms320c6211b Terminal Functions 表格的前两列合并错误
     # 该问题发生在 colspan 展开之后：部分续表的前两列本应是
