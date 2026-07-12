@@ -282,7 +282,8 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
 
     from extract.semantic_classifier import classify_table_schema
 
-    workers = max(1, int(os.getenv("EXTRACT_SCHEMA_WORKERS", "2")))
+    # 默认并发数按项目配置使用 4；如遇模型限流，可通过环境变量覆盖。
+    workers = max(1, int(os.getenv("EXTRACT_SCHEMA_WORKERS", "4")))
     print(f"语义字段判断: 候选表 {len(prepared)} 张, 并发 {workers}", flush=True)
     results: dict[int, TableDecision] = {}
     with ThreadPoolExecutor(max_workers=workers) as executor:
