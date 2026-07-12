@@ -586,13 +586,69 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
 
 
 def split_pin_numbers(value: str) -> list[str]:
-    """只按原文显式分隔符拆 pin_no，保留 A1-C3 等无分隔范围文本。"""
+    """拆分 pin_no 的显式列表和同前缀的连续数字范围。
+
+    例如 ``A1-A5`` 会展开为 A1、A2、A3、A4、A5；
+    ``A1-C3`` 前后字母前缀不同，不满足范围规则，会保留原值。
+    """
 
     value = plain_text(str(value or "")).strip()
     if not value:
         return []
-    parts = [part.strip() for part in re.split(r"[\s,，;/／、|]+", value) if part.strip()]
-    return parts or [value]
+
+    # 先保护带空格的范围，避免普通空格分隔逻辑把 A1 - A5 拆成三段。
+    protected_ranges: list[str] = []
+
+    def protect_range(match: re.Match[str]) -> str:
+        protected_ranges.append(match.group(0))
+        return f"__PIN_RANGE_{len(protected_ranges) - 1}__"
+
+    protected_value = re.sub(
+        r"[A-Za-z]+\s*\d+\s*-\s*[A-Za-z]+\s*\d+",
+        protect_range,
+        value,
+    )
+    parts = [part.strip() for part in re.split(r"[\s,，;/／、|]+", protected_value) if part.strip()]
+    if not parts:
+        parts = [value]
+
+    expanded = []
+    for part in parts:
+        protected_match = re.fullmatch(r"__PIN_RANGE_(\d+)__", part)
+        original_part = (
+            protected_ranges[int(protected_match.group(1))]
+            if protected_match
+            else part
+        )
+        expanded.extend(expand_same_prefix_pin_range(original_part))
+    return expanded
+
+
+def expand_same_prefix_pin_range(value: str) -> list[str]:
+    """展开形如 A1-A5 的范围，其他文本保持原样。"""
+
+    match = re.fullmatch(
+        r"([A-Za-z]+)\s*(\d+)\s*-\s*([A-Za-z]+)\s*(\d+)",
+        value.strip(),
+    )
+    if not match:
+        return [value]
+
+    start_prefix, start_number, end_prefix, end_number = match.groups()
+    if start_prefix.upper() != end_prefix.upper():
+        return [value]
+
+    start = int(start_number)
+    end = int(end_number)
+    if end < start:
+        return [value]
+
+    # 防止异常文本触发超大范围展开。
+    if end - start > 1000:
+        return [value]
+
+    prefix = start_prefix
+    return [f"{prefix}{number}" for number in range(start, end + 1)]
 
 
 def split_parallel_pin_names(value: str, expected_count: int) -> list[str]:
