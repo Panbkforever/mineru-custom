@@ -556,9 +556,13 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
     records = []
     if package_columns:
         for package_header, value in package_columns:
-            for pin_no in split_pin_numbers(value):
+            pin_numbers = split_pin_numbers(value)
+            pin_names = split_parallel_pin_names(fields.get("pin_name", ""), len(pin_numbers))
+            for index, pin_no in enumerate(pin_numbers):
                 record = dict(fields)
                 record["pin_no"] = pin_no
+                if pin_names:
+                    record["pin_name"] = pin_names[index]
                 record["_pkg"] = clean_package_label(package_header)
                 record["_raw_fields"] = raw_fields
                 records.append(record)
@@ -566,9 +570,15 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
             return records
 
     pin_value = fields.get("pin_no", "")
-    for pin_no in split_pin_numbers(pin_value):
+    pin_numbers = split_pin_numbers(pin_value)
+    pin_names = split_parallel_pin_names(fields.get("pin_name", ""), len(pin_numbers))
+    for index, pin_no in enumerate(pin_numbers):
         record = dict(fields)
         record["pin_no"] = pin_no
+        # 只有 pin_name 的显式分隔项数量与 pin_no 数量完全一致时，
+        # 才按位置对应拆开；数量不一致时保留原始 pin_name，避免误拆。
+        if pin_names:
+            record["pin_name"] = pin_names[index]
         record["_raw_fields"] = raw_fields
         records.append(record)
     return records
@@ -582,6 +592,23 @@ def split_pin_numbers(value: str) -> list[str]:
         return []
     parts = [part.strip() for part in re.split(r"[\s,，;/／、|]+", value) if part.strip()]
     return parts or [value]
+
+
+def split_parallel_pin_names(value: str, expected_count: int) -> list[str]:
+    """按 pin_no 数量拆分同一行中的 pin_name。
+
+    只处理 pin_name 自身的显式逗号、分号或斜杠分隔。普通空格不作为
+    分隔符，因为名称可能是 ``Power Supply`` 这样的正常短语。只有拆分
+    后的数量与 pin_no 数量完全相同，才认为两列可以按位置对应。
+    """
+
+    value = plain_text(str(value or "")).strip()
+    if expected_count <= 1 or not value:
+        return []
+    parts = [part.strip() for part in re.split(r"[,，;；/／]+", value) if part.strip()]
+    if len(parts) == expected_count:
+        return parts
+    return []
 
 
 def normalize_pin_record(record: dict[str, Any]) -> dict[str, Any]:
