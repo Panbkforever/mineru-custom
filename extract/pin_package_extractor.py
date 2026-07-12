@@ -12,10 +12,17 @@
 特别重要的项目规则：
 
 * 一列一旦被判定为需要字段，就不因为某一行为空而跳过该行。
-* pin_no 只有在原文有空格、逗号、斜杠等显式分隔符时才拆分；A1-C3 不拆。
+* pin_no 按原文中的空格、逗号、斜杠等显式分隔符拆分。
+* 对同一字母前缀且数字递增的范围进行展开，例如 A1-A5 展开为 A1、A2、A3、A4、A5；
+  前后字母不同的 A1-C3 不展开，数字倒序的 A5-A1 也不展开。
+* pin_no 和 pin_name 的多个值按位置对应；只有两列拆分后的数量完全一致时才同步拆分。
+  数量不一致时保留原 pin_name，不强行猜测对应关系。
+* 当前只对 pin_no 和 pin_name 做跨值同步拆分，不拆 type、description 等其他字段。
 * pin_name 为空填 ``Reserved``；去掉末尾的 ``(数字)`` 和 ``(continued)``。
 * 同一个 pin_no 出现多次时不合并记录；不同 type 也不合并。
+* 多个 type 列同时存在时，只保留最接近 signal/pin 语义的一个，优先 SIGNAL TYPE、PIN TYPE、I/O TYPE。
 * “Pin Configuration and Function” 这类坐标矩阵不是物理引脚表，表级直接排除。
+* 语义字段判断默认并发数为 4，可通过 ``EXTRACT_SCHEMA_WORKERS`` 覆盖。
 """
 
 from __future__ import annotations
