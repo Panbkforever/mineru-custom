@@ -104,6 +104,7 @@ def extract_pin_package_info_from_middle_json(
     include_debug: bool = False,
     use_semantic_classifier: bool = False,
 ) -> list[dict[str, Any]]:
+    """从 MinerU 的 middle_json 找出表格，并交给统一提取流水线。"""
     return extract_pin_package_info_from_table_candidates(
         iter_table_candidates(middle_json),
         source_name=source_name,
@@ -117,6 +118,7 @@ def extract_pin_package_info_from_middle_json_file(
     use_semantic_classifier: bool = False,
     include_debug: bool = False,
 ) -> list[dict[str, Any]]:
+    """读取 middle_json 文件后调用内存对象入口。"""
     path = Path(path)
     return extract_pin_package_info_from_middle_json(
         json.loads(path.read_text(encoding="utf-8")),
@@ -152,16 +154,22 @@ def extract_pin_package_info_from_table_candidates(
     include_debug: bool = False,
     use_semantic_classifier: bool = False,
 ) -> list[dict[str, Any]]:
-    """按“先判断、后提取”的顺序处理表格。"""
+    """按“先判断、后提取”的顺序处理表格。
+
+    ``prepared`` 保存候选表和字段判断所需的信息；只有
+    ``TableDecision.should_extract`` 为真时，才会调用行提取函数。
+    """
 
     global LAST_EXTRACTION_DEBUG
     LAST_EXTRACTION_DEBUG = []
+    # 转成列表，保证后面可以重复访问候选表；packages 保存最终分组结果。
     candidates = list(tables)
     packages: dict[str, dict[str, Any]] = {}
 
     # 第一阶段：只准备候选表，不创建任何 pin 记录。
     prepared = []
     for table_id, table in enumerate(candidates):
+        # 一个候选表对应一个二维字符串数组，后续判断和提取都基于它。
         rows = parse_html_table(table.html)
         debug = {
             "table_id": table_id,
@@ -213,6 +221,7 @@ def extract_pin_package_info_from_table_candidates(
         debug["rule_columns"] = decisions_to_debug(rule_columns)
 
     # 第二阶段：先完成所有表级和字段级判断，再进入任何行提取。
+    # 此处一次性完成全部表格判断，避免边判断边产出 pin 记录。
     decisions = decide_all_tables(prepared, use_semantic_classifier, include_debug)
 
     # 第三阶段：只有已经通过判断的表才允许进入行提取。
@@ -277,7 +286,11 @@ def extract_pin_package_info_from_table_candidates(
 
 
 def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, include_debug: bool) -> dict[int, TableDecision]:
-    """完成全部表格判断；此函数绝不调用行提取函数。"""
+    """完成全部表格判断；此函数绝不调用行提取函数。
+
+    关闭语义判断时走规则分支；开启后并发调用模型，只接收表格角色和
+    字段映射，不让模型直接生成最终 pin JSON。
+    """
 
     if not prepared:
         return {}
@@ -290,6 +303,7 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
     from extract.semantic_classifier import classify_table_schema
 
     # 默认并发数按项目配置使用 4；如遇模型限流，可通过环境变量覆盖。
+    # 默认 4 个模型请求并发；环境变量可在限流时把它调小。
     workers = max(1, int(os.getenv("EXTRACT_SCHEMA_WORKERS", "4")))
     print(f"语义字段判断: 候选表 {len(prepared)} 张, 并发 {workers}", flush=True)
     results: dict[int, TableDecision] = {}
@@ -338,8 +352,10 @@ def decision_from_schema(schema: dict[str, Any], item: dict[str, Any]) -> TableD
     """把模型返回的 schema 转成内部决定，并做最小确定性校验。"""
 
     role = normalize_header(str(schema.get("table_role") or ""))
+    # 这些角色虽然可能含有 pin 文字，但不是“物理 pin -> signal”关系表。
     if role in {"port function table", "pin mux table", "alternate function table", "default mapping table", "module signal connection", "irrelevant", "timing table", "electrical conditions", "ordering table", "boot mode table"}:
         return TableDecision(False, table_role=role, reason=f"semantic_role_rejected:{role}")
+    # 模型明确拒绝时，不能仅凭规则列名强行提取。
     if not bool(schema.get("should_extract")):
         return TableDecision(False, table_role=role, reason="semantic_rejected")
 
@@ -427,17 +443,20 @@ def is_non_physical_port_function_table(title: str, headers: list[str]) -> bool:
 
 
 def is_ordering_table(headers: list[str]) -> bool:
+    """根据表头组合判断是否是器件订货/包装信息表。"""
     text = normalize_header(" ".join(headers))
     words = ("orderable device", "package qty", "package type", "package drawing", "eco plan", "lead finish", "msl peak temp")
     return "orderable device" in text and sum(word in text for word in words) >= 2
 
 
 def has_required_columns(columns: list[ColumnDecision]) -> bool:
+    """检查字段判断结果是否同时包含编号列和名称列。"""
     fields = {normalize_field_name(c.field_name) for c in columns}
     return bool(fields & {"pin_no", "package_pin_no"}) and bool(fields & {"pin_name"})
 
 
 def is_pin_package_table(columns: list[ColumnDecision]) -> bool:
+    """检查字段映射是否具有真实引脚表的最小结构。"""
     if not has_required_columns(columns):
         return False
     number = [c for c in columns if normalize_field_name(c.field_name) in {"pin_no", "package_pin_no"}]
@@ -451,6 +470,8 @@ def is_pin_package_table(columns: list[ColumnDecision]) -> bool:
 
 
 def classify_columns(headers: list[str], rows: list[list[str]], title: str = "") -> list[ColumnDecision]:
+    """用表头优先、列值辅助的规则判断每一列的语义。"""
+    # decisions 只记录列映射，不包含任何从数据行生成的 pin 记录。
     decisions = []
     width = max([len(headers)] + [len(row) for row in rows[:30]] or [0])
     for index in range(width):
@@ -466,6 +487,7 @@ def classify_columns(headers: list[str], rows: list[list[str]], title: str = "")
 
 
 def build_schema_column_decisions(schema: dict[str, Any], headers: list[str]) -> list[ColumnDecision]:
+    """把模型返回的列编号和字段名转换成内部列决策对象。"""
     result = []
     for item in schema.get("columns") or []:
         index = parse_column_index(item.get("column_index"))
@@ -495,6 +517,7 @@ def keep_primary_type_decision(columns: list[ColumnDecision], rows: list[list[st
 
 
 def score_type_column(column: ColumnDecision, rows: list[list[str]]) -> tuple[int, int]:
+    """给 type 列评分：signal/pin 语义高于 buffer、power 等辅助语义。"""
     header = normalize_header(column.raw_header)
     score = column.score
     if any(word in header for word in ("signal type", "pin type", "terminal type", "io type", "i o type")):
@@ -509,6 +532,7 @@ def score_type_column(column: ColumnDecision, rows: list[list[str]]) -> tuple[in
 
 
 def classify_header(header: str) -> tuple[str, int]:
+    """根据表头文字返回标准字段名和表头匹配分数。"""
     h = normalize_header(header)
     if not h:
         return "", 0
@@ -530,6 +554,7 @@ def classify_header(header: str) -> tuple[str, int]:
 
 
 def classify_values(values: list[str]) -> tuple[str, int]:
+    """用列值形态补充表头判断，主要识别编号和值类型列。"""
     sample = [str(value).strip() for value in values if str(value).strip()][:20]
     if not sample:
         return "", 0
@@ -546,10 +571,16 @@ def classify_values(values: list[str]) -> tuple[str, int]:
 
 
 def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> list[dict[str, Any]]:
-    """按已确定的列映射读取一整行；空值不触发表级过滤。"""
+    """按已确定的列映射读取一整行；空值不触发表级过滤。
 
+    这里是唯一负责把一行转换为若干 pin 记录的函数；它不重新判断表格
+    是否有效，也不删除已经被字段判断选中的列。
+    """
+
+    # fields 是标准字段值；package_columns 单独保存“封装专属 pin 列”。
     fields: dict[str, str] = {}
     package_columns: list[tuple[str, str]] = []
+    # raw_fields 仅用于 debug，不参与最终字段判断和输出。
     raw_fields: dict[str, str] = {}
     for column in columns:
         value = row[column.index].strip() if column.index < len(row) else ""
@@ -563,6 +594,7 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
 
     records = []
     if package_columns:
+        # 封装专属编号列优先：每个封装列分别生成自己的 pin 记录。
         for package_header, value in package_columns:
             pin_numbers = split_pin_numbers(value)
             pin_names = split_parallel_pin_names(fields.get("pin_name", ""), len(pin_numbers))
@@ -570,6 +602,7 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
                 record = dict(fields)
                 record["pin_no"] = pin_no
                 if pin_names:
+                    # 只有数量完全对应时，才覆盖整行共享的 pin_name。
                     record["pin_name"] = pin_names[index]
                 record["_pkg"] = clean_package_label(package_header)
                 record["_raw_fields"] = raw_fields
@@ -607,6 +640,8 @@ def split_pin_numbers(value: str) -> list[str]:
     protected_ranges: list[str] = []
 
     def protect_range(match: re.Match[str]) -> str:
+        """把范围暂存起来，并返回不会被普通分隔符拆开的占位符。"""
+
         protected_ranges.append(match.group(0))
         return f"__PIN_RANGE_{len(protected_ranges) - 1}__"
 
@@ -641,6 +676,7 @@ def expand_same_prefix_pin_range(value: str) -> list[str]:
     if not match:
         return [value]
 
+    # 四个分组分别是起始前缀、起始数字、结束前缀、结束数字。
     start_prefix, start_number, end_prefix, end_number = match.groups()
     if start_prefix.upper() != end_prefix.upper():
         return [value]
@@ -669,13 +705,17 @@ def split_parallel_pin_names(value: str, expected_count: int) -> list[str]:
     value = plain_text(str(value or "")).strip()
     if expected_count <= 1 or not value:
         return []
+    # 名称中的普通空格不能作为分隔符，例如 Power Supply。
     parts = [part.strip() for part in re.split(r"[,，;；/／]+", value) if part.strip()]
     if len(parts) == expected_count:
+        # 数量相等意味着可以和 pin_no 按索引建立一一对应关系。
         return parts
+    # 数量不等时不猜测，调用方会把原名称复制到各个 pin 上。
     return []
 
 
 def normalize_pin_record(record: dict[str, Any]) -> dict[str, Any]:
+    """对已生成的单条记录执行项目规定的最终清洗。"""
     result = dict(record)
     result["pin_no"] = plain_text(str(result.get("pin_no", ""))).strip()
     result["pin_name"] = clean_pin_name(result.get("pin_name", ""))
@@ -683,6 +723,7 @@ def normalize_pin_record(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def clean_pin_name(value: Any) -> str:
+    """清理名称尾部标记，并把空名称统一成 Reserved。"""
     value = plain_text(str(value or "")).strip()
     value = re.sub(r"\s*\(\s*\d+\s*\)\s*$", "", value)
     value = re.sub(r"\s*[（(]\s*continued\s*[）)]\s*$", "", value, flags=re.IGNORECASE)
@@ -690,6 +731,7 @@ def clean_pin_name(value: Any) -> str:
 
 
 def add_pin_record_to_group(group: ExtractedGroup, record: dict[str, Any]) -> None:
+    """把单条 pin 追加到分组，刻意不按 pin_no 去重。"""
     # 项目规则：每条行记录独立保留，绝不按 pin_no 去重或合并。
     group.pin_list.append(normalize_pin_record(record))
 
@@ -708,6 +750,7 @@ TYPE_VALUES = {"i", "o", "io", "i/o", "i/o/z", "oz", "od", "odz", "p", "ipu", "i
 
 
 def parse_html_table(html: str) -> list[list[str]]:
+    """把一个 HTML table 转成按行、按列排列的纯文本二维数组。"""
     rows = []
     for tr in TR_RE.finditer(html):
         row = [plain_text(match.group(2)) for match in CELL_RE.finditer(tr.group(2))]
@@ -717,6 +760,7 @@ def parse_html_table(html: str) -> list[list[str]]:
 
 
 def choose_header_row(rows: list[list[str]], title: str = "", semantic: bool = False) -> tuple[int, list[str]]:
+    """在表格前几行中选择最像字段表头的一行。"""
     best = (-1, -1, [])
     for index in range(min(6, len(rows))):
         headers = build_combined_headers(rows, index)
@@ -729,6 +773,7 @@ def choose_header_row(rows: list[list[str]], title: str = "", semantic: bool = F
 
 
 def build_combined_headers(rows: list[list[str]], header_index: int) -> list[str]:
+    """合并多层表头，使跨行表头在字段判断时成为一个完整文字。"""
     width = max((len(row) for row in rows[: header_index + 1]), default=0)
     result = []
     for index in range(width):
@@ -741,15 +786,18 @@ def build_combined_headers(rows: list[list[str]], header_index: int) -> list[str
 
 
 def is_group_row(row: list[str]) -> bool:
+    """识别只有一个重复文本的分组标题行，而不是普通数据行。"""
     values = [cell.strip() for cell in row if cell.strip()]
     return bool(values) and (len(values) == 1 or len(set(values)) == 1) and not looks_like_pin_list(values[0])
 
 
 def first_non_empty(row: list[str]) -> str:
+    """返回一行中第一个非空单元格，用于读取分组标题。"""
     return next((cell.strip() for cell in row if cell.strip()), "")
 
 
 def infer_group_name(text: str) -> str:
+    """从表格附近的标题文本中提取 Pin/Signal/Connectivity 等组名。"""
     text = plain_text(text)
     if not text:
         return ""
@@ -758,6 +806,7 @@ def infer_group_name(text: str) -> str:
 
 
 def infer_group_name_from_headers(headers: list[str], package: str = "") -> str:
+    """当附近没有标题时，根据表头组合生成保守的组名。"""
     h = normalize_header(" ".join(headers))
     suffix = f", {package}" if package else ""
     if "connection requirements" in h or "connectivity requirements" in h:
@@ -770,6 +819,7 @@ def infer_group_name_from_headers(headers: list[str], package: str = "") -> str:
 
 
 def clean_group_name(value: str) -> str:
+    """去掉 Table 编号和 continued 标记，保留组的语义名称。"""
     value = re.sub(r"\s+", " ", plain_text(value)).strip()
     value = re.sub(r"\s*[（(]\s*continued\s*[）)]", "", value, flags=re.IGNORECASE)
     value = re.sub(r"^(?:table|表格?|表)\s*[\w.\-一二三四五六七八九十百千万]+\s*[:：.\-–—]?\s*", "", value, flags=re.IGNORECASE)
@@ -777,12 +827,14 @@ def clean_group_name(value: str) -> str:
 
 
 def infer_package_name(text: str) -> str:
+    """从标题中的“XXX Package”结构提取初始封装名。"""
     text = plain_text(text)
     match = re.search(r"\b([A-Z0-9][A-Z0-9-]{1,20})\s+Package\b", text, re.IGNORECASE)
     return match.group(1).upper() if match else ""
 
 
 def build_package_identity(label: str) -> PackageIdentity:
+    """把显示名称转换为用于分组的稳定封装身份。"""
     display = clean_package_label(label)
     if looks_like_pin_list(display):
         display = ""
@@ -796,6 +848,7 @@ def build_package_identity(label: str) -> PackageIdentity:
 
 
 def get_package_bucket(packages: dict[str, dict[str, Any]], identity: PackageIdentity) -> dict[str, Any]:
+    """按封装 key 获取或创建输出桶，并追加新出现的封装别名。"""
     key = identity.key
     if key not in packages:
         packages[key] = {"pkg": "", "pkg_key": key, "_groups": {}, "_aliases": [], "_identity": identity}
@@ -807,6 +860,7 @@ def get_package_bucket(packages: dict[str, dict[str, Any]], identity: PackageIde
 
 
 def build_package_snapshots(packages: dict[str, dict[str, Any]]) -> list[PackageSnapshot]:
+    """把已提取结果压缩成关联规则需要的已知封装快照。"""
     snapshots = []
     for bucket in packages.values():
         pins, names = set(), set()
@@ -819,6 +873,7 @@ def build_package_snapshots(packages: dict[str, dict[str, Any]]) -> list[Package
 
 
 def get_or_create_group(bucket: dict[str, Any], name: str) -> ExtractedGroup:
+    """在封装桶中获取或创建一个表格/小分组。"""
     name = clean_group_name(name) or "Pin/Package Table"
     if name not in bucket["_groups"]:
         bucket["_groups"][name] = ExtractedGroup(name)
@@ -826,6 +881,7 @@ def get_or_create_group(bucket: dict[str, Any], name: str) -> ExtractedGroup:
 
 
 def build_public_result(packages: dict[str, dict[str, Any]], include_debug: bool) -> list[dict[str, Any]]:
+    """把内部 bucket 结构转换成项目约定的公开 JSON 结构。"""
     result = []
     for bucket in packages.values():
         groups = [{"group": group.group, "pin_list": group.pin_list} for group in bucket["_groups"].values() if group.pin_list]
@@ -838,6 +894,7 @@ def build_public_result(packages: dict[str, dict[str, Any]], include_debug: bool
 
 
 def clean_package_label(value: str) -> str:
+    """清理封装表头中的脚注、Package 后缀和多余空格。"""
     value = plain_text(value)
     value = re.sub(r"\[[^]]+\]", "", value)
     value = re.sub(r"\bpackage\b", "", value, flags=re.IGNORECASE)
@@ -850,6 +907,7 @@ def clean_package_label(value: str) -> str:
 
 
 def iter_table_candidates(middle_json: dict[str, Any]) -> list[TableCandidate]:
+    """按页面阅读顺序从 middle_json 收集 HTML 表格及附近标题。"""
     result = []
     current_title = ""
     for page in middle_json.get("pdf_info", []):
@@ -868,6 +926,7 @@ def iter_table_candidates(middle_json: dict[str, Any]) -> list[TableCandidate]:
 
 
 def iter_table_candidates_from_markdown(markdown: str) -> list[TableCandidate]:
+    """从最终 Markdown 中收集 HTML 表格，并绑定最近的标题文本。"""
     result = []
     table_re = re.compile(r"<table\b.*?</table>", re.DOTALL | re.IGNORECASE)
     cursor = 0
@@ -883,6 +942,7 @@ def iter_table_candidates_from_markdown(markdown: str) -> list[TableCandidate]:
 
 
 def iter_spans_in_reading_order(value: Any):
+    """递归遍历 MinerU 嵌套结构，按原始阅读顺序返回文本 span。"""
     if isinstance(value, dict):
         for key in ("spans", "para_blocks", "blocks", "lines"):
             child = value.get(key)
@@ -902,6 +962,7 @@ def iter_spans_in_reading_order(value: Any):
 
 
 def normalize_field_name(name: str) -> str:
+    """把 ball/terminal/signal 等同义字段归一到 pin 输出字段。"""
     if name in {"ball_no", "terminal_no"}:
         return "pin_no"
     if name in {"ball_name", "signal_name", "terminal_name", "pad_name"}:
@@ -912,15 +973,18 @@ def normalize_field_name(name: str) -> str:
 
 
 def looks_like_pin_list(value: str) -> bool:
+    """判断一个单元格是否像编号列表，用于候选表和分组行识别。"""
     value = str(value).strip()
     return bool(re.fullmatch(r"\d{1,4}", value) or BALL_TOKEN_RE.search(value))
 
 
 def looks_like_signal_type(value: str) -> bool:
+    """判断单元格值是否像 I/O、Power、Analog 等类型值。"""
     return normalize_header(str(value)).replace(" ", "") in TYPE_VALUES
 
 
 def merge_field_value(left: str, right: str) -> str:
+    """多个列映射到同一字段时保留两个非重复值。"""
     if not left:
         return right
     if not right or left == right:
@@ -929,6 +993,7 @@ def merge_field_value(left: str, right: str) -> str:
 
 
 def normalize_header(value: str) -> str:
+    """统一表头比较格式，但不修改最终输出内容。"""
     value = plain_text(value).lower()
     value = re.sub(r"\[[^]]+\]", " ", value)
     value = re.sub(r"[$\\^†‡*]+", " ", value)
@@ -937,11 +1002,13 @@ def normalize_header(value: str) -> str:
 
 
 def plain_text(value: str) -> str:
+    """去除 HTML 标签、实体和多余空白，得到用于判断的文本。"""
     value = re.sub(r"<br\s*/?>", " ", str(value), flags=re.IGNORECASE)
     return re.sub(r"\s+", " ", html_lib.unescape(TAG_RE.sub("", value))).strip()
 
 
 def parse_column_index(value: Any) -> int | None:
+    """把模型返回的列编号安全转换为非负整数。"""
     try:
         value = int(value)
     except (TypeError, ValueError):
@@ -950,10 +1017,12 @@ def parse_column_index(value: Any) -> int | None:
 
 
 def safe_header(headers: list[str], index: int) -> str:
+    """安全读取列名；模型给出越界列号时生成占位列名。"""
     return headers[index] if 0 <= index < len(headers) else f"column_{index + 1}"
 
 
 def is_invalid_schema_package_name(value: str) -> bool:
+    """拦截模型误识别出的引脚列表、功能描述等伪封装名。"""
     normalized = normalize_header(value)
     if not normalized:
         return False
@@ -965,15 +1034,18 @@ def is_invalid_schema_package_name(value: str) -> bool:
 
 
 def skip(debug: dict[str, Any], reason: str) -> None:
+    """统一记录表格被跳过的状态和原因。"""
     debug["status"] = "skipped"
     debug["skip_reason"] = reason
 
 
 def decisions_to_debug(columns: list[ColumnDecision]) -> list[dict[str, Any]]:
+    """把列决策对象转换成可写入 debug JSON 的字典。"""
     return [{"index": c.index, "header": c.raw_header, "field": c.field_name, "score": c.score} for c in columns]
 
 
 def decision_to_debug(decision: TableDecision) -> dict[str, Any]:
+    """把表格决策对象转换成可写入 debug JSON 的字典。"""
     return {
         "should_extract": decision.should_extract,
         "table_role": decision.table_role,
@@ -986,10 +1058,12 @@ def decision_to_debug(decision: TableDecision) -> dict[str, Any]:
 
 
 def get_last_extraction_debug() -> list[dict[str, Any]]:
+    """返回最近一次提取的表级判断日志。"""
     return LAST_EXTRACTION_DEBUG
 
 
 def strip_debug_fields(result: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """删除 source 等调试字段，生成用户最终看到的 JSON。"""
     clean = []
     for package in result:
         item = {"pkg": package.get("pkg", ""), "group_list": []}
@@ -1005,12 +1079,14 @@ def strip_debug_fields(result: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def write_extraction_json(result: Any, output_path: str | Path) -> None:
+    """以 UTF-8 和缩进格式写出提取结果或调试结果。"""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def build_extraction_summary(result: list[dict[str, Any]], pdf_name: str = "") -> dict[str, Any]:
+    """统计封装数、引脚数、分组数及每组页码范围。"""
     packages = []
     total = 0
     for package in result:
