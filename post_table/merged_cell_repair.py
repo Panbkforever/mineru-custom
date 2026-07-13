@@ -8,6 +8,9 @@ errors conservatively:
 * Only pin/function-like tables are considered.
 * Only cells with no visible separators are split. Values containing comma,
   slash, whitespace, or hyphen are treated as intentional multi-value cells.
+* A narrow exception handles compact differential names such as
+  ``DA5-DA6+``. It is accepted only when both adjacent signal names end in
+  ``-`` or ``+`` and the pin-number column provides the same number of pins.
 * A row is split only when both pin number and pin/signal name columns can be
   split into the same number of tokens that match the surrounding table shape.
 
@@ -37,6 +40,12 @@ SIGNAL_WITH_PAREN_RE = re.compile(
 
 VISIBLE_SEPARATOR_RE = re.compile(r"[\s,，;/／、-]")
 TYPE_TOKEN_RE = re.compile(r"I/O/Z|I/O|O/Z|I|O|S|A|GND|Supply|Control I", re.IGNORECASE)
+# 特殊跨页合并格式：例如 DA5-DA6+ 实际是 DA5- 和 DA6+ 两个信号名。
+# 要求每个连续片段都带有 + 或 - 后缀，避免把普通的 XX-XX 当成两个名称。
+COMPACT_POLARITY_SIGNAL_RE = re.compile(
+    r"^(?:[A-Za-z][A-Za-z0-9_]*[+-]){2,}$"
+)
+COMPACT_POLARITY_SIGNAL_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*[+-]")
 
 
 @dataclass
@@ -186,6 +195,15 @@ def _split_compact_pin_numbers(value: str) -> list[str]:
 def _split_compact_signal_names(value: str) -> list[str]:
     """Split compact signal names only when there is no visible separator."""
     value = value.strip()
+
+    # 专门处理跨页合并后的差分信号名，例如 DA5-DA6+。
+    # 这是窄规则：必须至少有两个带正负后缀的连续信号名，不能只因为
+    # 文本中出现一个连字符就进行拆分。
+    if COMPACT_POLARITY_SIGNAL_RE.fullmatch(value):
+        polarity_tokens = COMPACT_POLARITY_SIGNAL_TOKEN_RE.findall(value)
+        if len(polarity_tokens) >= 2 and "".join(polarity_tokens) == value:
+            return polarity_tokens
+
     if not value or VISIBLE_SEPARATOR_RE.search(value):
         return []
     tokens = SIGNAL_WITH_PAREN_RE.findall(value)
