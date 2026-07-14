@@ -24,6 +24,8 @@
 * “Pin Configuration and Function” 这类坐标矩阵不是物理引脚表，表级直接排除。
 * 开启语义判断时，模型接收初筛后的表格标题、表头和完整表格；模型只返回
   ``should_extract`` 以及 ``pin_no``、``pin_name``、``type`` 的列映射。
+* 表格分组标题只按行首 ``Table xxx``/``表 xxx`` 识别，不要求标题中必须
+  含有 Pin、Signal 等关键词；清理编号和 ``(continued)`` 后作为 group 名。
 * 语义字段判断默认并发数为 4，可通过 ``EXTRACT_SCHEMA_WORKERS`` 覆盖。
 """
 
@@ -776,12 +778,26 @@ def first_non_empty(row: list[str]) -> str:
 
 
 def infer_group_name(text: str) -> str:
-    """从表格附近的标题文本中提取 Pin/Signal/Connectivity 等组名。"""
-    text = plain_text(text)
+    """清理已经绑定到候选表的标题，不再检查标题包含哪些语义词。"""
+    return clean_group_name(text)
+
+
+def extract_table_title(text: str) -> str:
+    """从独立文本行中识别 ``Table xxx``/``表 xxx`` 标题。
+
+    这里只判断标题格式，不判断后面的标题内容。这样 ``Signal Descriptions``、
+    ``Pin Attributes`` 或其他名称都能被保留，同时普通正文不会更新当前标题。
+    """
+
+    text = re.sub(r"\s+", " ", plain_text(text)).strip()
     if not text:
         return ""
-    match = re.search(r"((?:Table|表格?|表)\s*[\w.\-一二三四五六七八九十百千万]*\s*[^\n]{0,160}(?:Pin|Terminal|Signal|Connectivity|Connection|引脚|端子|信号|封装)[^\n]{0,100})", text, re.IGNORECASE)
-    return clean_group_name(match.group(1) if match else "")
+    match = re.match(
+        r"^(?:Table|表格?|表)\s*[\w一二三四五六七八九十百千万]+(?:[.\-][\w一二三四五六七八九十百千万]+)*\s*[.:：\-–—]?\s*.+$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return clean_group_name(text) if match else ""
 
 
 def infer_group_name_from_headers(headers: list[str], package: str = "") -> str:
@@ -898,7 +914,8 @@ def iter_table_candidates(middle_json: dict[str, Any]) -> list[TableCandidate]:
             if isinstance(html, str) and "<table" in html.lower():
                 result.append(TableCandidate(html, page_idx if isinstance(page_idx, int) else None, current_title or " ".join(recent[-5:])))
             elif text:
-                current_title = infer_group_name(text) or current_title
+                # 只有明确的 Table xxx 标题才能替换当前表标题。
+                current_title = extract_table_title(text) or current_title
                 recent.append(text)
                 recent = recent[-10:]
     return result
@@ -914,7 +931,8 @@ def iter_table_candidates_from_markdown(markdown: str) -> list[TableCandidate]:
         before = markdown[cursor : match.start()]
         texts = [plain_text(line).strip() for line in before.splitlines() if plain_text(line).strip()]
         for text in texts:
-            last_title = infer_group_name(text) or last_title
+            # 标题内容不设 Pin/Signal 等关键词限制，只检查 Table xxx 格式。
+            last_title = extract_table_title(text) or last_title
         result.append(TableCandidate(match.group(0), None, last_title or " ".join(texts[-5:])))
         cursor = match.end()
     return result
