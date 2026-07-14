@@ -367,6 +367,13 @@ def decision_from_schema(schema: dict[str, Any], item: dict[str, Any]) -> TableD
 
     columns = build_schema_column_decisions(schema, item["headers"])
     columns = keep_primary_type_decision(columns, item["data_rows"])
+    # 模型可能把 ``ABY BALL`` 这类列误判成 ball_name；用规则阶段对
+    # 明确的物理编号列做回退校正，避免整张 Signal Descriptions 表被跳过。
+    columns = reconcile_schema_with_rule_columns(
+        columns,
+        item["rule_columns"],
+        item["data_rows"],
+    )
     if not has_required_columns(columns):
         return TableDecision(False, table_role=role, reason="semantic_schema_missing_required_columns", columns=columns)
     # 不接受模型自由生成的 pkg/group。
@@ -467,7 +474,24 @@ def is_pin_package_table(columns: list[ColumnDecision]) -> bool:
     number = [c for c in columns if normalize_field_name(c.field_name) in {"pin_no", "package_pin_no"}]
     name_fields = {"pin_name", "signal_name", "ball_name", "terminal_name", "pad_name"}
     name = [c for c in columns if c.field_name in name_fields]
-    return any(classify_header(c.raw_header)[1] >= 3 for c in number) and any(classify_header(c.raw_header)[1] >= 3 for c in name)
+    number_evidence = any(
+        classify_header(c.raw_header)[1] >= 3
+        or any(
+            token in normalize_header(c.raw_header)
+            for token in (
+                "pin no",
+                "pin number",
+                "ball no",
+                "ball number",
+                "aby ball",
+                "terminal no",
+                "terminal number",
+            )
+        )
+        for c in number
+    )
+    name_evidence = any(classify_header(c.raw_header)[1] >= 3 for c in name)
+    return number_evidence and name_evidence
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +535,65 @@ def build_schema_column_decisions(schema: dict[str, Any], headers: list[str]) ->
             score = 8
         result.append(ColumnDecision(index, raw, field, score))
     return result
+
+
+def reconcile_schema_with_rule_columns(
+    schema_columns: list[ColumnDecision],
+    rule_columns: list[ColumnDecision],
+    rows: list[list[str]],
+) -> list[ColumnDecision]:
+    """用确定性规则修正模型遗漏的物理编号列。
+
+    模型仍然负责主要的语义判断，但对 ``ABY BALL``、``BALL NUMBER``
+    等明显的物理编号列不允许完全依赖模型。规则阶段如果已经根据列值
+    判断出该列是 pin_no，就替换模型对同一列的错误名称判断，其他列仍
+    保留模型结果。
+    """
+
+    result = list(schema_columns)
+    for rule_column in rule_columns:
+        if normalize_field_name(rule_column.field_name) not in {"pin_no", "package_pin_no"}:
+            continue
+        if not is_strong_physical_number_column(rule_column, rows):
+            continue
+
+        # 当前列若被模型标成 ball_name/signal_name 等，删除该错误映射，
+        # 再写入 pin_no；若模型完全漏掉该列，也直接补入。
+        result = [column for column in result if column.index != rule_column.index]
+        result.append(
+            ColumnDecision(
+                index=rule_column.index,
+                raw_header=rule_column.raw_header,
+                field_name="pin_no",
+                score=max(rule_column.score, 8),
+            )
+        )
+
+    return sorted(result, key=lambda column: column.index)
+
+
+def is_strong_physical_number_column(column: ColumnDecision, rows: list[list[str]]) -> bool:
+    """判断规则阶段识别出的编号列是否足够明确。"""
+
+    header = normalize_header(column.raw_header)
+    explicit_header = any(
+        token in header
+        for token in (
+            "pin no",
+            "pin number",
+            "ball no",
+            "ball number",
+            "aby ball",
+            "terminal no",
+            "terminal number",
+            "引脚编号",
+            "端子编号",
+        )
+    )
+    values = [row[column.index] for row in rows[:30] if column.index < len(row)]
+    pin_value_count = sum(looks_like_pin_list(value) for value in values if str(value).strip())
+    value_shape = pin_value_count >= max(2, len([value for value in values if str(value).strip()]) // 3)
+    return explicit_header or value_shape
 
 
 def keep_primary_type_decision(columns: list[ColumnDecision], rows: list[list[str]]) -> list[ColumnDecision]:

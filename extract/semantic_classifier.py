@@ -87,6 +87,7 @@ def build_schema_prompt_payload(
             "Do not classify timing/electrical/ordering/boot-mode tables as extractable pin tables.",
             "For multiple type-like columns, choose the one most related to the signal/pin itself, usually SIGNAL TYPE before BUFFER TYPE.",
             "When a table has multiple name columns, preserve their semantic roles: use signal_name for SIGNAL NAME, pin_name for PIN NAME, ball_name for BALL NAME, terminal_name for TERMINAL NAME, and pad_name for PAD NAME. Do not merge these columns into one field.",
+            "ABY BALL, BALL NUMBER, BALL NO., PIN NUMBER, PIN NO., TERMINAL NUMBER, and TERMINAL NO. are physical pin-number columns, not name columns. Use pin_no for them when their values look like coordinates such as A1, B10, or P23.",
             "Return ignore for description, condition, min/typ/max/unit, reset state, power source, notes, package quantity, and ordering columns unless they are the only useful name/type evidence.",
         ],
         "allowed_fields": [
