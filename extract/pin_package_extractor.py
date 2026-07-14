@@ -22,6 +22,8 @@
 * 同一个 pin_no 出现多次时不合并记录；不同 type 也不合并。
 * 多个 type 列同时存在时，只保留最接近 signal/pin 语义的一个，优先 SIGNAL TYPE、PIN TYPE、I/O TYPE。
 * “Pin Configuration and Function” 这类坐标矩阵不是物理引脚表，表级直接排除。
+* 开启语义判断时，模型接收初筛后的表格标题、表头和完整表格；模型只返回
+  ``should_extract`` 以及 ``pin_no``、``pin_name``、``type`` 的列映射。
 * 语义字段判断默认并发数为 4，可通过 ``EXTRACT_SCHEMA_WORKERS`` 覆盖。
 """
 
@@ -288,8 +290,8 @@ def extract_pin_package_info_from_table_candidates(
 def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, include_debug: bool) -> dict[int, TableDecision]:
     """完成全部表格判断；此函数绝不调用行提取函数。
 
-    关闭语义判断时走规则分支；开启后并发调用模型，只接收表格角色和
-    字段映射，不让模型直接生成最终 pin JSON。
+    关闭语义判断时走规则分支；开启后并发调用模型。模型只返回是否提取
+    以及目标列映射，不参与封装、分组、行提取或最终 JSON 生成。
     """
 
     if not prepared:
@@ -302,7 +304,6 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
 
     from extract.semantic_classifier import classify_table_schema
 
-    # 默认并发数按项目配置使用 4；如遇模型限流，可通过环境变量覆盖。
     # 默认 4 个模型请求并发；环境变量可在限流时把它调小。
     workers = max(1, int(os.getenv("EXTRACT_SCHEMA_WORKERS", "4")))
     print(f"语义字段判断: 候选表 {len(prepared)} 张, 并发 {workers}", flush=True)
@@ -311,11 +312,10 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
         futures = {
             executor.submit(
                 classify_table_schema,
-                item["table_id"],
                 item["table"].title,
                 item["headers"],
-                item["data_rows"][:12],
-                item["rule_columns"],
+                # 把初筛后的完整二维表格交给模型，不能只发送样例行。
+                item["rows"],
             ): item
             for item in prepared
         }
@@ -349,31 +349,18 @@ def decide_table_by_rules(item: dict[str, Any]) -> TableDecision:
 
 
 def decision_from_schema(schema: dict[str, Any], item: dict[str, Any]) -> TableDecision:
-    """把模型返回的 schema 转成内部决定，并做最小确定性校验。"""
+    """消费模型的最小返回值，不再读取角色、封装名、组名或置信度。"""
 
-    role = normalize_header(str(schema.get("table_role") or ""))
-    # 这些角色虽然可能含有 pin 文字，但不是“物理 pin -> signal”关系表。
-    if role in {"port function table", "pin mux table", "alternate function table", "default mapping table", "module signal connection", "irrelevant", "timing table", "electrical conditions", "ordering table", "boot mode table"}:
-        return TableDecision(False, table_role=role, reason=f"semantic_role_rejected:{role}")
-    # 模型明确拒绝时，不能仅凭规则列名强行提取。
+    # 模型层只拥有这一个表级开关；模型拒绝后不再叠加角色判断。
     if not bool(schema.get("should_extract")):
-        return TableDecision(False, table_role=role, reason="semantic_rejected")
+        return TableDecision(False, reason="semantic_rejected")
 
+    # 列映射完全来自模型返回的 column_index 和 field。
     columns = build_schema_column_decisions(schema, item["headers"])
-    columns = keep_primary_type_decision(columns, item["data_rows"])
-    if not has_required_columns(columns):
-        return TableDecision(False, table_role=role, reason="semantic_schema_missing_required_columns", columns=columns)
-    pkg = str(schema.get("pkg") or "").strip()
-    if is_invalid_schema_package_name(pkg):
-        pkg = ""
-    group = clean_group_name(str(schema.get("group") or ""))
     return TableDecision(
         True,
-        table_role=role,
-        pkg=pkg,
-        group=group,
-        confidence=float(schema.get("confidence") or 0.0),
-        reason=str(schema.get("reason") or "semantic_schema_valid"),
+        table_role="semantic_selected",
+        reason="semantic_selected",
         columns=columns,
     )
 
@@ -487,22 +474,14 @@ def classify_columns(headers: list[str], rows: list[list[str]], title: str = "")
 
 
 def build_schema_column_decisions(schema: dict[str, Any], headers: list[str]) -> list[ColumnDecision]:
-    """把模型返回的列编号和字段名转换成内部列决策对象。"""
+    """把模型返回的最小列映射转换成内部对象，不推断其他字段。"""
     result = []
     for item in schema.get("columns") or []:
         index = parse_column_index(item.get("column_index"))
         field = str(item.get("field") or "ignore").strip()
         if index is None or field == "ignore":
             continue
-        if field == "package_pin_no":
-            raw = str(item.get("pkg") or "").strip() or safe_header(headers, index)
-        else:
-            raw = safe_header(headers, index)
-        try:
-            score = max(1, int(float(item.get("confidence", 0.8)) * 10))
-        except (TypeError, ValueError):
-            score = 8
-        result.append(ColumnDecision(index, raw, field, score))
+        result.append(ColumnDecision(index, safe_header(headers, index), field, 10))
     return result
 
 
@@ -1019,18 +998,6 @@ def parse_column_index(value: Any) -> int | None:
 def safe_header(headers: list[str], index: int) -> str:
     """安全读取列名；模型给出越界列号时生成占位列名。"""
     return headers[index] if 0 <= index < len(headers) else f"column_{index + 1}"
-
-
-def is_invalid_schema_package_name(value: str) -> bool:
-    """拦截模型误识别出的引脚列表、功能描述等伪封装名。"""
-    normalized = normalize_header(value)
-    if not normalized:
-        return False
-    if any(word in normalized for word in ("pin name", "default mapping", "function", "description")):
-        return True
-    # 例如模型误把“A1 B4 A4”当作封装名。
-    tokens = re.findall(r"\b[A-Z]{1,2}\d{1,3}\b", value.upper())
-    return len(tokens) >= 2 and len(tokens) == len(value.split())
 
 
 def skip(debug: dict[str, Any], reason: str) -> None:
