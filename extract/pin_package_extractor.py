@@ -247,11 +247,15 @@ def extract_pin_package_info_from_table_candidates(
             or association.package
             or infer_package_name(item["table"].title)
         )
-        group_name = clean_group_name(
-            table_decision.group
-            or infer_group_name(item["table"].title)
-            or infer_group_name_from_headers(item["headers"], default_pkg)
-            or "Pin/Package Table"
+        # 分组主键必须来自“当前表格”，而不是来自模型生成的泛化名称。
+        # 同一张表的续表标题会在 infer_table_group_name() 中清理掉
+        # ``(continued)``，因此续表仍会进入同一个 group；不同表即使表头
+        # 相同，只要标题不同，也会保留为不同 group。
+        group_name = infer_table_group_name(
+            item["table"].title,
+            item["headers"],
+            table_id=item["table_id"],
+            package=default_pkg,
         )
 
         # 行提取函数只做列映射，不再决定表格是否有效。
@@ -855,11 +859,64 @@ def infer_group_name_from_headers(headers: list[str], package: str = "") -> str:
     suffix = f", {package}" if package else ""
     if "connection requirements" in h or "connectivity requirements" in h:
         return f"Connectivity Requirements{suffix}"
-    if "description" in h and ("function" in h or "signal type" in h):
+    # Signal Descriptions 表常见表头是 SIGNAL NAME | DESCRIPTION |
+    # PIN TYPE | BALL，不一定出现字面量 SIGNAL TYPE，因此必须优先识别。
+    if "description" in h and (
+        "signal" in h
+        or "pin type" in h
+        or "terminal type" in h
+        or "function" in h
+    ):
         return f"Signal Descriptions{suffix}"
     if "pin" in h or "ball" in h or "terminal" in h:
         return f"Pin Attributes{suffix}"
     return ""
+
+
+def infer_table_group_name(
+    title: str,
+    headers: list[str],
+    table_id: int,
+    package: str = "",
+) -> str:
+    """为当前候选表生成稳定的 group 名称。
+
+    分组优先级如下：
+
+    1. 当前表格附近的明确标题，例如 ``Pin Attributes``、
+       ``DSS Signal Descriptions``；
+    2. 没有明确标题时，根据表头语义生成名称；
+    3. 标题和表头都不足以命名时，使用候选表编号，避免多个无标题表
+       被错误合并成同一个泛化 group。
+
+    标题清洗会移除 ``Table 5-1`` 和 ``(continued)``，所以续表标题在
+    清洗后与主表相同；不同表的标题不会仅因为表头相同而合并。
+    """
+
+    cleaned_title = clean_group_name(title)
+    title_text = normalize_header(cleaned_title)
+    title_keywords = (
+        "pin",
+        "ball",
+        "terminal",
+        "signal",
+        "connectivity",
+        "connection",
+        "引脚",
+        "端子",
+        "信号",
+        "封装",
+    )
+    if cleaned_title and any(keyword in title_text for keyword in title_keywords):
+        return cleaned_title
+
+    header_group = infer_group_name_from_headers(headers, package)
+    if header_group:
+        return clean_group_name(header_group)
+
+    # 不能让多个没有标题的候选表共享同一个默认名称；否则它们的记录
+    # 会在 get_or_create_group() 中被追加到同一列表，导致表格边界丢失。
+    return f"Table {table_id + 1}"
 
 
 def clean_group_name(value: str) -> str:
