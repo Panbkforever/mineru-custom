@@ -18,6 +18,8 @@
 * pin_no 和 pin_name 的多个值按位置对应；只有两列拆分后的数量完全一致时才同步拆分。
   数量不一致时保留原 pin_name，不强行猜测对应关系。
 * 当前只对 pin_no 和 pin_name 做跨值同步拆分，不拆 type、description 等其他字段。
+* 同一行存在 BALL NAME、SIGNAL NAME 等多个名称列时只选择一个；优先 SIGNAL NAME，
+  其次 PIN NAME、BALL NAME 等，不把多个名称用 ``|`` 合并。
 * pin_name 为空填 ``Reserved``；去掉末尾的 ``(数字)`` 和 ``(continued)``。
 * 同一个 pin_no 出现多次时不合并记录；不同 type 也不合并。
 * 多个 type 列同时存在时，只保留最接近 signal/pin 语义的一个，优先 SIGNAL TYPE、PIN TYPE、I/O TYPE。
@@ -452,7 +454,8 @@ def is_ordering_table(headers: list[str]) -> bool:
 def has_required_columns(columns: list[ColumnDecision]) -> bool:
     """检查字段判断结果是否同时包含编号列和名称列。"""
     fields = {normalize_field_name(c.field_name) for c in columns}
-    return bool(fields & {"pin_no", "package_pin_no"}) and bool(fields & {"pin_name"})
+    name_fields = {"pin_name", "signal_name", "ball_name", "terminal_name", "pad_name"}
+    return bool(fields & {"pin_no", "package_pin_no"}) and bool(fields & name_fields)
 
 
 def is_pin_package_table(columns: list[ColumnDecision]) -> bool:
@@ -460,7 +463,8 @@ def is_pin_package_table(columns: list[ColumnDecision]) -> bool:
     if not has_required_columns(columns):
         return False
     number = [c for c in columns if normalize_field_name(c.field_name) in {"pin_no", "package_pin_no"}]
-    name = [c for c in columns if normalize_field_name(c.field_name) == "pin_name"]
+    name_fields = {"pin_name", "signal_name", "ball_name", "terminal_name", "pad_name"}
+    name = [c for c in columns if c.field_name in name_fields]
     return any(classify_header(c.raw_header)[1] >= 3 for c in number) and any(classify_header(c.raw_header)[1] >= 3 for c in name)
 
 
@@ -538,8 +542,15 @@ def classify_header(header: str) -> tuple[str, int]:
         return "", 0
     if any(word in h for word in ("pin no", "pin number", "ball no", "ball number", "terminal no", "terminal number", "引脚编号", "端子编号")):
         return "pin_no", 5
-    if any(word in h for word in ("pin name", "ball name", "signal name", "terminal name", "引脚名称", "信号名称", "引脚名")):
+    # 保留原始名称列的语义，后面由 choose_pin_name_value() 决定最终只选哪一列。
+    if any(word in h for word in ("signal name", "信号名称")):
+        return "signal_name", 6
+    if any(word in h for word in ("pin name", "引脚名称", "引脚名")):
         return "pin_name", 5
+    if any(word in h for word in ("ball name", "ball 名称")):
+        return "ball_name", 4
+    if any(word in h for word in ("terminal name", "端子名称")):
+        return "terminal_name", 4
     if any(word in h for word in ("signal type", "pin type", "terminal type", "io type", "i o type", "引脚类型", "信号类型")):
         return "type", 5
     if h in {"no", "no.", "number", "signal no", "signal no."}:
@@ -577,8 +588,9 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
     是否有效，也不删除已经被字段判断选中的列。
     """
 
-    # fields 是标准字段值；package_columns 单独保存“封装专属 pin 列”。
+    # fields 保存编号、类型等普通字段；名称列单独保存，稍后只选一个。
     fields: dict[str, str] = {}
+    name_values: list[tuple[str, str]] = []
     package_columns: list[tuple[str, str]] = []
     # raw_fields 仅用于 debug，不参与最终字段判断和输出。
     raw_fields: dict[str, str] = {}
@@ -588,19 +600,26 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
         field_name = normalize_field_name(column.field_name)
         if column.field_name == "package_pin_no":
             package_columns.append((column.raw_header, value))
+        elif field_name in {"pin_name", "signal_name", "ball_name", "terminal_name", "pad_name"}:
+            # 不能在这里用 merge_field_value()，否则 BALL NAME 和 SIGNAL NAME
+            # 会再次变成“名称1 | 名称2”。
+            name_values.append((field_name, value))
         elif field_name:
             # 同一个字段有多个列时保留原始信息，不在这里合并 pin 记录。
             fields[field_name] = merge_field_value(fields.get(field_name, ""), value)
 
+    # 同一行有多个名称列时，只选一个名称；空的高优先级列会回退到下一列。
+    selected_pin_name = choose_pin_name_value(name_values)
     records = []
     if package_columns:
         # 封装专属编号列优先：每个封装列分别生成自己的 pin 记录。
         for package_header, value in package_columns:
             pin_numbers = split_pin_numbers(value)
-            pin_names = split_parallel_pin_names(fields.get("pin_name", ""), len(pin_numbers))
+            pin_names = split_parallel_pin_names(selected_pin_name, len(pin_numbers))
             for index, pin_no in enumerate(pin_numbers):
                 record = dict(fields)
                 record["pin_no"] = pin_no
+                record["pin_name"] = pin_names[index] if pin_names else selected_pin_name
                 if pin_names:
                     # 只有数量完全对应时，才覆盖整行共享的 pin_name。
                     record["pin_name"] = pin_names[index]
@@ -612,10 +631,11 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
 
     pin_value = fields.get("pin_no", "")
     pin_numbers = split_pin_numbers(pin_value)
-    pin_names = split_parallel_pin_names(fields.get("pin_name", ""), len(pin_numbers))
+    pin_names = split_parallel_pin_names(selected_pin_name, len(pin_numbers))
     for index, pin_no in enumerate(pin_numbers):
         record = dict(fields)
         record["pin_no"] = pin_no
+        record["pin_name"] = pin_names[index] if pin_names else selected_pin_name
         # 只有 pin_name 的显式分隔项数量与 pin_no 数量完全一致时，
         # 才按位置对应拆开；数量不一致时保留原始 pin_name，避免误拆。
         if pin_names:
@@ -712,6 +732,31 @@ def split_parallel_pin_names(value: str, expected_count: int) -> list[str]:
         return parts
     # 数量不等时不猜测，调用方会把原名称复制到各个 pin 上。
     return []
+
+
+def choose_pin_name_value(name_values: list[tuple[str, str]]) -> str:
+    """从同一行多个名称列中选择一个输出名称。
+
+    优先级固定为 SIGNAL NAME、PIN NAME、TERMINAL NAME、BALL NAME、PAD NAME。
+    空值不参与选择；如果所有名称列都为空，返回空字符串，后续统一填充
+    ``Reserved``。该函数只选择，不拼接名称。
+    """
+
+    priorities = {
+        "signal_name": 50,
+        "pin_name": 40,
+        "terminal_name": 30,
+        "ball_name": 20,
+        "pad_name": 10,
+    }
+    candidates = [
+        (priorities.get(field_name, 0), value.strip())
+        for field_name, value in name_values
+        if value.strip()
+    ]
+    if not candidates:
+        return ""
+    return max(candidates, key=lambda item: item[0])[1]
 
 
 def normalize_pin_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -962,11 +1007,13 @@ def iter_spans_in_reading_order(value: Any):
 
 
 def normalize_field_name(name: str) -> str:
-    """把 ball/terminal/signal 等同义字段归一到 pin 输出字段。"""
+    """归一化字段名，但保留不同名称列的来源语义。
+
+    ``signal_name`` 和 ``ball_name`` 不能在这里直接改成同一个字段，
+    否则后续无法执行“优先 SIGNAL NAME、只选择一个”的规则。
+    """
     if name in {"ball_no", "terminal_no"}:
         return "pin_no"
-    if name in {"ball_name", "signal_name", "terminal_name", "pad_name"}:
-        return "pin_name"
     if name == "io_type":
         return "type"
     return name
