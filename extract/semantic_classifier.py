@@ -86,18 +86,16 @@ def build_schema_prompt_payload(
             "Headers like PIN NAME (P1.x), Port P1, Port P2, GPIO function, default mapping, or module function describe alternate functions, not package identities.",
             "Do not classify timing/electrical/ordering/boot-mode tables as extractable pin tables.",
             "For multiple type-like columns, choose the one most related to the signal/pin itself, usually SIGNAL TYPE before BUFFER TYPE.",
-            "When a table has multiple name columns, preserve their semantic roles: use signal_name for SIGNAL NAME, pin_name for PIN NAME, ball_name for BALL NAME, terminal_name for TERMINAL NAME, and pad_name for PAD NAME. Do not merge these columns into one field.",
-            "ABY BALL, BALL NUMBER, BALL NO., PIN NUMBER, PIN NO., TERMINAL NUMBER, and TERMINAL NO. are physical pin-number columns, not name columns. Use pin_no for them when their values look like coordinates such as A1, B10, or P23.",
             "Return ignore for description, condition, min/typ/max/unit, reset state, power source, notes, package quantity, and ordering columns unless they are the only useful name/type evidence.",
+            "If a package name appears only in the title, put it in pkg.",
         ],
         "allowed_fields": [
+            "package_pin_no",
             "pin_no",
             "pin_name",
-            "signal_name",
-            "ball_name",
-            "terminal_name",
-            "pad_name",
             "type",
+            "package",
+            "group",
             "ignore",
         ],
         "valid_table_roles": [
@@ -136,10 +134,13 @@ def build_schema_prompt_payload(
             "table_id": table_id,
             "table_role": "one valid_table_roles value",
             "should_extract": "boolean",
+            "pkg": "package name from title/table, or empty string",
+            "group": "clean table/group title, or empty string",
             "columns": [
                 {
                     "column_index": 0,
-                    "field": "pin_no|pin_name|signal_name|ball_name|terminal_name|pad_name|type|ignore",
+                    "field": "package_pin_no|pin_no|pin_name|type|package|group|ignore",
+                    "pkg": "only for package_pin_no columns, otherwise empty",
                     "confidence": 0.0,
                     "reason": "short reason",
                 }
@@ -340,8 +341,6 @@ def normalize_schema_response(response: dict[str, Any], headers: list[str]) -> d
     except (TypeError, ValueError):
         confidence = 0.0
 
-    # 保留模型返回的每个名称列的具体语义，后面才能执行
-    # SIGNAL NAME > PIN NAME > TERMINAL NAME > BALL NAME > PAD NAME 的选择规则。
     columns = []
     seen: set[tuple[int, str]] = set()
     for item in response.get("columns") or []:
@@ -385,12 +384,6 @@ def normalize_schema_response(response: dict[str, Any], headers: list[str]) -> d
 
 
 def normalize_schema_field(field: str) -> str:
-    """把模型字段名归一化，但保留不同名称列的语义来源。
-
-    这里不能把 ``SIGNAL NAME`` 和 ``BALL NAME`` 都压成 ``pin_name``。
-    后续提取阶段需要根据列语义优先选择 SIGNAL NAME，只有它为空时才回退
-    到 PIN NAME、BALL NAME 等列；如果在这里提前合并，优先级信息就丢失了。
-    """
     normalized = re.sub(r"[^a-z0-9]+", "_", field.lower()).strip("_")
     aliases = {
         "ball_no": "pin_no",
@@ -400,7 +393,10 @@ def normalize_schema_field(field: str) -> str:
         "pin_number": "pin_no",
         "signal_no": "pin_no",
         "signal_number": "pin_no",
-        "pin_signal_name": "signal_name",
+        "ball_name": "pin_name",
+        "signal_name": "pin_name",
+        "terminal_name": "pin_name",
+        "pin_signal_name": "pin_name",
         "signal_type": "type",
         "pin_type": "type",
         "io_type": "type",
@@ -409,15 +405,6 @@ def normalize_schema_field(field: str) -> str:
         "pkg": "package",
     }
     normalized = aliases.get(normalized, normalized)
-    if normalized not in {
-        "pin_no",
-        "pin_name",
-        "signal_name",
-        "ball_name",
-        "terminal_name",
-        "pad_name",
-        "type",
-        "ignore",
-    }:
+    if normalized not in {"package_pin_no", "pin_no", "pin_name", "type", "package", "group", "ignore"}:
         return "ignore"
     return normalized
