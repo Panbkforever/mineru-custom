@@ -26,6 +26,8 @@
   ``should_extract`` 以及 ``pin_no``、``pin_name``、``type`` 的列映射。
 * 表格分组标题只按行首 ``Table xxx``/``表 xxx`` 识别，不要求标题中必须
   含有 Pin、Signal 等关键词；清理编号和 ``(continued)`` 后作为 group 名。
+* 初筛后先调用 ``special_table_handlers.py``。特殊表只有完整命中专用规则才
+  绕过模型；当前 Reserved/NC 表会直接保留真实 Reserved 行并排除不存在位置。
 * 语义字段判断默认并发数为 4，可通过 ``EXTRACT_SCHEMA_WORKERS`` 覆盖。
 """
 
@@ -44,6 +46,7 @@ from extract.table_association_rules import (
     PackageSnapshot,
     resolve_table_package_association,
 )
+from extract.special_table_handlers import find_special_table_match
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +80,8 @@ class TableDecision:
     reason: str = ""
     confidence: float = 0.0
     columns: list[ColumnDecision] = field(default_factory=list)
+    # None 表示提取全部数据行；特殊表可以只允许确定的行进入统一提取流程。
+    included_row_indexes: frozenset[int] | None = None
 
 
 @dataclass
@@ -259,7 +264,12 @@ def extract_pin_package_info_from_table_candidates(
         # 行提取函数只做列映射，不再决定表格是否有效。
         current_group_name = group_name
         extracted_count = 0
-        for row in item["data_rows"]:
+        for row_index, row in enumerate(item["data_rows"]):
+            if (
+                table_decision.included_row_indexes is not None
+                and row_index not in table_decision.included_row_indexes
+            ):
+                continue
             if is_group_row(row):
                 current_group_name = clean_group_name(first_non_empty(row)) or current_group_name
                 continue
@@ -298,18 +308,48 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
 
     if not prepared:
         return {}
+
+    # 特殊表先走专用且严格的确定性处理；未命中的表才交给规则或模型。
+    results: dict[int, TableDecision] = {}
+    remaining: list[dict[str, Any]] = []
+    for item in prepared:
+        special_match = find_special_table_match(
+            item["table"].title,
+            item["headers"],
+            item["data_rows"],
+        )
+        if special_match is None:
+            remaining.append(item)
+            continue
+        results[item["table_id"]] = TableDecision(
+            should_extract=True,
+            table_role="special_table",
+            reason=special_match.handler_name,
+            columns=[
+                ColumnDecision(column.index, column.header, column.field_name, 10)
+                for column in special_match.columns
+            ],
+            included_row_indexes=special_match.included_row_indexes,
+        )
+
+    if not remaining:
+        return results
     if not use_semantic:
-        return {
+        results.update({
             item["table_id"]: decide_table_by_rules(item)
-            for item in prepared
-        }
+            for item in remaining
+        })
+        return results
 
     from extract.semantic_classifier import classify_table_schema
 
     # 默认 4 个模型请求并发；环境变量可在限流时把它调小。
     workers = max(1, int(os.getenv("EXTRACT_SCHEMA_WORKERS", "4")))
-    print(f"语义字段判断: 候选表 {len(prepared)} 张, 并发 {workers}", flush=True)
-    results: dict[int, TableDecision] = {}
+    print(
+        f"语义字段判断: 候选表 {len(remaining)} 张, "
+        f"特殊表直通 {len(prepared) - len(remaining)} 张, 并发 {workers}",
+        flush=True,
+    )
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(
@@ -319,7 +359,7 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
                 # 把初筛后的完整二维表格交给模型，不能只发送样例行。
                 item["rows"],
             ): item
-            for item in prepared
+            for item in remaining
         }
         for index, future in enumerate(as_completed(futures), 1):
             item = futures[future]
@@ -329,7 +369,7 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
             except Exception as exc:
                 decision = TableDecision(False, reason=f"semantic_classification_failed:{exc}")
             results[item["table_id"]] = decision
-            print(f"语义字段判断进度: {index}/{len(prepared)}", flush=True)
+            print(f"语义字段判断进度: {index}/{len(remaining)}", flush=True)
     return results
 
 
@@ -519,6 +559,9 @@ def classify_header(header: str) -> tuple[str, int]:
         return "", 0
     if any(word in h for word in ("pin no", "pin number", "ball no", "ball number", "terminal no", "terminal number", "引脚编号", "端子编号")):
         return "pin_no", 5
+    # Reserved/NC 表常把物理编号列简写为 PINS、BALLS 或 TERMINALS。
+    if h in {"pins", "balls", "terminals"}:
+        return "pin_no", 4
     if any(word in h for word in ("pin name", "ball name", "signal name", "terminal name", "引脚名称", "信号名称", "引脚名")):
         return "pin_name", 5
     if any(word in h for word in ("signal type", "pin type", "terminal type", "io type", "i o type", "引脚类型", "信号类型")):
@@ -1039,6 +1082,11 @@ def decision_to_debug(decision: TableDecision) -> dict[str, Any]:
         "confidence": decision.confidence,
         "reason": decision.reason,
         "columns": decisions_to_debug(decision.columns),
+        "included_row_indexes": (
+            sorted(decision.included_row_indexes)
+            if decision.included_row_indexes is not None
+            else None
+        ),
     }
 
 
