@@ -365,15 +365,13 @@ def decision_from_schema(schema: dict[str, Any], item: dict[str, Any]) -> TableD
     columns = keep_primary_type_decision(columns, item["data_rows"])
     if not has_required_columns(columns):
         return TableDecision(False, table_role=role, reason="semantic_schema_missing_required_columns", columns=columns)
-    pkg = str(schema.get("pkg") or "").strip()
-    if is_invalid_schema_package_name(pkg):
-        pkg = ""
-    group = clean_group_name(str(schema.get("group") or ""))
+    # 不接受模型自由生成的 pkg/group。
+    # pkg 由标题、表头和表间关联规则确定，group 由当前表格标题/表头确定。
+    # 这样模型只能负责“是否提取”和“哪些列是目标字段”，不会再把
+    # BALL NUMBER 这类表头写成封装名，也不会让多个表共用模型生成的泛化组名。
     return TableDecision(
         True,
         table_role=role,
-        pkg=pkg,
-        group=group,
         confidence=float(schema.get("confidence") or 0.0),
         reason=str(schema.get("reason") or "semantic_schema_valid"),
         columns=columns,
@@ -498,10 +496,11 @@ def build_schema_column_decisions(schema: dict[str, Any], headers: list[str]) ->
         field = str(item.get("field") or "ignore").strip()
         if index is None or field == "ignore":
             continue
+        # 兼容旧模型缓存：package_pin_no 只降级为普通 pin_no，不能使用
+        # 模型返回的 pkg，也不能把当前列标题当作封装名称。
         if field == "package_pin_no":
-            raw = str(item.get("pkg") or "").strip() or safe_header(headers, index)
-        else:
-            raw = safe_header(headers, index)
+            field = "pin_no"
+        raw = safe_header(headers, index)
         try:
             score = max(1, int(float(item.get("confidence", 0.8)) * 10))
         except (TypeError, ValueError):
