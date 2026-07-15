@@ -16,7 +16,7 @@
 * 对同一字母前缀且数字递增的范围进行展开，例如 A1-A5 展开为 A1、A2、A3、A4、A5；
   前后字母不同的 A1-C3 不展开，数字倒序的 A5-A1 也不展开。
 * 对 BGA 行列编号的方括号范围进行展开，例如 L[7:12] 展开为 L7 至 L12；
-  只接受 1 至 2 个纯字母行号，避免把 VDD[1:0]、DATA[7:0] 等信号总线误当成引脚范围。
+  此处输入已经由字段判断确定为 pin_no，因此不限制字母前缀长度。
 * pin_no 和 pin_name 的多个值按位置对应；只有两列拆分后的数量完全一致时才同步拆分。
   数量不一致时保留原 pin_name，不强行猜测对应关系。
 * 当前只对 pin_no 和 pin_name 做跨值同步拆分，不拆 type、description 等其他字段。
@@ -677,7 +677,7 @@ def split_pin_numbers(value: str) -> list[str]:
         (
             r"(?<![A-Za-z0-9_])(?:"
             r"[A-Za-z]+\s*\d+\s*-\s*[A-Za-z]+\s*\d+"
-            r"|[A-Za-z]{1,2}\s*\[\s*\d+\s*:\s*\d+\s*\]"
+            r"|[A-Za-z]+\s*\[\s*\d+\s*:\s*\d+\s*\]"
             r")(?![A-Za-z0-9_])"
         ),
         protect_range,
@@ -698,7 +698,7 @@ def split_pin_numbers(value: str) -> list[str]:
         # 每个 token 只进入一种范围解析器。方括号语法优先判断，
         # 未命中时再沿用原有的 A1-A5 连字符范围逻辑。
         if re.fullmatch(
-            r"[A-Za-z]{1,2}\s*\[\s*\d+\s*:\s*\d+\s*\]",
+            r"[A-Za-z]+\s*\[\s*\d+\s*:\s*\d+\s*\]",
             original_part,
         ):
             expanded.extend(expand_bracketed_pin_range(original_part))
@@ -711,7 +711,7 @@ def expand_bracketed_pin_range(value: str) -> list[str]:
     """展开形如 L[7:12] 的 BGA 引脚范围，其他文本保持原样。"""
 
     match = re.fullmatch(
-        r"([A-Za-z]{1,2})\s*\[\s*(\d+)\s*:\s*(\d+)\s*\]",
+        r"([A-Za-z]+)\s*\[\s*(\d+)\s*:\s*(\d+)\s*\]",
         value.strip(),
     )
     if not match:
