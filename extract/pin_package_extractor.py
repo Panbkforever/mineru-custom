@@ -2,12 +2,13 @@
 
 本文件只做一件事：把表格转换为项目约定的 JSON 结构。
 
-处理流程固定为四个阶段，阶段之间不互相调用：
+处理流程固定为五个阶段，阶段之间不互相调用：
 
 1. 表格判断：判断当前表是不是“物理引脚/封装关系表”。
 2. 字段判断：只判断每一列的语义，不读取行来生成输出记录。
-3. 行提取：按照已经确定的字段映射，完整读取所有数据行。
-4. 结果整理：拆分显式 pin_no 分隔符、清洗 pin_name、分组和合并封装别名。
+3. 多封装分析：为真正的多封装表生成 package 与列/行的绑定计划。
+4. 行提取：单封装和多封装走各自独立逻辑，完整读取已经绑定的数据行。
+5. 结果整理：拆分显式 pin_no 分隔符、清洗 pin_name、分组和合并封装别名。
 
 特别重要的项目规则：
 
@@ -30,6 +31,9 @@
   含有 Pin、Signal 等关键词；清理编号和 ``(continued)`` 后作为 group 名。
 * 初筛后先调用 ``special_table_handlers.py``。特殊表只有完整命中专用规则才
   绕过模型；当前 Reserved/NC 表会直接保留真实 Reserved 行并排除不存在位置。
+* 通过表格/字段判断后调用 ``multi_package_extractor.py``。多个封装专属
+  pin_no 列、package 控制列和 package 分段行走多封装分支；横向重复的
+  Pin#/Pin Name/Type 字段块只是单封装排版，不按多封装处理。
 * 语义字段判断默认并发数为 4，可通过 ``EXTRACT_SCHEMA_WORKERS`` 覆盖。
 """
 
@@ -49,6 +53,13 @@ from extract.table_association_rules import (
     resolve_table_package_association,
 )
 from extract.special_table_handlers import find_special_table_match
+from extract.multi_package_extractor import (
+    BoundPackageRow,
+    MultiPackagePlan,
+    analyze_multi_package_table,
+    iter_bound_package_rows,
+    plan_to_debug,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +246,24 @@ def extract_pin_package_info_from_table_candidates(
     # 此处一次性完成全部表格判断，避免边判断边产出 pin 记录。
     decisions = decide_all_tables(prepared, use_semantic_classifier, include_debug)
 
-    # 第三阶段：只有已经通过判断的表才允许进入行提取。
+    # 第三阶段：先为所有已经通过判断的表完成多封装结构分析。
+    # 此阶段仍然不创建 pin 记录，确保判断和提取完全分离。
+    multi_package_plans: dict[int, MultiPackagePlan] = {}
+    for item in prepared:
+        table_decision = decisions[item["table_id"]]
+        if not table_decision.should_extract:
+            continue
+        plan = analyze_multi_package_table(
+            title=item["table"].title,
+            header_rows=item["rows"][: item["header_index"] + 1],
+            headers=item["headers"],
+            data_rows=item["data_rows"],
+            columns=table_decision.columns,
+        )
+        multi_package_plans[item["table_id"]] = plan
+        item["debug"]["multi_package_plan"] = plan_to_debug(plan)
+
+    # 第四阶段：只有表格判断和多封装分析都结束后，才允许创建 pin 记录。
     for item in prepared:
         table_decision = decisions[item["table_id"]]
         debug = item["debug"]
@@ -263,36 +291,59 @@ def extract_pin_package_info_from_table_candidates(
             or "Pin/Package Table"
         )
 
-        # 行提取函数只做列映射，不再决定表格是否有效。
+        plan = multi_package_plans[item["table_id"]]
         current_group_name = group_name
         extracted_count = 0
-        for row_index, row in enumerate(item["data_rows"]):
-            if (
-                table_decision.included_row_indexes is not None
-                and row_index not in table_decision.included_row_indexes
-            ):
-                continue
-            if is_group_row(row):
-                current_group_name = clean_group_name(first_non_empty(row)) or current_group_name
-                continue
-            for record in extract_records_from_row(row, table_decision.columns):
-                record_pkg = record.pop("_pkg", default_pkg)
-                record.pop("_raw_fields", None)
-                if include_debug and source_name:
-                    record["source"] = source_name
-                if include_debug and item["table"].page_idx is not None:
-                    record["source_page"] = item["table"].page_idx + 1
-                identity = build_package_identity(record_pkg)
-                bucket = get_package_bucket(packages, identity)
-                group = get_or_create_group(bucket, current_group_name)
-                add_pin_record_to_group(group, record)
-                extracted_count += 1
+
+        # 真正的多封装表严格执行绑定计划。每个封装独立读取自己的 pin_no，
+        # 不能再进入普通逻辑把多个编号列拼接成一个字段。
+        if plan.is_multi_package:
+            for bound_row in iter_bound_package_rows(plan, item["data_rows"]):
+                for record in extract_records_from_bound_package_row(bound_row):
+                    record_pkg = record.pop("_pkg")
+                    if include_debug and source_name:
+                        record["source"] = source_name
+                    if include_debug and item["table"].page_idx is not None:
+                        record["source_page"] = item["table"].page_idx + 1
+                    identity = build_package_identity(record_pkg)
+                    bucket = get_package_bucket(packages, identity)
+                    group = get_or_create_group(bucket, current_group_name)
+                    add_pin_record_to_group(group, record)
+                    extracted_count += 1
+
+        # 单封装表保留原有逐行提取逻辑，不经过多封装绑定。
+        else:
+            for row_index, row in enumerate(item["data_rows"]):
+                if (
+                    table_decision.included_row_indexes is not None
+                    and row_index not in table_decision.included_row_indexes
+                ):
+                    continue
+                if is_group_row(row):
+                    current_group_name = clean_group_name(first_non_empty(row)) or current_group_name
+                    continue
+                for record in extract_records_from_row(row, table_decision.columns):
+                    record_pkg = record.pop("_pkg", default_pkg)
+                    record.pop("_raw_fields", None)
+                    if include_debug and source_name:
+                        record["source"] = source_name
+                    if include_debug and item["table"].page_idx is not None:
+                        record["source_page"] = item["table"].page_idx + 1
+                    identity = build_package_identity(record_pkg)
+                    bucket = get_package_bucket(packages, identity)
+                    group = get_or_create_group(bucket, current_group_name)
+                    add_pin_record_to_group(group, record)
+                    extracted_count += 1
 
         if extracted_count:
             debug.update({
                 "status": "extracted",
                 "pin_count": extracted_count,
-                "pkg": default_pkg,
+                "pkg": (
+                    " | ".join(binding.package for binding in plan.bindings)
+                    if plan.is_multi_package
+                    else default_pkg
+                ),
                 "group": group_name,
             })
         else:
@@ -594,6 +645,30 @@ def classify_values(values: list[str]) -> tuple[str, int]:
 # ---------------------------------------------------------------------------
 # 行提取和清洗：这里不再决定表格是否有效
 # ---------------------------------------------------------------------------
+
+
+def extract_records_from_bound_package_row(
+    bound_row: BoundPackageRow,
+) -> list[dict[str, Any]]:
+    """把多封装模块绑定的一行转换为项目统一的 pin 记录。
+
+    package 与列/行关系已经由多封装模块确定；本函数只复用项目统一的
+    pin_no 列表/范围展开和 pin_name 按位置对应规则，不能重新判断封装。
+    """
+
+    pin_numbers = split_pin_numbers(bound_row.pin_no)
+    pin_names = split_parallel_pin_names(bound_row.pin_name, len(pin_numbers))
+    records = []
+    for index, pin_no in enumerate(pin_numbers):
+        record: dict[str, Any] = {
+            "pin_no": pin_no,
+            "pin_name": pin_names[index] if pin_names else bound_row.pin_name,
+            "_pkg": bound_row.package,
+        }
+        if bound_row.pin_type:
+            record["type"] = bound_row.pin_type
+        records.append(record)
+    return records
 
 
 def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> list[dict[str, Any]]:
