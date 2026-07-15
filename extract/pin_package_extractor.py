@@ -20,6 +20,8 @@
   此处输入已经由字段判断确定为 pin_no，因此不限制字母前缀长度。
 * pin_no 和 pin_name 的多个值按位置对应；只有两列拆分后的数量完全一致时才同步拆分。
   数量不一致时保留原 pin_name，不强行猜测对应关系。
+* HTML 单元格中的 ``<br>`` 在表格读取阶段必须保留。只有 pin_no 和 pin_name
+  都具有相同数量的 ``<br>`` 分项时才按行对应；表头、描述和普通空格不按此规则拆分。
 * 当前只对 pin_no 和 pin_name 做跨值同步拆分，不拆 type、description 等其他字段。
 * pin_name 为空填 ``Reserved``；去掉末尾的 ``(数字)`` 和 ``(continued)``。
 * 同一个 pin_no 出现多次时不合并记录；不同 type 也不合并。
@@ -53,6 +55,10 @@ from extract.table_association_rules import (
     resolve_table_package_association,
 )
 from extract.special_table_handlers import find_special_table_match
+from extract.parallel_cell_splitter import (
+    parse_html_cell_text,
+    split_parallel_pin_names as split_parallel_pin_names_by_structure,
+)
 from extract.multi_package_extractor import (
     BoundPackageRow,
     MultiPackagePlan,
@@ -657,7 +663,11 @@ def extract_records_from_bound_package_row(
     """
 
     pin_numbers = split_pin_numbers(bound_row.pin_no)
-    pin_names = split_parallel_pin_names(bound_row.pin_name, len(pin_numbers))
+    pin_names = split_parallel_pin_names(
+        bound_row.pin_name,
+        len(pin_numbers),
+        pin_no_value=bound_row.pin_no,
+    )
     records = []
     for index, pin_no in enumerate(pin_numbers):
         record: dict[str, Any] = {
@@ -698,7 +708,11 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
         # 封装专属编号列优先：每个封装列分别生成自己的 pin 记录。
         for package_header, value in package_columns:
             pin_numbers = split_pin_numbers(value)
-            pin_names = split_parallel_pin_names(fields.get("pin_name", ""), len(pin_numbers))
+            pin_names = split_parallel_pin_names(
+                fields.get("pin_name", ""),
+                len(pin_numbers),
+                pin_no_value=value,
+            )
             for index, pin_no in enumerate(pin_numbers):
                 record = dict(fields)
                 record["pin_no"] = pin_no
@@ -713,7 +727,11 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
 
     pin_value = fields.get("pin_no", "")
     pin_numbers = split_pin_numbers(pin_value)
-    pin_names = split_parallel_pin_names(fields.get("pin_name", ""), len(pin_numbers))
+    pin_names = split_parallel_pin_names(
+        fields.get("pin_name", ""),
+        len(pin_numbers),
+        pin_no_value=pin_value,
+    )
     for index, pin_no in enumerate(pin_numbers):
         record = dict(fields)
         record["pin_no"] = pin_no
@@ -838,24 +856,22 @@ def expand_same_prefix_pin_range(value: str) -> list[str]:
     return [f"{prefix}{number}" for number in range(start, end + 1)]
 
 
-def split_parallel_pin_names(value: str, expected_count: int) -> list[str]:
+def split_parallel_pin_names(
+    value: str,
+    expected_count: int,
+    pin_no_value: str = "",
+) -> list[str]:
     """按 pin_no 数量拆分同一行中的 pin_name。
 
-    只处理 pin_name 自身的显式逗号、分号或斜杠分隔。普通空格不作为
-    分隔符，因为名称可能是 ``Power Supply`` 这样的正常短语。只有拆分
-    后的数量与 pin_no 数量完全相同，才认为两列可以按位置对应。
+    具体的 ``<br>`` 结构判断放在 parallel_cell_splitter.py。本函数保留
+    主提取器中的统一调用入口，避免行提取分支各自实现不同拆分规则。
     """
 
-    value = plain_text(str(value or "")).strip()
-    if expected_count <= 1 or not value:
-        return []
-    # 名称中的普通空格不能作为分隔符，例如 Power Supply。
-    parts = [part.strip() for part in re.split(r"[,，;；/／]+", value) if part.strip()]
-    if len(parts) == expected_count:
-        # 数量相等意味着可以和 pin_no 按索引建立一一对应关系。
-        return parts
-    # 数量不等时不猜测，调用方会把原名称复制到各个 pin 上。
-    return []
+    return split_parallel_pin_names_by_structure(
+        pin_name_value=value,
+        pin_no_value=pin_no_value,
+        expected_count=expected_count,
+    )
 
 
 def normalize_pin_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -894,10 +910,12 @@ TYPE_VALUES = {"i", "o", "io", "i/o", "i/o/z", "oz", "od", "odz", "p", "ipu", "i
 
 
 def parse_html_table(html: str) -> list[list[str]]:
-    """把一个 HTML table 转成按行、按列排列的纯文本二维数组。"""
+    """把 HTML table 转成二维数组，并保留单元格内的显式 ``<br>``。"""
     rows = []
     for tr in TR_RE.finditer(html):
-        row = [plain_text(match.group(2)) for match in CELL_RE.finditer(tr.group(2))]
+        # parse_html_cell_text() 只保留明确的 <br> 结构；后续表头判断仍会
+        # 通过 plain_text() 折叠换行，不会改变模型看到的表头语义。
+        row = [parse_html_cell_text(match.group(2)) for match in CELL_RE.finditer(tr.group(2))]
         if row:
             rows.append(row)
     return rows
@@ -923,8 +941,10 @@ def build_combined_headers(rows: list[list[str]], header_index: int) -> list[str
     for index in range(width):
         parts = []
         for row in rows[: header_index + 1]:
-            if index < len(row) and row[index].strip() and row[index].strip() not in parts:
-                parts.append(row[index].strip())
+            # 表头中的 <br> 只负责视觉排版，在字段判断时仍折叠成普通空格。
+            part = plain_text(row[index]) if index < len(row) else ""
+            if part and part not in parts:
+                parts.append(part)
         result.append(" ".join(parts))
     return result
 
