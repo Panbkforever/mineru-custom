@@ -530,6 +530,26 @@ def _normalize_field_name(value: str) -> str:
     return aliases.get(normalized, normalized)
 
 
+def _header_role(value: str) -> str:
+    """识别多封装子表头中的共享名称列和类型列。
+
+    该函数仍被 ``_resolve_package_column_headers()`` 使用，用来确认
+    ``SSOP/QFN/LQFP`` 等封装列名所在行确实是第二层表头，而不是数据行。
+    横向重复表格的过滤已经迁移到独立模块，不再由本函数负责。
+    """
+
+    text = _normalize_text(value)
+    if re.search(r"\b(?:pin|ball|terminal)\s*(?:no|number)\b", text) or "pin#" in text:
+        return "pin_no"
+    if re.search(r"\b(?:pin|ball|signal|terminal)\s*name\b", text):
+        return "pin_name"
+    if text in {"type", "io", "i o", "i/o"} or re.search(
+        r"\b(?:pin|signal|io|i o)\s*type\b", text
+    ):
+        return "type"
+    return ""
+
+
 def _package_dimension_header_score(value: str) -> int:
     """给明确的 package 控制列表头评分，分数只用于解决列选择。"""
 
