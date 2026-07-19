@@ -90,12 +90,14 @@ try:
     from post_table.restore_cell_line_breaks import (
         restore_cell_line_breaks_in_middle_json,
     )
+    from post_table.split_merged_tables import split_merged_tables_in_file
     POST_TABLE_AVAILABLE = True
     logging.info("post_table module loaded successfully")
 except ImportError as e:
     POST_TABLE_AVAILABLE = False
     correct_min_max_tables_in_middle_json = None
     restore_cell_line_breaks_in_middle_json = None
+    split_merged_tables_in_file = None
     logging.warning("post_table module not available: %s", e)
 
 # =========================
@@ -367,11 +369,12 @@ def run_mineru_pdf(pdf_path: Path) -> Path:
 
 def apply_post_table_correction(output_dir: Path):
     """
-    对 MinerU 输出的 Markdown 文件执行表格 OCR 后处理修正。
+    对 MinerU 输出的 Markdown 文件执行表格结构和 OCR 后处理修正。
     
     处理内容：
-      1. 修正表格中的字符混淆（I/1, O/0, 二/—）
-      2. 展开 HTML 表格的 rowspan/colspan 合并单元格
+      1. 拆分错误合并在一个 <table> 中的多个逻辑子表
+      2. 修正表格中的字符混淆（I/1, O/0, 二/—）
+      3. 展开 HTML 表格的 rowspan/colspan 合并单元格
     
     参数：
         output_dir: MinerU 输出目录（包含 auto/ 或 vlm_*/ 或 hybrid_*/ 子目录）
@@ -403,10 +406,17 @@ def apply_post_table_correction(output_dir: Path):
     for md_file in md_files:
         try:
             logging.info("Processing: %s", md_file.name)
+            # 在 colspan/rowspan 展开前，先按“全宽小节行 + 完整重复表头”
+            # 拆开被 MinerU 错误放进同一 <table> 的多个逻辑子表。
+            split_tables = split_merged_tables_in_file(md_file)
             # fix_markdown_file 会原地修改文件（output_path=None 时覆盖原文件）
             fix_table_ocr(str(md_file), output_path=None)
             write_final_markdown_json(md_file)
-            logging.info("Corrected: %s", md_file.name)
+            logging.info(
+                "Corrected: %s (split logical subtables: %d)",
+                md_file.name,
+                split_tables,
+            )
         except Exception as e:
             logging.warning("Failed to correct %s: %s", md_file.name, e)
 

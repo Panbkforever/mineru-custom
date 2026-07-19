@@ -188,6 +188,9 @@ from post_table.min_max_coordinate_correct import (  # noqa: E402
 from post_table.restore_cell_line_breaks import (  # noqa: E402
     restore_cell_line_breaks_in_middle_json,
 )
+from post_table.split_merged_tables import (  # noqa: E402
+    split_merged_tables_in_file,
+)
 
 
 def write_final_markdown_json(md_path: Path) -> Path:
@@ -214,7 +217,11 @@ def write_final_markdown_json(md_path: Path) -> Path:
 
 def apply_post_table_correction(doc_output_dir: Path) -> tuple[int, int]:
     """
-    对单个文档输出目录中的 Markdown 文件执行表格 OCR 后处理。
+    对单个文档输出目录中的 Markdown 文件执行表格结构和 OCR 后处理。
+
+    固定顺序：先拆分错误合并的逻辑子表，再展开合并单元格并执行字符修正，
+    最后生成与最终 Markdown 一致的同名 JSON。拆表必须排在展开操作之前，
+    否则原始 colspan 提供的全宽小节行证据会丢失。
 
     MinerU 不同 backend 的输出目录结构不同：
       - pipeline: doc_output_dir/auto/
@@ -249,9 +256,16 @@ def apply_post_table_correction(doc_output_dir: Path) -> tuple[int, int]:
             continue
 
         for md_path in md_files:
+            # 必须在 fix_markdown_file 展开 colspan/rowspan 之前执行：
+            # 使用“全宽小节行 + 完整重复表头”把 MinerU 错误合并到一个
+            # <table> 中的多个逻辑子表拆开，并保留原始单元格属性。
+            split_tables = split_merged_tables_in_file(md_path)
             fix_markdown_file(str(md_path))  # output_path=None -> 覆盖原文件
             json_path = write_final_markdown_json(md_path)
-            print(f"  ✅ 已修正: {md_path.name}  ({md_path.parent.name})，同步 JSON: {json_path.name}")
+            print(
+                f"  ✅ 已修正: {md_path.name}  ({md_path.parent.name})，"
+                f"拆分逻辑子表 {split_tables} 个，同步 JSON: {json_path.name}"
+            )
             fixed_count += 1
 
     return fixed_count, skip_count

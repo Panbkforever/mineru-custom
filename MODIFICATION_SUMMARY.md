@@ -29,7 +29,9 @@
 
 - `apply_post_table_correction(doc_output_dir)`
   - 遍历输出目录中的 Markdown。
+  - 先调用 `split_merged_tables_in_file()` 拆分错误合并的逻辑子表。
   - 调用 `post_table/fix_ocr_table.py` 中的 `fix_markdown_file()` 做 Markdown 层面的表格 OCR 修正。
+  - 最后输出与最终 Markdown 完全对应的同名 JSON。
 
 - `main()`
   - 命令行入口。
@@ -632,6 +634,38 @@
 
 ## 表格结构辅助
 
+### `post_table/split_merged_tables.py`
+
+用途：在 Markdown 后处理开始时，拆分被 MinerU 错误合并在同一个
+`<table>` 中的多个逻辑子表。
+
+命中条件：
+
+- 前一段已经存在正常数据行。
+- 分界处是横跨整表的小节标题，后面完整重复前面的单级或多级表头；或者
+  在没有小节标题时，完整表头本身再次出现。
+- 重复表头之后仍然存在正常数据行。
+- 没有 `rowspan` 从分界上方跨越到分界下方。
+
+保护规则：
+
+- 只出现小节标题但没有完整重复表头时不拆。
+- 多级表头只重复一部分时不拆。
+- 多级表头第二层不能单独作为分界。
+- 表头文本比较会统一大小写、空白、`<br>` 和脚注标记，但不会修改输出内容。
+- 拆分发生在 `rowspan/colspan` 展开之前，保留原始单元格属性和换行。
+
+主要函数：
+
+- `split_merged_tables_in_file()`
+  - 文件级入口，原地更新 Markdown 并返回新增 table 数量。
+- `split_merged_tables_in_markdown()`
+  - Markdown 字符串级入口。
+- `split_merged_table_html()`
+  - 使用 BeautifulSoup DOM 分析并重建单个 HTML 表格。
+- `_find_split_boundaries()`
+  - 根据完整重复表头和前后数据行确定所有分界。
+
 ### `post_table/expand_rowspan.py`
 
 用途：展开 HTML 表格中的 rowspan/colspan，方便后处理按二维表格操作。
@@ -657,6 +691,18 @@
   - 删除已处理的 colspan 属性。
 
 ## 测试文件
+
+### `post_table/test_split_merged_tables.py`
+
+用途：验证拆表规则的通用结构约束，不绑定具体 PDF 名或具体小节名称。
+
+覆盖情况：
+
+- 全宽小节标题加完整两级重复表头。
+- 没有小节标题但完整表头再次出现。
+- 只有小节标题、表头重复不完整、多级表头只匹配第二层时保持原表。
+- 一个 HTML 表格中存在多个逻辑分界。
+- `rowspan` 跨越候选分界时禁止拆表。
 
 ### `post_table/test_min_max_coordinate_correct.py`
 
@@ -698,7 +744,9 @@ PDF 解析后的主要后处理顺序如下：
 4. `correct_min_max_tables_in_middle_json()` 修正极限值表格坐标。
 5. `restore_cell_line_breaks_in_middle_json()` 恢复单元格内换行。
 6. 使用对应 backend 的 `union_make()` 重建 Markdown。
-7. `fix_markdown_file()` 执行 Markdown 层面的表格 OCR 修正。
+7. `split_merged_tables_in_file()` 在原始 `colspan/rowspan` 尚未展开时拆分逻辑子表。
+8. `fix_markdown_file()` 展开合并单元格并执行 Markdown 层面的表格 OCR 修正。
+9. 输出与最终 Markdown 一一对应的同名 JSON。
 
 ## 当前风险与后续方向
 
