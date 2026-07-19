@@ -122,9 +122,15 @@ def apply_header_footer_filter(
             try:
                 middle_json = json.loads(middle_path.read_text(encoding="utf-8"))
                 pdf_info = HEADER_FOOTER_FILTER.load_pdf_info_list(middle_json)
+                # 暂停使用页面黑色横线推断正文边界。该规则可能把表格自身的
+                # 上下边框误判为页眉/页脚分界线，进而删除靠近页底的完整表格。
+                filter_config = HEADER_FOOTER_FILTER.FilterConfig(
+                    enable_line_boundary_filter=False,
+                )
                 stats = HEADER_FOOTER_FILTER.filter_headers_and_footers(
                     pdf_info,
                     pdf_path=source_pdf_path,
+                    config=filter_config,
                 )
                 # 极限值表格坐标校正：
                 # 修正 MIN/TYP/NOM/MAX 中的重复与错位，并依据原始

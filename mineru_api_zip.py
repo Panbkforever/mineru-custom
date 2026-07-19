@@ -249,9 +249,15 @@ def apply_header_footer_filter(output_dir: Path, source_pdf_path: Path | None = 
             try:
                 middle_json = json.loads(middle_path.read_text(encoding="utf-8"))
                 pdf_info = HEADER_FOOTER_FILTER.load_pdf_info_list(middle_json)
+                # 与 parse_doc.py 保持一致：关闭横线边界推断，避免把表格边框
+                # 当成页脚分界线后误删位于页面下方的完整表格。
+                filter_config = HEADER_FOOTER_FILTER.FilterConfig(
+                    enable_line_boundary_filter=False,
+                )
                 stats = HEADER_FOOTER_FILTER.filter_headers_and_footers(
                     pdf_info,
                     pdf_path=source_pdf_path,
+                    config=filter_config,
                 )
                 # 修正 MIN/TYP/NOM/MAX 中的重复与错位，并依据原始
                 # colspan 完整展开真正横跨多个极限值列的单元格。
