@@ -30,7 +30,8 @@
 * 开启语义判断时，模型接收初筛后的表格标题、表头和完整表格；模型只返回
   ``should_extract`` 以及 ``pin_no``、``pin_name``、``type`` 的列映射。
 * 表格分组标题只按行首 ``Table xxx``/``表 xxx`` 识别，不要求标题中必须
-  含有 Pin、Signal 等关键词；清理编号和 ``(continued)`` 后作为 group 名。
+  含有 Pin、Signal 等关键词；保留表格编号，仅清理 ``(continued)`` 后作为
+  group 名，便于按原 PDF 表号检索和核对。
 * 初筛后先调用 ``special_table_handlers.py``。特殊表只有完整命中专用规则才
   绕过模型；当前 Reserved/NC 表会直接保留真实 Reserved 行并排除不存在位置。
 * 横向重复的 ``Pin# | Pin Name | Type`` 字段块必须至少完整重复两次且字段
@@ -1007,11 +1008,14 @@ def infer_group_name_from_headers(headers: list[str], package: str = "") -> str:
 
 
 def clean_group_name(value: str) -> str:
-    """去掉 Table 编号和 continued 标记，保留组的语义名称。"""
+    """保留 Table/表格编号，只去掉续表标记并清理多余空格。
+
+    同一张跨页表的后续标题通常只多出 ``(continued)``。删除该标记后，
+    原表和续表仍会得到完全相同的 group 名；保留表号则方便回到 PDF 定位。
+    """
     value = re.sub(r"\s+", " ", plain_text(value)).strip()
     value = re.sub(r"\s*[（(]\s*continued\s*[）)]", "", value, flags=re.IGNORECASE)
-    value = re.sub(r"^(?:table|表格?|表)\s*[\w.\-一二三四五六七八九十百千万]+\s*[:：.\-–—]?\s*", "", value, flags=re.IGNORECASE)
-    return value or ""
+    return value.strip()
 
 
 def infer_package_name(text: str) -> str:

@@ -44,6 +44,7 @@
 - `parse_doc.py` 与 `mineru_api_zip.py` 的后处理逻辑应保持同步。
 - 两个入口当前都显式关闭 `enable_line_boundary_filter`。仍执行显式页眉页脚类型和重复边缘文本过滤，但不再根据页面黑色横线推断正文上下边界，避免将表格自身边框误判为页脚分界线。
 - 表格坐标修复和单元格换行恢复发生在 middle_json 阶段；Markdown OCR 后处理发生在 `.md` 阶段。
+- 提取结果的 group 名保留原始 `Table xxx`/`表格 xxx` 编号，仅删除 `(continued)`；原表和续表仍按相同标题归组，同时可以按 PDF 表号检索。
 
 ### `mineru_api_zip.py`
 
