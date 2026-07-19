@@ -15,8 +15,8 @@
 * package_sections：表内用“XXX Package”分段行切换当前封装；
 * shared_packages：标题明确说明同一套引脚映射同时适用于多个封装。
 
-横向重复的 ``Pin# | Pin Name | Type`` 字段块只是单封装排版，不在这里处理，
-也绝不能因为存在多个 pin_no 列就误判成多封装。
+横向重复的 ``Pin# | Pin Name | Type`` 字段块由主流程在表格判断阶段直接
+过滤，因此不会进入本模块。
 """
 
 from __future__ import annotations
@@ -85,21 +85,13 @@ def analyze_multi_package_table(
 ) -> MultiPackagePlan:
     """按固定优先级判断表格结构，并返回一个多封装提取计划。
 
-    判断顺序不能随意调整：横向重复排版必须最先排除；多个 package 专属
-    pin_no 列是最明确的多封装证据；按行和按分段判断只在表格只有一套
-    pin_no/pin_name 字段时执行。
+    判断顺序不能随意调整：多个 package 专属 pin_no 列是最明确的多封装
+    证据；按行和按分段判断只在表格只有一套 pin_no/pin_name 字段时执行。
     """
 
     # 完整多行表头不能在进入本模块前丢失。headers 是主提取器当前选中的
     # 逐列表头；某些 PDF 的最后一层子表头会暂时位于 data_rows 第一行，
     # package_columns 分支会在严格确认后把该行补回列标题。
-
-    if detect_repeated_horizontal_layout(headers):
-        return MultiPackagePlan(
-            False,
-            "repeated_horizontal_layout",
-            evidence=("检测到重复的 pin_no/pin_name 字段块，按单封装横向排版处理",),
-        )
 
     package_column_plan = detect_package_specific_pin_columns(
         header_rows=header_rows,
@@ -138,30 +130,6 @@ def analyze_multi_package_table(
         "single_package",
         evidence=("未发现足够的多封装结构证据",),
     )
-
-
-def detect_repeated_horizontal_layout(headers: Sequence[str]) -> bool:
-    """识别重复的 Pin#/Pin Name/Type 横向排版，避免误判为多封装。
-
-    这里只在至少两个编号列都能在下一个编号列之前找到各自名称列时命中。
-    多封装专属编号列表通常只有一个共享名称列，因此不会满足此条件。
-    """
-
-    roles = [_header_role(header) for header in headers]
-    pin_positions = [index for index, role in enumerate(roles) if role == "pin_no"]
-    if len(pin_positions) < 2:
-        return False
-
-    matched_blocks = 0
-    for position_index, pin_position in enumerate(pin_positions):
-        next_pin = (
-            pin_positions[position_index + 1]
-            if position_index + 1 < len(pin_positions)
-            else len(roles)
-        )
-        if "pin_name" in roles[pin_position + 1 : next_pin]:
-            matched_blocks += 1
-    return matched_blocks == len(pin_positions)
 
 
 def detect_package_specific_pin_columns(
@@ -560,21 +528,6 @@ def _normalize_field_name(value: str) -> str:
         "io_type": "type",
     }
     return aliases.get(normalized, normalized)
-
-
-def _header_role(value: str) -> str:
-    """只为识别横向重复排版判断明显的编号、名称和类型表头。"""
-
-    text = _normalize_text(value)
-    if re.search(r"\b(?:pin|ball|terminal)\s*(?:no|number)\b", text) or "pin#" in text:
-        return "pin_no"
-    if re.search(r"\b(?:pin|ball|signal|terminal)\s*name\b", text):
-        return "pin_name"
-    if text in {"type", "io", "i o", "i/o"} or re.search(
-        r"\b(?:pin|signal|io|i o)\s*type\b", text
-    ):
-        return "type"
-    return ""
 
 
 def _package_dimension_header_score(value: str) -> int:

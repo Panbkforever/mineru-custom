@@ -33,9 +33,10 @@
   含有 Pin、Signal 等关键词；清理编号和 ``(continued)`` 后作为 group 名。
 * 初筛后先调用 ``special_table_handlers.py``。特殊表只有完整命中专用规则才
   绕过模型；当前 Reserved/NC 表会直接保留真实 Reserved 行并排除不存在位置。
+* 横向重复的 ``Pin# | Pin Name | Type`` 字段块必须至少完整重复两次且字段
+  顺序完全一致才命中；命中后整张表直接排除，不送模型、不进入行提取。
 * 通过表格/字段判断后调用 ``multi_package_extractor.py``。多个封装专属
-  pin_no 列、package 控制列和 package 分段行走多封装分支；横向重复的
-  Pin#/Pin Name/Type 字段块只是单封装排版，不按多封装处理。
+  pin_no 列、package 控制列和 package 分段行走多封装分支。
 * 语义字段判断默认并发数为 4，可通过 ``EXTRACT_SCHEMA_WORKERS`` 覆盖。
 """
 
@@ -58,6 +59,9 @@ from extract.special_table_handlers import find_special_table_match
 from extract.parallel_cell_splitter import (
     parse_html_cell_text,
     split_parallel_pin_names as split_parallel_pin_names_by_structure,
+)
+from extract.repeated_horizontal_table_filter import (
+    is_repeated_horizontal_pin_block_table,
 )
 from extract.multi_package_extractor import (
     BoundPackageRow,
@@ -220,6 +224,12 @@ def extract_pin_package_info_from_table_candidates(
         header_index, headers = choose_header_row(rows, table.title, semantic=use_semantic_classifier)
         if header_index < 0:
             skip(debug, "no_candidate_header")
+            continue
+        # 横向重复字段块是已确认不需要的冗余引脚列表。必须在模型判断和
+        # 多封装分析之前整表排除，不能再按普通单封装表进入行提取。
+        if is_repeated_horizontal_pin_block_table(headers):
+            debug["headers"] = headers
+            skip(debug, "repeated_horizontal_pin_blocks")
             continue
         data_rows = rows[header_index + 1 :]
         if is_ordering_table(headers):
