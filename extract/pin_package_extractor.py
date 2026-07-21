@@ -2,13 +2,14 @@
 
 本文件只做一件事：把表格转换为项目约定的 JSON 结构。
 
-处理流程固定为五个阶段，阶段之间不互相调用：
+处理流程固定为六个阶段，阶段之间不互相调用：
 
 1. 表格判断：判断当前表是不是“物理引脚/封装关系表”。
 2. 字段判断：只判断每一列的语义，不读取行来生成输出记录。
 3. 多封装分析：为真正的多封装表生成 package 与列/行的绑定计划。
-4. 行提取：单封装和多封装走各自独立逻辑，完整读取已经绑定的数据行。
-5. 结果整理：拆分显式 pin_no 分隔符、清洗 pin_name、分组和合并封装别名。
+4. 封装归属：扫描全文证据，并在行提取前一次性确定所有目标表的 pkg。
+5. 行提取：单封装和多封装走各自独立逻辑，完整读取已经绑定的数据行。
+6. 结果整理：拆分显式 pin_no 分隔符、清洗 pin_name、分组和合并封装别名。
 
 特别重要的项目规则：
 
@@ -41,6 +42,11 @@
   顺序完全一致才命中；命中后整张表直接排除，不送模型、不进入行提取。
 * 通过表格/字段判断后调用 ``multi_package_extractor.py``。多个封装专属
   pin_no 列、package 控制列和 package 分段行走多封装分支。
+* ``package_resolver.py`` 只使用表题、当前章节、封装信息表、多封装绑定和
+  引脚集合关系判断 pkg，不调用模型。所有表的归属必须在逐行提取前完成；
+  上一章节标题只属于 group 上下文，不能作为当前表的封装继承证据。
+* 封装证据不足或多个候选冲突时，pkg 保持空字符串，不能根据处理顺序或
+  相同字段名主观合并；不同 package drawing/code 也不能合并成一个封装。
 * 语义字段判断默认并发数为 4，可通过 ``EXTRACT_SCHEMA_WORKERS`` 覆盖。
 """
 
@@ -55,10 +61,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from extract.table_association_rules import (
-    PackageSnapshot,
-    resolve_table_package_association,
-)
 from extract.special_table_handlers import find_special_table_match
 from extract.parallel_cell_splitter import (
     parse_html_cell_text,
@@ -79,6 +81,12 @@ from extract.group_title_context import (
     append_group_subtitle,
     join_group_titles,
 )
+from extract.package_resolver import (
+    PackageTableSource,
+    PackageTargetTable,
+    assignment_to_debug,
+    resolve_document_packages,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +102,9 @@ class TableCandidate:
     # group_context 与 title 必须分开：前者包含跨章节上下文，后者只保存
     # 当前表题并继续用于模型、封装关联和多封装结构分析。
     group_context: str = ""
+    # 两组标题分别保存，封装判断只能读取当前章；上一章仍只用于 group。
+    previous_chapter_titles: tuple[str, ...] = ()
+    current_chapter_titles: tuple[str, ...] = ()
 
 
 @dataclass
@@ -209,12 +220,25 @@ def extract_pin_package_info_from_table_candidates(
     # 转成列表，保证后面可以重复访问候选表；packages 保存最终分组结果。
     candidates = list(tables)
     packages: dict[str, dict[str, Any]] = {}
+    # 全文表格源不能只保存最终通过筛选的引脚表。订购信息表等虽然不会生成
+    # pin 记录，但其中的 Package Drawing/Type/Name 是封装候选的重要证据。
+    all_package_tables: list[PackageTableSource] = []
 
     # 第一阶段：只准备候选表，不创建任何 pin 记录。
     prepared = []
     for table_id, table in enumerate(candidates):
         # 一个候选表对应一个二维字符串数组，后续判断和提取都基于它。
         rows = parse_html_table(table.html)
+        all_package_tables.append(
+            PackageTableSource(
+                table_id=table_id,
+                title=table.title,
+                group_context=table.group_context,
+                previous_chapter_titles=table.previous_chapter_titles,
+                current_chapter_titles=table.current_chapter_titles,
+                rows=tuple(tuple(cell for cell in row) for row in rows),
+            )
+        )
         debug = {
             "table_id": table_id,
             "source": source_name,
@@ -292,7 +316,36 @@ def extract_pin_package_info_from_table_candidates(
         multi_package_plans[item["table_id"]] = plan
         item["debug"]["multi_package_plan"] = plan_to_debug(plan)
 
-    # 第四阶段：只有表格判断和多封装分析都结束后，才允许创建 pin 记录。
+    # 第四阶段：在创建任何 pin 记录前，统一判断全部目标表的封装归属。
+    # 这里不能读取 packages 输出桶，因为那会让结果依赖表格处理顺序。
+    package_targets = [
+        PackageTargetTable(
+            table_id=item["table_id"],
+            title=item["table"].title,
+            current_chapter_titles=item["table"].current_chapter_titles,
+            headers=tuple(item["headers"]),
+            data_rows=tuple(tuple(cell for cell in row) for row in item["data_rows"]),
+            columns=tuple(decisions[item["table_id"]].columns),
+            declared_package=decisions[item["table_id"]].pkg,
+            included_row_indexes=decisions[item["table_id"]].included_row_indexes,
+        )
+        for item in prepared
+        if decisions[item["table_id"]].should_extract
+    ]
+    package_resolution = resolve_document_packages(
+        all_tables=all_package_tables,
+        target_tables=package_targets,
+        multi_package_plans=multi_package_plans,
+    )
+    for item in prepared:
+        assignment = package_resolution.assignments.get(item["table_id"])
+        if assignment is not None:
+            item["debug"]["package_resolution"] = assignment_to_debug(
+                assignment,
+                package_resolution.registry,
+            )
+
+    # 第五阶段：前四个判断阶段全部结束后，才允许创建 pin 记录。
     for item in prepared:
         table_decision = decisions[item["table_id"]]
         debug = item["debug"]
@@ -301,18 +354,9 @@ def extract_pin_package_info_from_table_candidates(
             skip(debug, table_decision.reason or "table_rejected")
             continue
 
-        association = resolve_table_package_association(
-            item["table"].title,
-            item["headers"],
-            item["data_rows"],
-            table_decision.columns,
-            build_package_snapshots(packages),
-        )
-        default_pkg = (
-            table_decision.pkg
-            or association.package
-            or infer_package_name(item["table"].title)
-        )
+        # 单封装表只消费文档级归属结果。证据不足时这里得到空字符串，不能
+        # 再使用旧的“已提取上一表”状态或标题兜底做第二次猜测。
+        default_pkg = package_resolution.package_label(item["table_id"])
         group_name = clean_group_name(
             item["table"].group_context
             or table_decision.group
@@ -332,7 +376,11 @@ def extract_pin_package_info_from_table_candidates(
         if plan.is_multi_package:
             for bound_row in iter_bound_package_rows(plan, item["data_rows"]):
                 for record in extract_records_from_bound_package_row(bound_row):
-                    record_pkg = record.pop("_pkg")
+                    # 多封装绑定仍决定每行属于哪个封装；候选库只负责把该标签
+                    # 转换成包含全部已知别名的稳定显示名称。
+                    record_pkg = package_resolution.registry.display_for_label(
+                        record.pop("_pkg")
+                    )
                     if include_debug and source_name:
                         record["source"] = source_name
                     if include_debug and item["table"].page_idx is not None:
@@ -375,7 +423,10 @@ def extract_pin_package_info_from_table_candidates(
                 "status": "extracted",
                 "pin_count": extracted_count,
                 "pkg": (
-                    " | ".join(binding.package for binding in plan.bindings)
+                    " | ".join(
+                        package_resolution.registry.display_for_label(binding.package)
+                        for binding in plan.bindings
+                    )
                     if plan.is_multi_package
                     else default_pkg
                 ),
@@ -1068,19 +1119,6 @@ def get_package_bucket(packages: dict[str, dict[str, Any]], identity: PackageIde
     return bucket
 
 
-def build_package_snapshots(packages: dict[str, dict[str, Any]]) -> list[PackageSnapshot]:
-    """把已提取结果压缩成关联规则需要的已知封装快照。"""
-    snapshots = []
-    for bucket in packages.values():
-        pins, names = set(), set()
-        for group in bucket["_groups"].values():
-            for pin in group.pin_list:
-                pins.add(pin.get("pin_no", ""))
-                names.add(pin.get("pin_name", "").upper())
-        snapshots.append(PackageSnapshot(bucket.get("pkg", ""), pins, names))
-    return snapshots
-
-
 def get_or_create_group(bucket: dict[str, Any], name: str) -> ExtractedGroup:
     """在封装桶中获取或创建一个表格/小分组。"""
     name = clean_group_name(name) or "Pin/Package Table"
@@ -1134,6 +1172,8 @@ def iter_table_candidates(middle_json: dict[str, Any]) -> list[TableCandidate]:
                         page_idx if isinstance(page_idx, int) else None,
                         table_title,
                         title_context.build_group_context(table_title),
+                        tuple(title_context.previous_chapter_titles),
+                        tuple(title_context.current_chapter_titles),
                     )
                 )
             elif text:
@@ -1170,6 +1210,8 @@ def iter_table_candidates_from_markdown(markdown: str) -> list[TableCandidate]:
                 None,
                 table_title,
                 title_context.build_group_context(table_title),
+                tuple(title_context.previous_chapter_titles),
+                tuple(title_context.current_chapter_titles),
             )
         )
         cursor = match.end()
