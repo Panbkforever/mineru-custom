@@ -24,6 +24,9 @@
 * HTML 单元格中的 ``<br>`` 在表格读取阶段必须保留。只有 pin_no 和 pin_name
   都具有相同数量的 ``<br>`` 分项时才按行对应；表头、描述和普通空格不按此规则拆分。
 * 当前只对 pin_no 和 pin_name 做跨值同步拆分，不拆 type、description 等其他字段。
+* 表格存在 DESCRIPTION 列时，每条输出记录增加 ``description``，取同一原始
+  数据行中的完整描述；一行拆成多个引脚时共享该描述，没有 DESCRIPTION 列
+  的表不输出该字段。DESCRIPTION 由代码按表头补充，不扩大模型职责。
 * pin_name 为空填 ``Reserved``；去掉末尾的 ``(数字)`` 和 ``(continued)``。
 * 同一个 pin_no 出现多次时不合并记录；不同 type 也不合并。
 * 多个 type 列同时存在时，只保留最接近 signal/pin 语义的一个，优先 SIGNAL TYPE、PIN TYPE、I/O TYPE。
@@ -299,6 +302,17 @@ def extract_pin_package_info_from_table_candidates(
     # 此处一次性完成全部表格判断，避免边判断边产出 pin 记录。
     decisions = decide_all_tables(prepared, use_semantic_classifier, include_debug)
 
+    # DESCRIPTION 是最终输出的附加字段，不参与“是否为引脚表”的语义判断。
+    # 因此在模型/规则完成核心字段判断后，再依据已确定的完整表头统一补充，
+    # 保证开启和关闭语义模型时得到相同结果。
+    for item in prepared:
+        decision = decisions[item["table_id"]]
+        if decision.should_extract:
+            decision.columns = append_description_column_decision(
+                decision.columns,
+                item["headers"],
+            )
+
     # 第三阶段：先为所有已经通过判断的表完成多封装结构分析。
     # 此阶段仍然不创建 pin 记录，确保判断和提取完全分离。
     multi_package_plans: dict[int, MultiPackagePlan] = {}
@@ -376,6 +390,16 @@ def extract_pin_package_info_from_table_candidates(
         if plan.is_multi_package:
             for bound_row in iter_bound_package_rows(plan, item["data_rows"]):
                 for record in extract_records_from_bound_package_row(bound_row):
+                    # 多封装绑定对象只保存 pin_no/pin_name/type。description
+                    # 必须使用 row_index 回到同一原始数据行读取，不能从相邻
+                    # 绑定或已经生成的记录继承。
+                    description = read_optional_mapped_field(
+                        item["data_rows"][bound_row.row_index],
+                        table_decision.columns,
+                        "description",
+                    )
+                    if description is not None:
+                        record["description"] = description
                     # 多封装绑定仍决定每行属于哪个封装；候选库只负责把该标签
                     # 转换成包含全部已知别名的稳定显示名称。
                     record_pkg = package_resolution.registry.display_for_label(
@@ -664,6 +688,53 @@ def build_schema_column_decisions(schema: dict[str, Any], headers: list[str]) ->
             continue
         result.append(ColumnDecision(index, safe_header(headers, index), field, 10))
     return result
+
+
+def append_description_column_decision(
+    columns: list[ColumnDecision],
+    headers: list[str],
+) -> list[ColumnDecision]:
+    """表头存在 DESCRIPTION 时补充唯一的 description 列映射。
+
+    description 不参与表格有效性判断，也不交给模型选择。这里在核心字段已经
+    冻结后执行，避免辅助字段影响 pin_no/pin_name/type 的判断结果。
+    """
+
+    result = list(columns)
+    if any(normalize_field_name(column.field_name) == "description" for column in result):
+        return result
+    for index, header in enumerate(headers):
+        if is_description_header(header):
+            result.append(ColumnDecision(index, header, "description", 10))
+            break
+    return result
+
+
+def is_description_header(value: str) -> bool:
+    """识别 DESCRIPTION 及带 Pin/Signal/Terminal 前缀的同义表头。"""
+
+    header = normalize_header(value)
+    header = re.sub(r"\s*\(\s*\d+\s*\)\s*$", "", header).strip()
+    return header in {
+        "description",
+        "pin description",
+        "signal description",
+        "terminal description",
+    }
+
+
+def read_optional_mapped_field(
+    row: list[str],
+    columns: list[ColumnDecision],
+    field_name: str,
+) -> str | None:
+    """读取可选映射字段；未映射返回 None，已映射但单元格为空返回空串。"""
+
+    for column in columns:
+        if normalize_field_name(column.field_name) != field_name:
+            continue
+        return row[column.index].strip() if column.index < len(row) else ""
+    return None
 
 
 def keep_primary_type_decision(columns: list[ColumnDecision], rows: list[list[str]]) -> list[ColumnDecision]:
