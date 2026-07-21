@@ -32,6 +32,9 @@
 * 表格分组标题只按行首 ``Table xxx``/``表 xxx`` 识别，不要求标题中必须
   含有 Pin、Signal 等关键词；保留表格编号，仅清理 ``(continued)`` 后作为
   group 名，便于按原 PDF 表号检索和核对。
+* 每张表的 group 还要包含上一章的全部章节标题、当前章开始到该表之前
+  已出现的全部章节标题以及当前表格标题，各标题使用换行符分隔。章节上下文
+  只用于 group，不替代发送给模型和多封装判断的当前表格标题。
 * 初筛后先调用 ``special_table_handlers.py``。特殊表只有完整命中专用规则才
   绕过模型；当前 Reserved/NC 表会直接保留真实 Reserved 行并排除不存在位置。
 * 横向重复的 ``Pin# | Pin Name | Type`` 字段块必须至少完整重复两次且字段
@@ -71,6 +74,11 @@ from extract.multi_package_extractor import (
     iter_bound_package_rows,
     plan_to_debug,
 )
+from extract.group_title_context import (
+    GroupTitleContextTracker,
+    append_group_subtitle,
+    join_group_titles,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +91,9 @@ class TableCandidate:
     html: str
     page_idx: int | None
     title: str = ""
+    # group_context 与 title 必须分开：前者包含跨章节上下文，后者只保存
+    # 当前表题并继续用于模型、封装关联和多封装结构分析。
+    group_context: str = ""
 
 
 @dataclass
@@ -209,6 +220,7 @@ def extract_pin_package_info_from_table_candidates(
             "source": source_name,
             "page": table.page_idx + 1 if isinstance(table.page_idx, int) else None,
             "title": table.title,
+            "group_context": table.group_context,
             "row_count": len(rows),
             "status": "pending",
             "skip_reason": "",
@@ -302,13 +314,16 @@ def extract_pin_package_info_from_table_candidates(
             or infer_package_name(item["table"].title)
         )
         group_name = clean_group_name(
-            table_decision.group
+            item["table"].group_context
+            or table_decision.group
             or infer_group_name(item["table"].title)
             or infer_group_name_from_headers(item["headers"], default_pkg)
             or "Pin/Package Table"
         )
 
         plan = multi_package_plans[item["table_id"]]
+        # 表内小分组只能追加到这段基础上下文，不能覆盖上一章、当前章和表题。
+        base_group_name = group_name
         current_group_name = group_name
         extracted_count = 0
 
@@ -337,7 +352,10 @@ def extract_pin_package_info_from_table_candidates(
                 ):
                     continue
                 if is_group_row(row):
-                    current_group_name = clean_group_name(first_non_empty(row)) or current_group_name
+                    current_group_name = (
+                        append_group_subtitle(base_group_name, first_non_empty(row))
+                        or current_group_name
+                    )
                     continue
                 for record in extract_records_from_row(row, table_decision.columns):
                     record_pkg = record.pop("_pkg", default_pkg)
@@ -1008,14 +1026,13 @@ def infer_group_name_from_headers(headers: list[str], package: str = "") -> str:
 
 
 def clean_group_name(value: str) -> str:
-    """保留 Table/表格编号，只去掉续表标记并清理多余空格。
+    """逐行清理 group，保留章节上下文中的换行和 Table/表格编号。
 
     同一张跨页表的后续标题通常只多出 ``(continued)``。删除该标记后，
-    原表和续表仍会得到完全相同的 group 名；保留表号则方便回到 PDF 定位。
+    原表和续表仍会得到完全相同的 group 名；每一行标题独立清理，不能再用
+    ``\s+`` 把标题之间的换行折叠成普通空格。
     """
-    value = re.sub(r"\s+", " ", plain_text(value)).strip()
-    value = re.sub(r"\s*[（(]\s*continued\s*[）)]", "", value, flags=re.IGNORECASE)
-    return value.strip()
+    return join_group_titles(value)
 
 
 def infer_package_name(text: str) -> str:
@@ -1102,6 +1119,7 @@ def iter_table_candidates(middle_json: dict[str, Any]) -> list[TableCandidate]:
     """按页面阅读顺序从 middle_json 收集 HTML 表格及附近标题。"""
     result = []
     current_title = ""
+    title_context = GroupTitleContextTracker()
     for page in middle_json.get("pdf_info", []):
         page_idx = page.get("page_idx") if isinstance(page, dict) else None
         recent = []
@@ -1109,10 +1127,21 @@ def iter_table_candidates(middle_json: dict[str, Any]) -> list[TableCandidate]:
             html = span.get("html") if isinstance(span, dict) else None
             text = plain_text((span.get("content") or span.get("text") or "") if isinstance(span, dict) else "")
             if isinstance(html, str) and "<table" in html.lower():
-                result.append(TableCandidate(html, page_idx if isinstance(page_idx, int) else None, current_title or " ".join(recent[-5:])))
+                table_title = current_title or " ".join(recent[-5:])
+                result.append(
+                    TableCandidate(
+                        html,
+                        page_idx if isinstance(page_idx, int) else None,
+                        table_title,
+                        title_context.build_group_context(table_title),
+                    )
+                )
             elif text:
                 # 只有明确的 Table xxx 标题才能替换当前表标题。
                 current_title = extract_table_title(text) or current_title
+                # 章节状态与表题状态相互独立；Table/Figure 标题会由上下文
+                # 模块排除，正文也不会进入章节标题列表。
+                title_context.observe(text)
                 recent.append(text)
                 recent = recent[-10:]
     return result
@@ -1124,13 +1153,25 @@ def iter_table_candidates_from_markdown(markdown: str) -> list[TableCandidate]:
     table_re = re.compile(r"<table\b.*?</table>", re.DOTALL | re.IGNORECASE)
     cursor = 0
     last_title = ""
+    title_context = GroupTitleContextTracker()
     for match in table_re.finditer(markdown):
         before = markdown[cursor : match.start()]
         texts = [plain_text(line).strip() for line in before.splitlines() if plain_text(line).strip()]
         for text in texts:
             # 标题内容不设 Pin/Signal 等关键词限制，只检查 Table xxx 格式。
             last_title = extract_table_title(text) or last_title
-        result.append(TableCandidate(match.group(0), None, last_title or " ".join(texts[-5:])))
+            # 最终 Markdown 只信任带 # 的明确标题，避免把目录项、编号列表
+            # 或正文中的数字开头句子错误收进章节上下文。
+            title_context.observe(text, require_markdown_heading=True)
+        table_title = last_title or " ".join(texts[-5:])
+        result.append(
+            TableCandidate(
+                match.group(0),
+                None,
+                table_title,
+                title_context.build_group_context(table_title),
+            )
+        )
         cursor = match.end()
     return result
 
