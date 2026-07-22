@@ -14,6 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from extract.note_extractor import extract_notes_from_source_files
 from extract.pin_package_extractor import (
     build_extraction_summary,
     extract_pin_package_info_from_middle_json_file,
@@ -128,6 +129,7 @@ def main() -> int:
         else output_path.with_name(f"{output_path.stem}_debug.json")
     )
     extracted = strip_debug_fields(extracted_with_debug)
+    package_count = len(extracted)
     pdf_name = input_path.name if input_path.is_file() else input_path.resolve().name
     summary = build_extraction_summary(extracted_with_debug, pdf_name=pdf_name)
     debug_payload = {
@@ -136,13 +138,20 @@ def main() -> int:
         "table_list": get_last_extraction_debug(),
     }
 
+    # NOTE/注是文档级信息，不参与 package 数量统计，也不归属某个引脚组。
+    # 使用与引脚提取相同的解析源，并把注释对象追加在最终 JSON 数组末尾。
+    notes = extract_notes_from_source_files(source_files)
+    if notes:
+        extracted.append({"notes": notes})
+    debug_payload["notes"] = notes
+
     write_extraction_json(extracted, output_path)
     write_extraction_json(summary, summary_path)
     write_extraction_json(debug_payload, debug_path)
     print(f"引脚/封装字段提取完成: {output_path}")
     print(f"提取信息文件完成: {summary_path}")
     print(f"字段判断调试文件完成: {debug_path}")
-    print(f"提取 package 数: {len(extracted)}")
+    print(f"提取 package 数: {package_count}")
     print(json.dumps(extracted[:1], ensure_ascii=False, indent=2))
     return 0
 
