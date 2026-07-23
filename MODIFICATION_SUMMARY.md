@@ -793,3 +793,38 @@ PDF 解析后的主要后处理顺序如下：
 - `extract/test_required_field_contract.py`
   - 使用结构化通用案例覆盖：模型缺编号列、只有编号列、空编号单元格、
     完全空白行、多封装空编号以及完整字段映射。
+
+## 2026-07-23：全文封装实体识别与 pkg 归属
+
+涉及文件：
+
+- `extract/package_resolver.py`
+  - 把最终 Markdown 按阅读顺序转换为标题、正文和完整表格证据块，每个块
+    使用稳定 `block_id`。
+  - 封装语义模型分块读取全文，只返回具体 `package_identity`、原文名称和
+    证据块 ID。代码拒绝不存在的 block ID、原文中找不到的名称以及只有
+    QFN/BGA/LQFP 等机械家族的结果。
+  - 候选实体按名称、drawing code、pin count 和 device scope 校验合并；
+    相同家族、不同 drawing/device scope 不合并。
+  - 单封装表按“多封装绑定 > 当前表题 > 当前表头 > 语义上下文 > 续表 >
+    同章节唯一归属 > 引脚集合”确定 pkg。
+  - 当前表题和表头中的具体封装优先于上下文候选；二者指向不同具体封装时
+    保持空 pkg 并记录冲突，不进行猜测。
+  - 表级语义归属只能返回候选库已有 `package_id` 和有效证据块 ID，不能
+    创建自由文本封装名。
+  - 全文实体发现默认按约 12000 字符的完整块边界分批、并发 4；封装模型
+    默认超时 60 秒。可分别通过 `EXTRACT_PACKAGE_CHUNK_CHARS`、
+    `EXTRACT_PACKAGE_WORKERS` 和 `EXTRACT_PACKAGE_TIMEOUT` 调整。
+
+- `extract/pin_package_extractor.py`
+  - 最终 JSON 入口把完整 Markdown 证据块传给封装解析阶段。
+  - 封装候选、证据、每表归属模式和拒绝原因写入调试信息。
+  - 表格字段判断和逐行引脚提取职责不变。
+
+- `extract/semantic_classifier.py`
+  - 提取通用 JSON 模型调用底座，字段判断和封装判断使用各自独立的 system
+    prompt，共用网络重试与 JSON 容错逻辑。
+
+- `extract/test_package_semantic_resolution.py`
+  - 使用不依赖具体 PDF 的伪模型结果验证：虚构名称拒绝、表头具体封装优先
+    于表题家族、表题/表头具体身份冲突不猜、表归属只能选择已有 package ID。

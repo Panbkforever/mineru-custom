@@ -51,9 +51,12 @@
   顺序完全一致才命中；命中后整张表直接排除，不送模型、不进入行提取。
 * 通过表格/字段判断后调用 ``multi_package_extractor.py``。多个封装专属
   pin_no 列、package 控制列和 package 分段行走多封装分支。
-* ``package_resolver.py`` 只使用表题、当前章节、封装信息表、多封装绑定和
-  引脚集合关系判断 pkg，不调用模型。所有表的归属必须在逐行提取前完成；
-  上一章节标题只属于 group 上下文，不能作为当前表的封装继承证据。
+* ``package_resolver.py`` 独立读取最终 Markdown 的有序全文块，发现并校验
+  具体封装实体；模型只能引用真实 block_id 和已有 package_id，不能创建
+  自由文本 pkg。所有表的归属必须在逐行提取前完成。
+* 单封装表的 pkg 优先级固定为：多封装绑定、当前表题、当前表头、语义
+  上下文、续表、同章节唯一归属、引脚集合。表题和表头出现冲突的具体封装
+  时保持空字符串；上一章节标题只属于 group，不能作为当前表封装证据。
 * 封装证据不足或多个候选冲突时，pkg 保持空字符串，不能根据处理顺序或
   相同字段名主观合并；不同 package drawing/code 也不能合并成一个封装。
 * 语义字段判断默认并发数为 4，可通过 ``EXTRACT_SCHEMA_WORKERS`` 覆盖。
@@ -91,9 +94,11 @@ from extract.group_title_context import (
     join_group_titles,
 )
 from extract.package_resolver import (
+    PackageDocumentBlock,
     PackageTableSource,
     PackageTargetTable,
     assignment_to_debug,
+    build_package_document_blocks_from_markdown,
     resolve_document_packages,
 )
 
@@ -209,6 +214,9 @@ def extract_pin_package_info_from_markdown_json_file(
         source_name=path.stem,
         include_debug=include_debug,
         use_semantic_classifier=use_semantic_classifier,
+        # pkg 语义阶段必须看到最终 Markdown 的完整有序上下文，而不只是
+        # 已初筛出的引脚表。表格字段模型仍只接收单张完整候选表。
+        package_document_blocks=build_package_document_blocks_from_markdown(markdown),
     )
 
 
@@ -217,6 +225,7 @@ def extract_pin_package_info_from_table_candidates(
     source_name: str = "",
     include_debug: bool = False,
     use_semantic_classifier: bool = False,
+    package_document_blocks: Iterable[PackageDocumentBlock] = (),
 ) -> list[dict[str, Any]]:
     """按“先判断、后提取”的顺序处理表格。
 
@@ -356,7 +365,35 @@ def extract_pin_package_info_from_table_candidates(
         all_tables=all_package_tables,
         target_tables=package_targets,
         multi_package_plans=multi_package_plans,
+        document_blocks=tuple(package_document_blocks),
+        use_semantic_classifier=use_semantic_classifier,
     )
+    if LAST_EXTRACTION_DEBUG:
+        LAST_EXTRACTION_DEBUG[0]["package_candidates"] = [
+            {
+                "package_key": candidate.key,
+                "names": list(candidate.aliases),
+                "drawing_code": candidate.drawing_code,
+                "family": candidate.family,
+                "pin_count": candidate.pin_count,
+                "role": candidate.role,
+                "device_scope": candidate.device_scope,
+                "evidence": [
+                    {
+                        "source": evidence.source,
+                        "table_id": evidence.table_id,
+                        "block_id": evidence.block_id,
+                        "detail": evidence.detail,
+                        "confidence": evidence.confidence,
+                    }
+                    for evidence in candidate.evidence
+                ],
+            }
+            for candidate in package_resolution.registry.candidates.values()
+        ]
+        LAST_EXTRACTION_DEBUG[0]["package_diagnostics"] = (
+            package_resolution.diagnostics
+        )
     for item in prepared:
         assignment = package_resolution.assignments.get(item["table_id"])
         if assignment is not None:
