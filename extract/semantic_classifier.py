@@ -58,7 +58,9 @@ def build_schema_prompt_payload(
         ),
         "rules": [
             "Use semantic meaning, not exact header names only.",
-            "Return should_extract=true only when rows express physical pin, ball, or terminal identifiers and their names/signals.",
+            "Return should_extract=true only when the table has at least one column containing physical pin, ball, or terminal identifiers.",
+            "If there is no physical pin_no, ball-number, or terminal-number column, return should_extract=false even when the table contains logical Pin Name, Signal Name, Type, Mode, or Function columns.",
+            "A pin_name column is optional. A physical-number-only table may still be extracted because missing names are filled as Reserved by deterministic code.",
             "If different packages have separate physical pin/ball number columns, return every one of those columns as pin_no; do not select only one package.",
             "For multiple name-like columns, select only the column that is the actual physical pin/signal name.",
             "For multiple type-like columns, select only the type most directly describing the pin/signal, such as SIGNAL TYPE rather than BUFFER TYPE.",

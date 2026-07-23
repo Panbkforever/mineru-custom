@@ -763,3 +763,33 @@ PDF 解析后的主要后处理顺序如下：
 - 单案例验证只能作为回归样本。
   - 不能用单个 PDF 或单个表格证明通用正确。
   - 更可靠的验证方式应包括多文件批量对比、抽样人工检查、统计修正前后差异。
+
+## 2026-07-23：物理引脚字段最低契约
+
+涉及文件：
+
+- `extract/pin_package_extractor.py`
+  - `decision_from_schema(...)`：模型返回 `should_extract=true` 后，由代码再次
+    检查是否存在 `pin_no` 映射；缺失时以
+    `semantic_missing_pin_no_column` 明确拒绝。
+  - `has_pin_number_column(...)`：统一定义物理引脚表的最低字段要求，只强制
+    `pin_no`，不再强制 `pin_name`。
+  - `is_pin_package_table(...)`：无模型规则分支同步采用同一最低字段契约。
+  - `extract_records_from_row(...)`、`extract_records_from_bound_package_row(...)`：
+    已确定 `pin_no` 列后，空编号单元格保留为 `pin_no: ""`；`pin_name`
+    整列缺失或单元格为空时，由最终清洗统一填充 `Reserved`。
+  - 单封装行循环跳过完全空白的 HTML 排版行，避免生成空编号占位记录。
+
+- `extract/multi_package_extractor.py`
+  - `iter_bound_package_rows(...)`：多封装绑定已经确定 `pin_no` 列后，不再
+    因该行编号为空而提前丢行。
+  - `_is_structural_group_row(...)`：完全空白行仍作为排版占位跳过。
+
+- `extract/semantic_classifier.py`
+  - 模型提示明确要求：没有物理 Pin/Ball/Terminal 编号列时必须返回
+    `should_extract=false`；`pin_name` 可选，缺失名称由确定性代码补
+    `Reserved`。
+
+- `extract/test_required_field_contract.py`
+  - 使用结构化通用案例覆盖：模型缺编号列、只有编号列、空编号单元格、
+    完全空白行、多封装空编号以及完整字段映射。

@@ -14,6 +14,12 @@
 特别重要的项目规则：
 
 * 一列一旦被判定为需要字段，就不因为某一行为空而跳过该行。
+* 物理引脚表必须存在 pin_no 列映射；模型即使返回 ``should_extract=true``，
+  缺少 pin_no 映射时仍由代码明确拒绝，不能进入行提取后静默得到空结果。
+* pin_name 不是表级必需字段。整张表没有 pin_name 列或某行 pin_name 为空时，
+  该行仍保留，并在最终清洗阶段统一填充为 ``Reserved``。
+* 已确定存在 pin_no 列后，某个数据行的 pin_no 单元格为空也保留为
+  ``pin_no: ""``；完全空白的结构占位行不属于数据行，仍然跳过。
 * pin_no 按原文中的空格、逗号、斜杠等显式分隔符拆分。
 * 对同一字母前缀且数字递增的范围进行展开，例如 A1-A5 展开为 A1、A2、A3、A4、A5；
   前后字母不同的 A1-C3 不展开，数字倒序的 A5-A1 也不展开。
@@ -423,6 +429,10 @@ def extract_pin_package_info_from_table_candidates(
                     and row_index not in table_decision.included_row_indexes
                 ):
                     continue
+                # 完全空白行只是 HTML 排版占位，不属于项目要求保留的数据行。
+                # 只要该行还有名称、类型或其他已解析内容，空 pin_no 仍会保留。
+                if not any(cell.strip() for cell in row):
+                    continue
                 if is_group_row(row):
                     current_group_name = (
                         append_group_subtitle(base_group_name, first_non_empty(row))
@@ -541,7 +551,7 @@ def decide_table_by_rules(item: dict[str, Any]) -> TableDecision:
 
     columns = keep_primary_type_decision(item["rule_columns"], item["data_rows"])
     if not is_pin_package_table(columns):
-        return TableDecision(False, reason="missing_pin_name_or_number_column", columns=columns)
+        return TableDecision(False, reason="missing_pin_number_column", columns=columns)
     return TableDecision(
         True,
         table_role="rule_pin_table",
@@ -562,6 +572,15 @@ def decision_from_schema(schema: dict[str, Any], item: dict[str, Any]) -> TableD
 
     # 列映射完全来自模型返回的 column_index 和 field。
     columns = build_schema_column_decisions(schema, item["headers"])
+    # 模型输出属于不可信的字段判断结果。物理引脚记录必须有 pin_no 映射；
+    # pin_name 则允许缺失，后续逐行创建记录后统一补成 Reserved。
+    if not has_pin_number_column(columns):
+        return TableDecision(
+            False,
+            table_role="semantic_selected",
+            reason="semantic_missing_pin_no_column",
+            columns=columns,
+        )
     return TableDecision(
         True,
         table_role="semantic_selected",
@@ -641,19 +660,22 @@ def is_ordering_table(headers: list[str]) -> bool:
     return "orderable device" in text and sum(word in text for word in words) >= 2
 
 
-def has_required_columns(columns: list[ColumnDecision]) -> bool:
-    """检查字段判断结果是否同时包含编号列和名称列。"""
+def has_pin_number_column(columns: list[ColumnDecision]) -> bool:
+    """检查字段判断结果是否包含生成物理引脚记录所需的编号列。"""
+
     fields = {normalize_field_name(c.field_name) for c in columns}
-    return bool(fields & {"pin_no", "package_pin_no"}) and bool(fields & {"pin_name"})
+    return bool(fields & {"pin_no", "package_pin_no"})
 
 
 def is_pin_package_table(columns: list[ColumnDecision]) -> bool:
     """检查字段映射是否具有真实引脚表的最小结构。"""
-    if not has_required_columns(columns):
+
+    # pin_name 不是最低结构要求：只有编号列的 Reserved/NC 表仍要输出，
+    # 名称由最终清洗阶段补成 Reserved。
+    if not has_pin_number_column(columns):
         return False
     number = [c for c in columns if normalize_field_name(c.field_name) in {"pin_no", "package_pin_no"}]
-    name = [c for c in columns if normalize_field_name(c.field_name) == "pin_name"]
-    return any(classify_header(c.raw_header)[1] >= 3 for c in number) and any(classify_header(c.raw_header)[1] >= 3 for c in name)
+    return any(classify_header(c.raw_header)[1] >= 3 for c in number)
 
 
 # ---------------------------------------------------------------------------
@@ -813,7 +835,9 @@ def extract_records_from_bound_package_row(
     pin_no 列表/范围展开和 pin_name 按位置对应规则，不能重新判断封装。
     """
 
-    pin_numbers = split_pin_numbers(bound_row.pin_no)
+    # 绑定计划已经证明该列是该封装的 pin_no。单元格为空属于原始数据，
+    # 不能再通过空列表静默丢行，因此用一个空编号保留该条记录。
+    pin_numbers = split_pin_numbers(bound_row.pin_no) or [""]
     pin_names = split_parallel_pin_names(
         bound_row.pin_name,
         len(pin_numbers),
@@ -858,7 +882,8 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
     if package_columns:
         # 封装专属编号列优先：每个封装列分别生成自己的 pin 记录。
         for package_header, value in package_columns:
-            pin_numbers = split_pin_numbers(value)
+            # 列映射已经确定；空单元格仍要生成 pin_no="" 的记录。
+            pin_numbers = split_pin_numbers(value) or [""]
             pin_names = split_parallel_pin_names(
                 fields.get("pin_name", ""),
                 len(pin_numbers),
@@ -877,7 +902,9 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
             return records
 
     pin_value = fields.get("pin_no", "")
-    pin_numbers = split_pin_numbers(pin_value)
+    # 表级判断已保证存在 pin_no 映射。这里的空字符串只表示当前数据行
+    # 编号为空，不代表字段缺失，因此仍保留一条空编号记录。
+    pin_numbers = split_pin_numbers(pin_value) or [""]
     pin_names = split_parallel_pin_names(
         fields.get("pin_name", ""),
         len(pin_numbers),

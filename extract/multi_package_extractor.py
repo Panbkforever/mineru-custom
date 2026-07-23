@@ -371,9 +371,8 @@ def iter_bound_package_rows(
             if _is_structural_group_row(row):
                 continue
             pin_no = _cell(row, binding.pin_no_column)
-            # 没有物理编号时不能生成空 pin_no；该行的其他封装绑定仍会独立处理。
-            if not pin_no:
-                continue
+            # 绑定计划已经确定该列就是当前封装的 pin_no。单元格为空属于
+            # 原始行数据，交给统一行提取函数保留为 pin_no=""，不能在此丢行。
             yield BoundPackageRow(
                 package=binding.package,
                 row_index=row_index,
@@ -645,7 +644,11 @@ def _is_structural_group_row(row: Sequence[str]) -> bool:
     """跳过只有一个重复文本的结构标题行，不把标题当成物理引脚。"""
 
     values = [str(cell).strip() for cell in row if str(cell).strip()]
-    if not values or not (len(values) == 1 or len(set(values)) == 1):
+    # 完全空白行是排版占位，也必须在绑定前跳过；有其他字段内容但
+    # pin_no 为空的行不在这里跳过，后续会保留为 pin_no=""。
+    if not values:
+        return True
+    if not (len(values) == 1 or len(set(values)) == 1):
         return False
     # 只有 pin_no 的 Reserved 行仍是合法数据，不能因为其他字段为空就跳过。
     return not _looks_like_pin_value(values[0])
