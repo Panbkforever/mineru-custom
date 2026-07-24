@@ -17,6 +17,9 @@
 
 横向重复的 ``Pin# | Pin Name | Type`` 字段块由主流程在表格判断阶段直接
 过滤，因此不会进入本模块。
+
+DESCRIPTION 是只读附加字段，不是封装维度。无论其表头或数据内容是否出现
+Package/PKG/封装，本模块都不能把它作为 package 控制列。
 """
 
 from __future__ import annotations
@@ -553,6 +556,10 @@ def _package_dimension_header_score(value: str) -> int:
     """给明确的 package 控制列表头评分，分数只用于解决列选择。"""
 
     text = _normalize_text(value)
+    # 组合表头偶尔会误带首条数据。DESCRIPTION 中出现
+    # “TSSOP package”等说明文字时仍然只是描述列，不能触发多封装。
+    if re.search(r"\bdescription\b", text) or "描述" in text:
+        return 0
     if text in {"package", "pkg", "封装"}:
         return 4
     if any(phrase in text for phrase in ("package drawing", "package name", "package type")):

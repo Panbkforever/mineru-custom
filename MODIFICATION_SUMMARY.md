@@ -858,3 +858,22 @@ PDF 解析后的主要后处理顺序如下：
 - `extract/test_package_semantic_resolution.py`
   - 新增通用测试覆盖：别名只内部保存、表题别名优先、最终桶只输出一个
     高优先级名称，以及不同 package key 必须生成不同外层对象。
+
+## 2026-07-24：隔离 DESCRIPTION 与封装判断
+
+涉及文件：
+
+- `extract/pin_package_extractor.py`
+  - DESCRIPTION 是只读附加字段，不参与 pin、type 或 package 字段判断。
+  - 组合表头即使误带首行 description 文字，也不能因为其中出现 package、
+    pin、ball 等词提高核心字段分数，避免数据行被错选为表头。
+  - DESCRIPTION 表头允许识别后方误附加的首行文字，作为异常输入防御，但
+    附加文字不会改变该列的 description 语义。
+
+- `extract/multi_package_extractor.py`
+  - package 控制列评分明确排除 DESCRIPTION/描述语义列，说明文字中出现
+    Package/PKG/封装不再触发多封装分支。
+
+- `extract/test_description_output.py`
+  - 使用通用三列表格验证：首条描述含 package 时仍选择正确表头、description
+    不能成为 package 控制列、最终不能按每条描述拆出多个虚假封装。

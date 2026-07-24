@@ -33,6 +33,9 @@
 * 表格存在 DESCRIPTION 列时，每条输出记录增加 ``description``，取同一原始
   数据行中的完整描述；一行拆成多个引脚时共享该描述，没有 DESCRIPTION 列
   的表不输出该字段。DESCRIPTION 由代码按表头补充，不扩大模型职责。
+* DESCRIPTION 列是只读附加字段，其表头和单元格内容都不能参与 pin、type
+  或 package 字段判断。即使描述中出现 package、pin、ball 等词，也不能
+  改变表头边界或触发多封装分支。
 * pin_name 为空填 ``Reserved``；去掉末尾的 ``(数字)`` 和 ``(continued)``。
 * 同一个 pin_no 出现多次时不合并记录；不同 type 也不合并。
 * 多个 type 列同时存在时，只保留最接近 signal/pin 语义的一个，优先 SIGNAL TYPE、PIN TYPE、I/O TYPE。
@@ -809,16 +812,21 @@ def append_description_column_decision(
 
 
 def is_description_header(value: str) -> bool:
-    """识别 DESCRIPTION 及带 Pin/Signal/Terminal 前缀的同义表头。"""
+    """识别 DESCRIPTION 列，并隔离误附加在表头后的首行描述文字。
+
+    正常情况下表头选择应停在真正的 DESCRIPTION 表头。这里仍接受
+    ``DESCRIPTION <首行文字>``，是为了保证异常组合表头不会再被解释成
+    package/type 等其他字段；附加文字只影响 description，不改变列语义。
+    """
 
     header = normalize_header(value)
     header = re.sub(r"\s*\(\s*\d+\s*\)\s*$", "", header).strip()
-    return header in {
-        "description",
-        "pin description",
-        "signal description",
-        "terminal description",
-    }
+    return bool(
+        re.match(
+            r"^(?:(?:pin|signal|terminal)\s+)?description(?:\s|$)",
+            header,
+        )
+    )
 
 
 def read_optional_mapped_field(
@@ -864,6 +872,11 @@ def classify_header(header: str) -> tuple[str, int]:
     """根据表头文字返回标准字段名和表头匹配分数。"""
     h = normalize_header(header)
     if not h:
+        return "", 0
+    # DESCRIPTION 只在核心字段判断结束后由
+    # append_description_column_decision() 补充。必须先截断其余规则，
+    # 否则首行描述里的 package/pin/type 等普通词会污染字段评分。
+    if is_description_header(h):
         return "", 0
     if any(word in h for word in ("pin no", "pin number", "ball no", "ball number", "terminal no", "terminal number", "引脚编号", "端子编号")):
         return "pin_no", 5
