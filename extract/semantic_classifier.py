@@ -6,7 +6,7 @@
 2. 表格需要提取时，把目标列映射为 ``pin_no``、``pin_name`` 或 ``type``。
 
 模型不判断封装名、分组名或表格角色，也不生成最终引脚记录。后续逐行提取、
-字段清洗、封装归并和分组均由 ``pin_package_extractor.py`` 负责。
+字段清洗、结构槽位分组均由 ``pin_package_extractor.py`` 负责。
 """
 
 from __future__ import annotations
@@ -87,40 +87,11 @@ def build_schema_prompt_payload(
 
 
 def call_deepseek_json(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
-    """调用字段判断模型；保留旧函数名供现有调用方使用。"""
-
-    return call_model_json(
-        payload,
-        api_key=api_key,
-        system_prompt=(
-            "You only decide whether one complete semiconductor datasheet table should "
-            "be extracted and map its needed columns. Return valid JSON containing only "
-            "should_extract and columns. Do not return any other fields or final pin records."
-        ),
-    )
-
-
-def call_model_json(
-    payload: dict[str, Any],
-    *,
-    api_key: str,
-    system_prompt: str,
-    max_tokens: int | None = None,
-    timeout: float | None = None,
-) -> dict[str, Any]:
-    """调用兼容 OpenAI Chat Completions 的模型并返回 JSON。
-
-    字段判断和封装语义判断共用这里的网络、重试和 JSON 容错逻辑，但分别
-    提供自己的 system prompt，避免两个模型任务互相污染。
-    """
+    """调用唯一的字段判断模型并返回 JSON。"""
 
     base_url = os.getenv("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL).rstrip("/")
     model = os.getenv("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL)
-    request_timeout = (
-        timeout
-        if timeout is not None
-        else float(os.getenv("DEEPSEEK_TIMEOUT", "30"))
-    )
+    request_timeout = float(os.getenv("DEEPSEEK_TIMEOUT", "30"))
     url = f"{base_url}/chat/completions"
 
     body = {
@@ -128,7 +99,11 @@ def call_model_json(
         "messages": [
             {
                 "role": "system",
-                "content": system_prompt,
+                "content": (
+                    "You only decide whether one complete semiconductor datasheet table should "
+                    "be extracted and map its needed columns. Return valid JSON containing only "
+                    "should_extract and columns. Do not return any other fields or final pin records."
+                ),
             },
             {
                 "role": "user",
@@ -137,11 +112,7 @@ def call_model_json(
         ],
         "response_format": {"type": "json_object"},
         "temperature": 0,
-        "max_tokens": (
-            max_tokens
-            if max_tokens is not None
-            else int(os.getenv("DEEPSEEK_MAX_TOKENS", "3000"))
-        ),
+        "max_tokens": int(os.getenv("DEEPSEEK_MAX_TOKENS", "3000")),
         "stream": False,
     }
 

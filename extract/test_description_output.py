@@ -132,7 +132,7 @@ class DescriptionOutputTest(unittest.TestCase):
         result = extract_pin_package_info_from_table_candidates([table])
 
         self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["pkg"], "")
+        self.assertEqual(result[0]["pkg"], "a")
         pins = result[0]["group_list"][0]["pin_list"]
         self.assertEqual(
             [(pin["pin_no"], pin["pin_name"]) for pin in pins],

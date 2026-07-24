@@ -877,3 +877,27 @@ PDF 解析后的主要后处理顺序如下：
 - `extract/test_description_output.py`
   - 使用通用三列表格验证：首条描述含 package 时仍选择正确表头、description
     不能成为 package 控制列、最终不能按每条描述拆出多个虚假封装。
+
+## 2026-07-24：删除真实 pkg 识别，改为匿名结构分组
+
+当前规则取代前述所有真实封装名识别和封装实体归属规则。
+
+- 删除 `extract/package_resolver.py`
+  - 不再扫描全文、标题、表头、DESCRIPTION 或引脚集合识别真实封装名称。
+  - 不再调用模型发现封装实体，也不再维护 drawing、family、pin count、
+    alias、package key 或跨表封装归属。
+- 删除 `extract/table_association_rules.py`
+  - 不再依据标题名称、引脚重合度或上一张表推断补充表属于哪个真实封装。
+- `extract/pin_package_extractor.py`
+  - 单封装表统一进入内部结构槽位 0。
+  - 多封装表仍由 `multi_package_extractor.py` 判断列、行和分段结构，但表头
+    中的封装文字只用于建立当前表内绑定，不作为输出名称。
+  - 多封装绑定按原表先后顺序进入槽位 0、1、2……；不同表只按槽位序号汇总。
+  - 最终序列化时才把非空槽位依次写为 `pkg: "a"`、`"b"`、`"c"`；超过
+    26 个槽位后继续使用 `aa`、`ab`。
+- `extract/semantic_classifier.py`
+  - 模型只判断表格是否需要提取以及 `pin_no`、`pin_name`、`type` 列，
+    不再存在供封装识别复用的通用模型调用入口。
+- 删除 `extract/test_package_resolver.py` 和
+  `extract/test_package_semantic_resolution.py`，新增
+  `extract/test_package_slot_grouping.py` 验证匿名槽位分组。

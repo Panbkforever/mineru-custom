@@ -2,14 +2,13 @@
 
 本文件只做一件事：把表格转换为项目约定的 JSON 结构。
 
-处理流程固定为六个阶段，阶段之间不互相调用：
+处理流程固定为五个阶段，阶段之间不互相调用：
 
 1. 表格判断：判断当前表是不是“物理引脚/封装关系表”。
 2. 字段判断：只判断每一列的语义，不读取行来生成输出记录。
-3. 多封装分析：为真正的多封装表生成 package 与列/行的绑定计划。
-4. 封装归属：扫描全文证据，并在行提取前一次性确定所有目标表的 pkg。
-5. 行提取：单封装和多封装走各自独立逻辑，完整读取已经绑定的数据行。
-6. 结果整理：拆分显式 pin_no 分隔符、清洗 pin_name、按单一 pkg 名称分组。
+3. 多封装分析：只按表格结构生成多个编号列/行的绑定计划。
+4. 行提取：单封装和多封装走各自独立逻辑，完整读取已经绑定的数据行。
+5. 结果整理：清洗字段并按结构槽位分组，最后依次输出 pkg=a、b、c。
 
 特别重要的项目规则：
 
@@ -34,7 +33,7 @@
   数据行中的完整描述；一行拆成多个引脚时共享该描述，没有 DESCRIPTION 列
   的表不输出该字段。DESCRIPTION 由代码按表头补充，不扩大模型职责。
 * DESCRIPTION 列是只读附加字段，其表头和单元格内容都不能参与 pin、type
-  或 package 字段判断。即使描述中出现 package、pin、ball 等词，也不能
+  或多封装结构判断。即使描述中出现 package、pin、ball 等词，也不能
   改变表头边界或触发多封装分支。
 * pin_name 为空填 ``Reserved``；去掉末尾的 ``(数字)`` 和 ``(continued)``。
 * 同一个 pin_no 出现多次时不合并记录；不同 type 也不合并。
@@ -53,20 +52,14 @@
 * 横向重复的 ``Pin# | Pin Name | Type`` 字段块必须至少完整重复两次且字段
   顺序完全一致才命中；命中后整张表直接排除，不送模型、不进入行提取。
 * 通过表格/字段判断后调用 ``multi_package_extractor.py``。多个封装专属
-  pin_no 列、package 控制列和 package 分段行走多封装分支。
-* ``package_resolver.py`` 独立读取最终 Markdown 的有序全文块，发现并校验
-  具体封装实体；模型只能引用真实 block_id 和已有 package_id，不能创建
-  自由文本 pkg。所有表的归属必须在逐行提取前完成。
-* 单封装表的 pkg 优先级固定为：多封装绑定、当前表题、当前表头、语义
-  上下文、续表、同章节唯一归属、引脚集合。表题和表头出现冲突的具体封装
-  时保持空字符串；上一章节标题只属于 group，不能作为当前表封装证据。
-* 封装证据不足或多个候选冲突时，pkg 保持空字符串，不能根据处理顺序或
-  相同字段名主观合并；不同 package drawing/code 也不能合并成一个封装。
-* 同一封装实体允许在内部保存多个别名，但最终 ``pkg`` 只能输出一个名称。
-  当前表题命中的名称优先，其次是当前表头，再使用文档级规范名称；禁止用
-  ``|`` 拼接别名。真正的多个封装必须输出为多个外层 package 对象。
-* pkg 通常不超过 15 个字符。长度只参与候选名称排序，不能截断原文；多个
-  候选无法确定唯一归属时保持空字符串，不能为了填值而任意选择。
+  pin_no 列、package 控制列和 package 分段行走多封装分支；其中的 package
+  文字只用于判断结构和绑定列，绝不作为最终 pkg 名称。
+* 不再识别真实封装名称，也不扫描全文、标题、表头或 DESCRIPTION 猜测 pkg。
+  单封装表固定进入内部槽位 0；多封装表按绑定在原表中的先后顺序进入槽位
+  0、1、2……。不同表只按槽位序号汇总，不按任何封装字符串归并。
+* 最终 JSON 序列化时，非空槽位按序输出 ``pkg: "a"``、``"b"``、``"c"``；
+  超过 26 个槽位后继续使用 ``aa``、``ab``。字母只是稳定分组编号，不表示
+  真实封装名称，也不能反向参与表格或字段判断。
 * 语义字段判断默认并发数为 4，可通过 ``EXTRACT_SCHEMA_WORKERS`` 覆盖。
 """
 
@@ -100,14 +93,6 @@ from extract.group_title_context import (
     GroupTitleContextTracker,
     append_group_subtitle,
     join_group_titles,
-)
-from extract.package_resolver import (
-    PackageDocumentBlock,
-    PackageTableSource,
-    PackageTargetTable,
-    assignment_to_debug,
-    build_package_document_blocks_from_markdown,
-    resolve_document_packages,
 )
 
 
@@ -143,7 +128,6 @@ class TableDecision:
 
     should_extract: bool
     table_role: str = ""
-    pkg: str = ""
     group: str = ""
     reason: str = ""
     confidence: float = 0.0
@@ -156,18 +140,6 @@ class TableDecision:
 class ExtractedGroup:
     group: str
     pin_list: list[dict[str, Any]] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class PackageIdentity:
-    display: str
-    key: str
-    pin_count: str = ""
-    family: str = ""
-    code: str = ""
-    # priority 表示 display 的证据等级。相同内部 key 遇到不同别名时，
-    # 只有更直接的表题/表头证据才能替换当前显示名称。
-    priority: int = 0
 
 
 LAST_EXTRACTION_DEBUG: list[dict[str, Any]] = []
@@ -225,9 +197,6 @@ def extract_pin_package_info_from_markdown_json_file(
         source_name=path.stem,
         include_debug=include_debug,
         use_semantic_classifier=use_semantic_classifier,
-        # pkg 语义阶段必须看到最终 Markdown 的完整有序上下文，而不只是
-        # 已初筛出的引脚表。表格字段模型仍只接收单张完整候选表。
-        package_document_blocks=build_package_document_blocks_from_markdown(markdown),
     )
 
 
@@ -236,7 +205,6 @@ def extract_pin_package_info_from_table_candidates(
     source_name: str = "",
     include_debug: bool = False,
     use_semantic_classifier: bool = False,
-    package_document_blocks: Iterable[PackageDocumentBlock] = (),
 ) -> list[dict[str, Any]]:
     """按“先判断、后提取”的顺序处理表格。
 
@@ -246,28 +214,15 @@ def extract_pin_package_info_from_table_candidates(
 
     global LAST_EXTRACTION_DEBUG
     LAST_EXTRACTION_DEBUG = []
-    # 转成列表，保证后面可以重复访问候选表；packages 保存最终分组结果。
+    # 转成列表，保证后面可以重复访问候选表；packages 保存结构槽位分组结果。
     candidates = list(tables)
-    packages: dict[str, dict[str, Any]] = {}
-    # 全文表格源不能只保存最终通过筛选的引脚表。订购信息表等虽然不会生成
-    # pin 记录，但其中的 Package Drawing/Type/Name 是封装候选的重要证据。
-    all_package_tables: list[PackageTableSource] = []
+    packages: dict[int, dict[str, Any]] = {}
 
     # 第一阶段：只准备候选表，不创建任何 pin 记录。
     prepared = []
     for table_id, table in enumerate(candidates):
         # 一个候选表对应一个二维字符串数组，后续判断和提取都基于它。
         rows = parse_html_table(table.html)
-        all_package_tables.append(
-            PackageTableSource(
-                table_id=table_id,
-                title=table.title,
-                group_context=table.group_context,
-                previous_chapter_titles=table.previous_chapter_titles,
-                current_chapter_titles=table.current_chapter_titles,
-                rows=tuple(tuple(cell for cell in row) for row in rows),
-            )
-        )
         debug = {
             "table_id": table_id,
             "source": source_name,
@@ -356,64 +311,9 @@ def extract_pin_package_info_from_table_candidates(
         multi_package_plans[item["table_id"]] = plan
         item["debug"]["multi_package_plan"] = plan_to_debug(plan)
 
-    # 第四阶段：在创建任何 pin 记录前，统一判断全部目标表的封装归属。
-    # 这里不能读取 packages 输出桶，因为那会让结果依赖表格处理顺序。
-    package_targets = [
-        PackageTargetTable(
-            table_id=item["table_id"],
-            title=item["table"].title,
-            current_chapter_titles=item["table"].current_chapter_titles,
-            headers=tuple(item["headers"]),
-            data_rows=tuple(tuple(cell for cell in row) for row in item["data_rows"]),
-            columns=tuple(decisions[item["table_id"]].columns),
-            declared_package=decisions[item["table_id"]].pkg,
-            included_row_indexes=decisions[item["table_id"]].included_row_indexes,
-        )
-        for item in prepared
-        if decisions[item["table_id"]].should_extract
-    ]
-    package_resolution = resolve_document_packages(
-        all_tables=all_package_tables,
-        target_tables=package_targets,
-        multi_package_plans=multi_package_plans,
-        document_blocks=tuple(package_document_blocks),
-        use_semantic_classifier=use_semantic_classifier,
-    )
-    if LAST_EXTRACTION_DEBUG:
-        LAST_EXTRACTION_DEBUG[0]["package_candidates"] = [
-            {
-                "package_key": candidate.key,
-                "names": list(candidate.aliases),
-                "drawing_code": candidate.drawing_code,
-                "family": candidate.family,
-                "pin_count": candidate.pin_count,
-                "role": candidate.role,
-                "device_scope": candidate.device_scope,
-                "evidence": [
-                    {
-                        "source": evidence.source,
-                        "table_id": evidence.table_id,
-                        "block_id": evidence.block_id,
-                        "detail": evidence.detail,
-                        "confidence": evidence.confidence,
-                    }
-                    for evidence in candidate.evidence
-                ],
-            }
-            for candidate in package_resolution.registry.candidates.values()
-        ]
-        LAST_EXTRACTION_DEBUG[0]["package_diagnostics"] = (
-            package_resolution.diagnostics
-        )
-    for item in prepared:
-        assignment = package_resolution.assignments.get(item["table_id"])
-        if assignment is not None:
-            item["debug"]["package_resolution"] = assignment_to_debug(
-                assignment,
-                package_resolution.registry,
-            )
-
-    # 第五阶段：前四个判断阶段全部结束后，才允许创建 pin 记录。
+    # 第四阶段：前三个判断阶段全部结束后，才允许创建 pin 记录。
+    # 此处不再识别真实封装名。单封装使用槽位 0；多封装按照绑定顺序使用
+    # 槽位 0、1、2……，最终输出阶段再把槽位转换为 a、b、c。
     for item in prepared:
         table_decision = decisions[item["table_id"]]
         debug = item["debug"]
@@ -422,16 +322,11 @@ def extract_pin_package_info_from_table_candidates(
             skip(debug, table_decision.reason or "table_rejected")
             continue
 
-        # 单封装表只消费文档级归属结果。证据不足时这里得到空字符串，不能
-        # 再使用旧的“已提取上一表”状态或标题兜底做第二次猜测。
-        default_pkg = package_resolution.package_label(item["table_id"])
-        default_pkg_key = package_resolution.package_key(item["table_id"])
-        default_pkg_priority = package_resolution.package_priority(item["table_id"])
         group_name = clean_group_name(
             item["table"].group_context
             or table_decision.group
             or infer_group_name(item["table"].title)
-            or infer_group_name_from_headers(item["headers"], default_pkg)
+            or infer_group_name_from_headers(item["headers"])
             or "Pin/Package Table"
         )
 
@@ -445,6 +340,9 @@ def extract_pin_package_info_from_table_candidates(
         # 不能再进入普通逻辑把多个编号列拼接成一个字段。
         if plan.is_multi_package:
             for bound_row in iter_bound_package_rows(plan, item["data_rows"]):
+                # binding 在原表中的顺序就是内部槽位顺序。这里只比较同一个
+                # plan 内的结构标签，标签本身不会进入最终 pkg。
+                package_slot = package_slot_for_bound_row(plan, bound_row)
                 for record in extract_records_from_bound_package_row(bound_row):
                     # 多封装绑定对象只保存 pin_no/pin_name/type。description
                     # 必须使用 row_index 回到同一原始数据行读取，不能从相邻
@@ -456,29 +354,11 @@ def extract_pin_package_info_from_table_candidates(
                     )
                     if description is not None:
                         record["description"] = description
-                    # 多封装绑定中的 package 名称来自本表表头/控制列，属于
-                    # 当前行最直接的证据。候选库只做单一名称规范化，不能把
-                    # 该名称扩展为由 ``|`` 连接的别名列表。
-                    raw_record_pkg = record.pop("_pkg")
-                    record_pkg = package_resolution.registry.display_for_label(
-                        raw_record_pkg
-                    )
-                    record_pkg_key = (
-                        package_resolution.registry.unique_key_for_label(
-                            raw_record_pkg
-                        )
-                        or f"label={normalize_header(record_pkg) or 'unknown'}"
-                    )
                     if include_debug and source_name:
                         record["source"] = source_name
                     if include_debug and item["table"].page_idx is not None:
                         record["source_page"] = item["table"].page_idx + 1
-                    identity = build_package_identity(
-                        record_pkg,
-                        identity_key=record_pkg_key,
-                        priority=110,
-                    )
-                    bucket = get_package_bucket(packages, identity)
+                    bucket = get_package_slot_bucket(packages, package_slot)
                     group = get_or_create_group(bucket, current_group_name)
                     add_pin_record_to_group(group, record)
                     extracted_count += 1
@@ -502,28 +382,12 @@ def extract_pin_package_info_from_table_candidates(
                     )
                     continue
                 for record in extract_records_from_row(row, table_decision.columns):
-                    record_pkg = record.pop("_pkg", default_pkg)
                     record.pop("_raw_fields", None)
                     if include_debug and source_name:
                         record["source"] = source_name
                     if include_debug and item["table"].page_idx is not None:
                         record["source_page"] = item["table"].page_idx + 1
-                    # 普通单封装表使用封装归属阶段得到的内部 key。若某条记录
-                    # 明确覆盖了 pkg，则只在该名称能唯一映射时改用对应 key。
-                    record_pkg_key = default_pkg_key
-                    record_pkg_priority = default_pkg_priority
-                    if record_pkg != default_pkg:
-                        record_pkg_key = (
-                            package_resolution.registry.unique_key_for_label(record_pkg)
-                            or f"label={normalize_header(record_pkg) or 'unknown'}"
-                        )
-                        record_pkg_priority = 110
-                    identity = build_package_identity(
-                        record_pkg,
-                        identity_key=record_pkg_key,
-                        priority=record_pkg_priority,
-                    )
-                    bucket = get_package_bucket(packages, identity)
+                    bucket = get_package_slot_bucket(packages, 0)
                     group = get_or_create_group(bucket, current_group_name)
                     add_pin_record_to_group(group, record)
                     extracted_count += 1
@@ -532,16 +396,10 @@ def extract_pin_package_info_from_table_candidates(
             debug.update({
                 "status": "extracted",
                 "pin_count": extracted_count,
-                # 多封装调试信息也用数组表达多个实体，避免让 ``|`` 拼接串
-                # 看起来像一个合法 pkg。
-                "pkg": default_pkg if not plan.is_multi_package else "",
-                "packages": (
-                    [
-                        package_resolution.registry.display_for_label(binding.package)
-                        for binding in plan.bindings
-                    ]
+                "package_slots": (
+                    list(range(len(plan.bindings)))
                     if plan.is_multi_package
-                    else ([default_pkg] if default_pkg else [])
+                    else [0]
                 ),
                 "group": group_name,
             })
@@ -634,7 +492,6 @@ def decide_table_by_rules(item: dict[str, Any]) -> TableDecision:
     return TableDecision(
         True,
         table_role="rule_pin_table",
-        pkg=infer_package_name(item["table"].title),
         group=infer_group_name(item["table"].title),
         confidence=1.0,
         columns=columns,
@@ -937,7 +794,6 @@ def extract_records_from_bound_package_row(
         record: dict[str, Any] = {
             "pin_no": pin_no,
             "pin_name": pin_names[index] if pin_names else bound_row.pin_name,
-            "_pkg": bound_row.package,
         }
         if bound_row.pin_type:
             record["type"] = bound_row.pin_type
@@ -952,9 +808,9 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
     是否有效，也不删除已经被字段判断选中的列。
     """
 
-    # fields 是标准字段值；package_columns 单独保存“封装专属 pin 列”。
+    # fields 是标准字段值；package_columns 单独保存多封装专属 pin 列。
     fields: dict[str, str] = {}
-    package_columns: list[tuple[str, str]] = []
+    package_columns: list[str] = []
     # raw_fields 仅用于 debug，不参与最终字段判断和输出。
     raw_fields: dict[str, str] = {}
     for column in columns:
@@ -962,7 +818,9 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
         raw_fields[column.raw_header or f"column_{column.index + 1}"] = value
         field_name = normalize_field_name(column.field_name)
         if column.field_name == "package_pin_no":
-            package_columns.append((column.raw_header, value))
+            # 这里只保存编号值，不保留封装表头文字。正常情况下多封装结构
+            # 已在上一阶段接管；该分支只是兼容既有字段映射。
+            package_columns.append(value)
         elif field_name:
             # 同一个字段有多个列时保留原始信息，不在这里合并 pin 记录。
             fields[field_name] = merge_field_value(fields.get(field_name, ""), value)
@@ -970,7 +828,7 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
     records = []
     if package_columns:
         # 封装专属编号列优先：每个封装列分别生成自己的 pin 记录。
-        for package_header, value in package_columns:
+        for value in package_columns:
             # 列映射已经确定；空单元格仍要生成 pin_no="" 的记录。
             pin_numbers = split_pin_numbers(value) or [""]
             pin_names = split_parallel_pin_names(
@@ -984,7 +842,6 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
                 if pin_names:
                     # 只有数量完全对应时，才覆盖整行共享的 pin_name。
                     record["pin_name"] = pin_names[index]
-                record["_pkg"] = clean_package_label(package_header)
                 record["_raw_fields"] = raw_fields
                 records.append(record)
         if records:
@@ -1164,7 +1021,7 @@ def add_pin_record_to_group(group: ExtractedGroup, record: dict[str, Any]) -> No
 
 
 # ---------------------------------------------------------------------------
-# 表格读取、标题、分组和封装归并
+# 表格读取、标题和结构槽位分组
 # ---------------------------------------------------------------------------
 
 
@@ -1172,7 +1029,6 @@ TR_RE = re.compile(r"(<tr[^>]*>)(.*?)(</tr>)", re.DOTALL | re.IGNORECASE)
 CELL_RE = re.compile(r"(<t[dh][^>]*>)(.*?)(</t[dh]>)", re.DOTALL | re.IGNORECASE)
 TAG_RE = re.compile(r"<[^>]+>")
 BALL_TOKEN_RE = re.compile(r"\b[A-Z]{1,2}\d{1,3}\b")
-PACKAGE_RE = re.compile(r"\b(?:\d{2,4}\s*)?(?:qfp|lqfp|tqfp|qfn|bga|soic|sop|pdip|dfn|wqfn|zce\d*[a-z]*|nzn\d*[a-z]*|zwt|zjz|zay|rgz|rha|rhb|pz|pm|pw)\b", re.IGNORECASE)
 TYPE_VALUES = {"i", "o", "io", "i/o", "i/o/z", "oz", "od", "odz", "p", "ipu", "ipd", "analog", "digital", "power", "ground", "gnd", "supply", "input", "output"}
 
 
@@ -1250,16 +1106,15 @@ def extract_table_title(text: str) -> str:
     return clean_group_name(text) if match else ""
 
 
-def infer_group_name_from_headers(headers: list[str], package: str = "") -> str:
+def infer_group_name_from_headers(headers: list[str]) -> str:
     """当附近没有标题时，根据表头组合生成保守的组名。"""
     h = normalize_header(" ".join(headers))
-    suffix = f", {package}" if package else ""
     if "connection requirements" in h or "connectivity requirements" in h:
-        return f"Connectivity Requirements{suffix}"
+        return "Connectivity Requirements"
     if "description" in h and ("function" in h or "signal type" in h):
-        return f"Signal Descriptions{suffix}"
+        return "Signal Descriptions"
     if "pin" in h or "ball" in h or "terminal" in h:
-        return f"Pin Attributes{suffix}"
+        return "Pin Attributes"
     return ""
 
 
@@ -1268,66 +1123,43 @@ def clean_group_name(value: str) -> str:
 
     同一张跨页表的后续标题通常只多出 ``(continued)``。删除该标记后，
     原表和续表仍会得到完全相同的 group 名；每一行标题独立清理，不能再用
-    ``\s+`` 把标题之间的换行折叠成普通空格。
+    ``\\s+`` 把标题之间的换行折叠成普通空格。
     """
     return join_group_titles(value)
 
 
-def infer_package_name(text: str) -> str:
-    """从标题中的“XXX Package”结构提取初始封装名。"""
-    text = plain_text(text)
-    match = re.search(r"\b([A-Z0-9][A-Z0-9-]{1,20})\s+Package\b", text, re.IGNORECASE)
-    return match.group(1).upper() if match else ""
+def package_slot_for_bound_row(
+    plan: MultiPackagePlan,
+    bound_row: BoundPackageRow,
+) -> int:
+    """把多封装绑定行映射到它在当前表中的结构槽位。
+
+    ``binding.package`` 只是多封装模块定位列/行时使用的内部标签。这里仅用
+    它在当前 plan 中查找序号，标签内容本身不会保存、比较或输出。
+    """
+
+    for slot, binding in enumerate(plan.bindings):
+        if binding.package == bound_row.package:
+            return slot
+    raise ValueError(
+        f"多封装绑定行没有对应的结构槽位: {bound_row.package!r}"
+    )
 
 
-def build_package_identity(
-    label: str,
-    *,
-    identity_key: str = "",
-    priority: int = 0,
-) -> PackageIdentity:
-    """把单一显示名称和已解析内部 key 组合成稳定封装身份。"""
+def get_package_slot_bucket(
+    packages: dict[int, dict[str, Any]],
+    slot: int,
+) -> dict[str, Any]:
+    """按非负结构槽位获取输出桶，不读取任何真实封装名称。"""
 
-    display = clean_package_label(label)
-    if "|" in display:
-        # ``|`` 代表上游把多个别名错误拼成了一个 pkg。这里不能取第一段
-        # 继续输出，因为那会掩盖封装归属错误。
-        display = ""
-    if looks_like_pin_list(display):
-        display = ""
-    compact = normalize_header(display)
-    code = ""
-    match = PACKAGE_RE.search(display)
-    if match:
-        code = match.group(0).upper().replace(" ", "")
-    key = identity_key or (f"code={code}" if code else f"label={compact or 'unknown'}")
-    return PackageIdentity(display, key, code=code, priority=priority)
-
-
-def get_package_bucket(packages: dict[str, dict[str, Any]], identity: PackageIdentity) -> dict[str, Any]:
-    """按封装 key 获取输出桶；别名只内部记录，最终 pkg 始终保留一个。"""
-
-    key = identity.key
-    if key not in packages:
-        packages[key] = {
-            "pkg": "",
-            "pkg_key": key,
+    if slot < 0:
+        raise ValueError(f"package slot 必须为非负整数: {slot}")
+    if slot not in packages:
+        packages[slot] = {
+            "package_slot": slot,
             "_groups": {},
-            "_aliases": [],
-            "_identity": identity,
-            "_pkg_priority": -1,
         }
-    bucket = packages[key]
-    if identity.display and identity.display not in bucket["_aliases"]:
-        bucket["_aliases"].append(identity.display)
-    # 相同封装在不同表中可能使用不同别名。优先保留表题/表头等更直接证据；
-    # 证据等级相同时保留文档中先出现的名称，保证结果稳定且不依赖字符串长度。
-    if identity.display and (
-        not bucket["pkg"] or identity.priority > bucket["_pkg_priority"]
-    ):
-        bucket["pkg"] = identity.display
-        bucket["_pkg_priority"] = identity.priority
-    return bucket
+    return packages[slot]
 
 
 def get_or_create_group(bucket: dict[str, Any], name: str) -> ExtractedGroup:
@@ -1338,30 +1170,35 @@ def get_or_create_group(bucket: dict[str, Any], name: str) -> ExtractedGroup:
     return bucket["_groups"][name]
 
 
-def build_public_result(packages: dict[str, dict[str, Any]], include_debug: bool) -> list[dict[str, Any]]:
-    """把内部 bucket 结构转换成项目约定的公开 JSON 结构。"""
+def package_slot_label(slot: int) -> str:
+    """把从零开始的槽位转换为 a..z、aa..az、ba.. 的稳定编号。"""
+
+    if slot < 0:
+        raise ValueError(f"package slot 必须为非负整数: {slot}")
+    value = slot + 1
+    parts: list[str] = []
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        parts.append(chr(ord("a") + remainder))
+    return "".join(reversed(parts))
+
+
+def build_public_result(
+    packages: dict[int, dict[str, Any]],
+    include_debug: bool,
+) -> list[dict[str, Any]]:
+    """按槽位顺序生成公开 JSON，并仅在这里写入 a/b/c pkg。"""
+
     result = []
-    for bucket in packages.values():
+    for slot in sorted(packages):
+        bucket = packages[slot]
         groups = [{"group": group.group, "pin_list": group.pin_list} for group in bucket["_groups"].values() if group.pin_list]
         if groups:
-            pkg = clean_package_label(bucket["pkg"])
-            if "|" in pkg:
-                raise ValueError(
-                    f"最终 pkg 不能包含别名拼接符 '|': {pkg!r}"
-                )
-            item = {"pkg": pkg, "group_list": groups}
+            item = {"pkg": package_slot_label(slot), "group_list": groups}
             if include_debug:
-                item["pkg_key"] = bucket["pkg_key"]
+                item["package_slot"] = slot
             result.append(item)
     return result
-
-
-def clean_package_label(value: str) -> str:
-    """清理封装表头中的脚注、Package 后缀和多余空格。"""
-    value = plain_text(value)
-    value = re.sub(r"\[[^]]+\]", "", value)
-    value = re.sub(r"\bpackage\b", "", value, flags=re.IGNORECASE)
-    return re.sub(r"\s+", " ", value).strip(" -:/")
 
 
 # ---------------------------------------------------------------------------
@@ -1530,7 +1367,6 @@ def decision_to_debug(decision: TableDecision) -> dict[str, Any]:
     return {
         "should_extract": decision.should_extract,
         "table_role": decision.table_role,
-        "pkg": decision.pkg,
         "group": decision.group,
         "confidence": decision.confidence,
         "reason": decision.reason,

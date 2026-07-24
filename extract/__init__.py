@@ -1,1 +1,1 @@
-"""Pin and package information extraction helpers."""
+"""引脚提取、表格结构判断和匿名 package 槽位分组工具。"""
