@@ -16,6 +16,9 @@ Pin Descriptions 表提取，因此整张重复排版表直接排除，不送给
 * 每个字段块都且只包含一个名称列，并允许包含一个 type 列；
 * 所有字段块的字段顺序完全一致；
 * 表头中不能夹杂 description、package 等其他字段。
+
+``No.`` 只有在本模块已经看到至少两个完整重复字段块时才作为 pin_no
+处理；不能把这个规则扩散到普通单表的全局字段判断中。
 """
 
 from __future__ import annotations
@@ -63,6 +66,11 @@ def _header_role(value: str) -> str:
     """将明确的引脚编号、名称和类型表头归一化为结构角色。"""
 
     text = _normalize_header(value)
+    # 裸 No. 在单张普通表中语义不够明确，但本函数只服务于后续的完整
+    # 重复块校验；只有至少两组 pin_no -> pin_name -> type 全部匹配时
+    # 整张表才会被过滤，因此不会扩大普通候选表的 pin_no 识别范围。
+    if text == "no":
+        return "pin_no"
     if re.search(r"\b(?:pin|ball|terminal)\s*(?:no|number)\b", text) or "pin#" in text:
         return "pin_no"
     if re.search(r"\b(?:pin|ball|signal|terminal)\s*name\b", text):

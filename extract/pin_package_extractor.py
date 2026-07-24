@@ -41,9 +41,11 @@
 * “Pin Configuration and Function” 这类坐标矩阵不是物理引脚表，表级直接排除。
 * 开启语义判断时，模型接收初筛后的表格标题、表头和完整表格；模型只返回
   ``should_extract`` 以及 ``pin_no``、``pin_name``、``type`` 的列映射。
-* 表格分组标题只按行首 ``Table xxx``/``表 xxx`` 识别，不要求标题中必须
-  含有 Pin、Signal 等关键词；保留表格编号，仅清理 ``(continued)`` 后作为
-  group 名，便于按原 PDF 表号检索和核对。
+* 表格分组标题在“上一张表结束到当前表开始”的局部文本窗口中识别：
+  优先使用 ``Table xxx``/``表 xxx`` 明确表题；没有表号时允许使用紧邻
+  表格的独立短标题，例如 ``Pin Functions``，不要求包含 Pin、Signal 等
+  固定关键词。局部窗口进入新章节时禁止继承上一章节的旧表题；没有新章节
+  和新标题时才继承上一表题，用于无重复标题的跨页续表。
 * 每张表的 group 还要包含上一章的全部章节标题、当前章开始到该表之前
   已出现的全部章节标题以及当前表格标题，各标题使用换行符分隔。章节上下文
   只用于 group，不替代发送给模型和多封装判断的当前表格标题。
@@ -92,7 +94,9 @@ from extract.multi_package_extractor import (
 from extract.group_title_context import (
     GroupTitleContextTracker,
     append_group_subtitle,
+    extract_numbered_table_title,
     join_group_titles,
+    resolve_table_title,
 )
 
 
@@ -1089,21 +1093,9 @@ def infer_group_name(text: str) -> str:
 
 
 def extract_table_title(text: str) -> str:
-    """从独立文本行中识别 ``Table xxx``/``表 xxx`` 标题。
+    """兼容旧调用：识别带 Table/表 和表号的明确表题。"""
 
-    这里只判断标题格式，不判断后面的标题内容。这样 ``Signal Descriptions``、
-    ``Pin Attributes`` 或其他名称都能被保留，同时普通正文不会更新当前标题。
-    """
-
-    text = re.sub(r"\s+", " ", plain_text(text)).strip()
-    if not text:
-        return ""
-    match = re.match(
-        r"^(?:Table|表格?|表)\s*[\w一二三四五六七八九十百千万]+(?:[.\-][\w一二三四五六七八九十百千万]+)*\s*[.:：\-–—]?\s*.+$",
-        text,
-        flags=re.IGNORECASE,
-    )
-    return clean_group_name(text) if match else ""
+    return extract_numbered_table_title(text)
 
 
 def infer_group_name_from_headers(headers: list[str]) -> str:
@@ -1209,16 +1201,21 @@ def build_public_result(
 def iter_table_candidates(middle_json: dict[str, Any]) -> list[TableCandidate]:
     """按页面阅读顺序从 middle_json 收集 HTML 表格及附近标题。"""
     result = []
-    current_title = ""
+    previous_table_title = ""
+    # pending_texts 始终只保存上一张表结束后到当前扫描位置的文本。
+    # 表格一旦消费该窗口就清空，避免旧章节表题无限向后传播。
+    pending_texts: list[str] = []
     title_context = GroupTitleContextTracker()
     for page in middle_json.get("pdf_info", []):
         page_idx = page.get("page_idx") if isinstance(page, dict) else None
-        recent = []
         for span in iter_spans_in_reading_order(page):
             html = span.get("html") if isinstance(span, dict) else None
             text = plain_text((span.get("content") or span.get("text") or "") if isinstance(span, dict) else "")
             if isinstance(html, str) and "<table" in html.lower():
-                table_title = current_title or " ".join(recent[-5:])
+                table_title = resolve_table_title(
+                    pending_texts,
+                    previous_table_title,
+                )
                 result.append(
                     TableCandidate(
                         html,
@@ -1229,14 +1226,13 @@ def iter_table_candidates(middle_json: dict[str, Any]) -> list[TableCandidate]:
                         tuple(title_context.current_chapter_titles),
                     )
                 )
+                previous_table_title = table_title
+                pending_texts = []
             elif text:
-                # 只有明确的 Table xxx 标题才能替换当前表标题。
-                current_title = extract_table_title(text) or current_title
                 # 章节状态与表题状态相互独立；Table/Figure 标题会由上下文
                 # 模块排除，正文也不会进入章节标题列表。
                 title_context.observe(text)
-                recent.append(text)
-                recent = recent[-10:]
+                pending_texts.append(text)
     return result
 
 
@@ -1245,18 +1241,21 @@ def iter_table_candidates_from_markdown(markdown: str) -> list[TableCandidate]:
     result = []
     table_re = re.compile(r"<table\b.*?</table>", re.DOTALL | re.IGNORECASE)
     cursor = 0
-    last_title = ""
+    previous_table_title = ""
     title_context = GroupTitleContextTracker()
     for match in table_re.finditer(markdown):
         before = markdown[cursor : match.start()]
-        texts = [plain_text(line).strip() for line in before.splitlines() if plain_text(line).strip()]
+        # 保留原始 Markdown 行中的 #，供章节标题和独立局部标题判断使用。
+        texts = [
+            line.strip()
+            for line in before.splitlines()
+            if plain_text(line).strip()
+        ]
         for text in texts:
-            # 标题内容不设 Pin/Signal 等关键词限制，只检查 Table xxx 格式。
-            last_title = extract_table_title(text) or last_title
             # 最终 Markdown 只信任带 # 的明确标题，避免把目录项、编号列表
             # 或正文中的数字开头句子错误收进章节上下文。
             title_context.observe(text, require_markdown_heading=True)
-        table_title = last_title or " ".join(texts[-5:])
+        table_title = resolve_table_title(texts, previous_table_title)
         result.append(
             TableCandidate(
                 match.group(0),
@@ -1267,6 +1266,7 @@ def iter_table_candidates_from_markdown(markdown: str) -> list[TableCandidate]:
                 tuple(title_context.current_chapter_titles),
             )
         )
+        previous_table_title = table_title
         cursor = match.end()
     return result
 

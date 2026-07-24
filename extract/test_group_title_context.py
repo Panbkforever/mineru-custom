@@ -4,10 +4,12 @@ from extract.group_title_context import (
     GroupTitleContextTracker,
     append_group_subtitle,
     join_group_titles,
+    resolve_table_title,
 )
 from extract.pin_package_extractor import (
     TableCandidate,
     extract_pin_package_info_from_table_candidates,
+    iter_table_candidates,
     iter_table_candidates_from_markdown,
 )
 
@@ -176,3 +178,77 @@ def test_complete_context_is_written_to_final_extraction_group():
     )
 
     assert result[0]["group_list"][0]["group"] == context
+
+
+def test_unnumbered_local_title_replaces_previous_numbered_table_title():
+    markdown = """
+# 5 Device Comparison
+Table 5-1. Device Comparison
+<table><tr><td>DEVICE</td><td>PACKAGE</td></tr></table>
+
+# 6 Pin Configuration and Functions
+Solder exposed pad to ground.
+Pin Functions
+<table><tr><td>PIN NO.</td><td>PIN NAME</td></tr></table>
+"""
+
+    candidates = iter_table_candidates_from_markdown(markdown)
+
+    assert len(candidates) == 2
+    assert candidates[1].title == "Pin Functions"
+    assert "Table 5-1. Device Comparison" not in candidates[1].group_context
+    assert candidates[1].group_context.endswith(
+        "6 Pin Configuration and Functions\nPin Functions"
+    )
+
+
+def test_new_section_without_local_title_does_not_inherit_old_table_title():
+    title = resolve_table_title(
+        ["# 6 Pin Configuration and Functions", "This section introduces the pins."],
+        "Table 5-1. Device Comparison",
+    )
+
+    assert title == ""
+
+
+def test_titleless_continuation_inherits_previous_table_title():
+    title = resolve_table_title(
+        ["Copyright 2026 Example", "12 of 80"],
+        "Table 7-3. Signal Descriptions",
+    )
+
+    assert title == "Table 7-3. Signal Descriptions"
+
+
+def test_middle_json_reader_uses_local_unnumbered_title_after_section_change():
+    middle_json = {
+        "pdf_info": [
+            {
+                "page_idx": 0,
+                "blocks": [
+                    {"content": "5 Device Comparison"},
+                    {"content": "Table 5-1. Device Comparison"},
+                    {
+                        "html": (
+                            "<table><tr><td>DEVICE</td>"
+                            "<td>PACKAGE</td></tr></table>"
+                        )
+                    },
+                    {"content": "6 Pin Configuration and Functions"},
+                    {"content": "Pin Functions"},
+                    {
+                        "html": (
+                            "<table><tr><td>PIN NO.</td>"
+                            "<td>PIN NAME</td></tr></table>"
+                        )
+                    },
+                ],
+            }
+        ]
+    }
+
+    candidates = iter_table_candidates(middle_json)
+
+    assert len(candidates) == 2
+    assert candidates[1].title == "Pin Functions"
+    assert "Table 5-1. Device Comparison" not in candidates[1].group_context

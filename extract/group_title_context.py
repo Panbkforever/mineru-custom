@@ -9,6 +9,15 @@
 遇到表格时，将“上一章标题 + 当前章已出现标题 + 当前表格标题”按顺序
 用换行符连接。表格标题仍由主提取器单独保存，不能用这段上下文替代后
 发送给模型的当前表格标题。
+
+当前表格标题只在“上一张表结束到当前表开始”的局部文本窗口内判断：
+
+* 优先使用局部窗口中的 ``Table xxx``/``表 xxx`` 明确表题；
+* 没有表号时，允许使用紧邻表格的独立短标题，例如 ``Pin Functions``；
+* 局部窗口出现新章节但没有局部表题时，清空上一张表的标题，禁止跨章节
+  继承旧表题；
+* 局部窗口没有新章节和新表题时，才继承上一张表标题，用于无重复标题的
+  跨页续表。
 """
 
 from __future__ import annotations
@@ -16,9 +25,17 @@ from __future__ import annotations
 import html as html_lib
 import re
 from dataclasses import dataclass, field
+from typing import Sequence
 
 
 _TABLE_TITLE_RE = re.compile(r"^(?:table|表格?|表)\s*\S+", re.IGNORECASE)
+_NUMBERED_TABLE_TITLE_RE = re.compile(
+    r"^(?:table|表格?|表)\s*"
+    r"[\w一二三四五六七八九十百千万]+"
+    r"(?:[.\-][\w一二三四五六七八九十百千万]+)*"
+    r"\s*[.:：\-–—]?\s*.+$",
+    re.IGNORECASE,
+)
 _FIGURE_TITLE_RE = re.compile(r"^(?:figure|fig\.?|图)\s*\S+", re.IGNORECASE)
 _NUMBERED_HEADING_RE = re.compile(
     r"^(?P<number>\d{1,3}(?:\.\d{1,3}){0,5})\s*"
@@ -133,6 +150,58 @@ class GroupTitleContextTracker:
         )
 
 
+def resolve_table_title(
+    values: Sequence[str],
+    previous_title: str = "",
+) -> str:
+    """从当前表之前的局部文本窗口解析表题。
+
+    ``values`` 必须只包含上一张表结束后、当前表开始前的文本。函数先找
+    明确的编号表题，再找紧邻表格的独立短标题。只有当前窗口没有出现
+    新章节时，才允许回退到 ``previous_title``，从而兼容没有重复标题的
+    跨页续表，同时避免把上一章节的表题错误绑定到新章节表格。
+    """
+
+    raw_lines = [str(value or "").strip() for value in values if str(value or "").strip()]
+    if not raw_lines:
+        return clean_group_title_line(previous_title)
+
+    # 编号表题可能与表格之间夹有少量说明文字，因此在整个局部窗口中
+    # 反向查找最近一条，而不是只检查最后一行。
+    for raw_line in reversed(raw_lines):
+        numbered_title = extract_numbered_table_title(raw_line)
+        if numbered_title:
+            return numbered_title
+
+    # 无表号标题必须紧邻表格。允许跳过常见页眉页脚噪声，但不跨越普通
+    # 正文继续向前猜标题，避免把任意短句误当成 group。
+    for raw_line in reversed(raw_lines):
+        cleaned_line = clean_group_title_line(raw_line)
+        if not cleaned_line:
+            continue
+        if _is_page_noise(cleaned_line):
+            continue
+        if _looks_like_local_table_title(raw_line):
+            return cleaned_line
+        break
+
+    # 新章节已经开始时，即使没有独立表题，也不能沿用上一章节的表题。
+    if any(
+        not _is_page_noise(clean_group_title_line(value))
+        and parse_section_heading(value) is not None
+        for value in raw_lines
+    ):
+        return ""
+    return clean_group_title_line(previous_title)
+
+
+def extract_numbered_table_title(value: str) -> str:
+    """识别带 Table/表 和表号的明确表题，不限制标题语义关键词。"""
+
+    text = clean_group_title_line(value)
+    return text if _NUMBERED_TABLE_TITLE_RE.match(text) else ""
+
+
 def parse_section_heading(
     value: str,
     *,
@@ -218,6 +287,45 @@ def clean_group_title_line(value: str) -> str:
         flags=re.IGNORECASE,
     )
     return text.strip()
+
+
+def _looks_like_local_table_title(value: str) -> bool:
+    """判断紧邻表格的文本是否像独立标题，而不是正文句子。
+
+    该判断不要求出现 Pin、Signal 等特定词。显式 Markdown 标题直接接受；
+    普通文本只接受长度受控、无句末标点、无 URL 且不是章节/图题的短行。
+    """
+
+    raw = str(value or "").strip()
+    markdown_heading = re.match(r"^\s*#{1,6}\s+\S", raw) is not None
+    text = clean_group_title_line(raw)
+    if not text or len(text) > 160:
+        return False
+    if extract_numbered_table_title(text):
+        return False
+    if _FIGURE_TITLE_RE.match(text) or parse_section_heading(raw) is not None:
+        return False
+    if markdown_heading:
+        return True
+    if re.search(r"https?://|www\.", text, flags=re.IGNORECASE):
+        return False
+    if re.search(r"[。！？!?;；.]$", text):
+        return False
+    # 普通英文正文通常远长于标题；中文标题没有可靠空格，因此同时保留
+    # 总字符长度约束，不按英文单词数直接拒绝中文。
+    if re.search(r"[A-Za-z]", text) and len(text.split()) > 18:
+        return False
+    return True
+
+
+def _is_page_noise(value: str) -> bool:
+    """识别可安全跳过的页眉页脚行，供局部表题查找使用。"""
+
+    normalized = re.sub(r"\s+", " ", str(value or "")).strip().lower()
+    return bool(
+        re.search(r"\bcopyright\b|submit documentation feedback|product folder links", normalized)
+        or re.fullmatch(r"(?:page\s*)?\d+\s*(?:of\s*\d+)?", normalized)
+    )
 
 
 def _append_unique(target: list[str], value: str) -> None:
