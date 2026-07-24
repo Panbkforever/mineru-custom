@@ -9,7 +9,7 @@
 3. 多封装分析：为真正的多封装表生成 package 与列/行的绑定计划。
 4. 封装归属：扫描全文证据，并在行提取前一次性确定所有目标表的 pkg。
 5. 行提取：单封装和多封装走各自独立逻辑，完整读取已经绑定的数据行。
-6. 结果整理：拆分显式 pin_no 分隔符、清洗 pin_name、分组和合并封装别名。
+6. 结果整理：拆分显式 pin_no 分隔符、清洗 pin_name、按单一 pkg 名称分组。
 
 特别重要的项目规则：
 
@@ -59,6 +59,11 @@
   时保持空字符串；上一章节标题只属于 group，不能作为当前表封装证据。
 * 封装证据不足或多个候选冲突时，pkg 保持空字符串，不能根据处理顺序或
   相同字段名主观合并；不同 package drawing/code 也不能合并成一个封装。
+* 同一封装实体允许在内部保存多个别名，但最终 ``pkg`` 只能输出一个名称。
+  当前表题命中的名称优先，其次是当前表头，再使用文档级规范名称；禁止用
+  ``|`` 拼接别名。真正的多个封装必须输出为多个外层 package 对象。
+* pkg 通常不超过 15 个字符。长度只参与候选名称排序，不能截断原文；多个
+  候选无法确定唯一归属时保持空字符串，不能为了填值而任意选择。
 * 语义字段判断默认并发数为 4，可通过 ``EXTRACT_SCHEMA_WORKERS`` 覆盖。
 """
 
@@ -157,6 +162,9 @@ class PackageIdentity:
     pin_count: str = ""
     family: str = ""
     code: str = ""
+    # priority 表示 display 的证据等级。相同内部 key 遇到不同别名时，
+    # 只有更直接的表题/表头证据才能替换当前显示名称。
+    priority: int = 0
 
 
 LAST_EXTRACTION_DEBUG: list[dict[str, Any]] = []
@@ -414,6 +422,8 @@ def extract_pin_package_info_from_table_candidates(
         # 单封装表只消费文档级归属结果。证据不足时这里得到空字符串，不能
         # 再使用旧的“已提取上一表”状态或标题兜底做第二次猜测。
         default_pkg = package_resolution.package_label(item["table_id"])
+        default_pkg_key = package_resolution.package_key(item["table_id"])
+        default_pkg_priority = package_resolution.package_priority(item["table_id"])
         group_name = clean_group_name(
             item["table"].group_context
             or table_decision.group
@@ -443,16 +453,28 @@ def extract_pin_package_info_from_table_candidates(
                     )
                     if description is not None:
                         record["description"] = description
-                    # 多封装绑定仍决定每行属于哪个封装；候选库只负责把该标签
-                    # 转换成包含全部已知别名的稳定显示名称。
+                    # 多封装绑定中的 package 名称来自本表表头/控制列，属于
+                    # 当前行最直接的证据。候选库只做单一名称规范化，不能把
+                    # 该名称扩展为由 ``|`` 连接的别名列表。
+                    raw_record_pkg = record.pop("_pkg")
                     record_pkg = package_resolution.registry.display_for_label(
-                        record.pop("_pkg")
+                        raw_record_pkg
+                    )
+                    record_pkg_key = (
+                        package_resolution.registry.unique_key_for_label(
+                            raw_record_pkg
+                        )
+                        or f"label={normalize_header(record_pkg) or 'unknown'}"
                     )
                     if include_debug and source_name:
                         record["source"] = source_name
                     if include_debug and item["table"].page_idx is not None:
                         record["source_page"] = item["table"].page_idx + 1
-                    identity = build_package_identity(record_pkg)
+                    identity = build_package_identity(
+                        record_pkg,
+                        identity_key=record_pkg_key,
+                        priority=110,
+                    )
                     bucket = get_package_bucket(packages, identity)
                     group = get_or_create_group(bucket, current_group_name)
                     add_pin_record_to_group(group, record)
@@ -483,7 +505,21 @@ def extract_pin_package_info_from_table_candidates(
                         record["source"] = source_name
                     if include_debug and item["table"].page_idx is not None:
                         record["source_page"] = item["table"].page_idx + 1
-                    identity = build_package_identity(record_pkg)
+                    # 普通单封装表使用封装归属阶段得到的内部 key。若某条记录
+                    # 明确覆盖了 pkg，则只在该名称能唯一映射时改用对应 key。
+                    record_pkg_key = default_pkg_key
+                    record_pkg_priority = default_pkg_priority
+                    if record_pkg != default_pkg:
+                        record_pkg_key = (
+                            package_resolution.registry.unique_key_for_label(record_pkg)
+                            or f"label={normalize_header(record_pkg) or 'unknown'}"
+                        )
+                        record_pkg_priority = 110
+                    identity = build_package_identity(
+                        record_pkg,
+                        identity_key=record_pkg_key,
+                        priority=record_pkg_priority,
+                    )
                     bucket = get_package_bucket(packages, identity)
                     group = get_or_create_group(bucket, current_group_name)
                     add_pin_record_to_group(group, record)
@@ -493,13 +529,16 @@ def extract_pin_package_info_from_table_candidates(
             debug.update({
                 "status": "extracted",
                 "pin_count": extracted_count,
-                "pkg": (
-                    " | ".join(
+                # 多封装调试信息也用数组表达多个实体，避免让 ``|`` 拼接串
+                # 看起来像一个合法 pkg。
+                "pkg": default_pkg if not plan.is_multi_package else "",
+                "packages": (
+                    [
                         package_resolution.registry.display_for_label(binding.package)
                         for binding in plan.bindings
-                    )
+                    ]
                     if plan.is_multi_package
-                    else default_pkg
+                    else ([default_pkg] if default_pkg else [])
                 ),
                 "group": group_name,
             })
@@ -1228,9 +1267,19 @@ def infer_package_name(text: str) -> str:
     return match.group(1).upper() if match else ""
 
 
-def build_package_identity(label: str) -> PackageIdentity:
-    """把显示名称转换为用于分组的稳定封装身份。"""
+def build_package_identity(
+    label: str,
+    *,
+    identity_key: str = "",
+    priority: int = 0,
+) -> PackageIdentity:
+    """把单一显示名称和已解析内部 key 组合成稳定封装身份。"""
+
     display = clean_package_label(label)
+    if "|" in display:
+        # ``|`` 代表上游把多个别名错误拼成了一个 pkg。这里不能取第一段
+        # 继续输出，因为那会掩盖封装归属错误。
+        display = ""
     if looks_like_pin_list(display):
         display = ""
     compact = normalize_header(display)
@@ -1238,19 +1287,33 @@ def build_package_identity(label: str) -> PackageIdentity:
     match = PACKAGE_RE.search(display)
     if match:
         code = match.group(0).upper().replace(" ", "")
-    key = f"code={code}" if code else f"label={compact or 'unknown'}"
-    return PackageIdentity(display, key, code=code)
+    key = identity_key or (f"code={code}" if code else f"label={compact or 'unknown'}")
+    return PackageIdentity(display, key, code=code, priority=priority)
 
 
 def get_package_bucket(packages: dict[str, dict[str, Any]], identity: PackageIdentity) -> dict[str, Any]:
-    """按封装 key 获取或创建输出桶，并追加新出现的封装别名。"""
+    """按封装 key 获取输出桶；别名只内部记录，最终 pkg 始终保留一个。"""
+
     key = identity.key
     if key not in packages:
-        packages[key] = {"pkg": "", "pkg_key": key, "_groups": {}, "_aliases": [], "_identity": identity}
+        packages[key] = {
+            "pkg": "",
+            "pkg_key": key,
+            "_groups": {},
+            "_aliases": [],
+            "_identity": identity,
+            "_pkg_priority": -1,
+        }
     bucket = packages[key]
     if identity.display and identity.display not in bucket["_aliases"]:
         bucket["_aliases"].append(identity.display)
-        bucket["pkg"] = " | ".join(bucket["_aliases"])
+    # 相同封装在不同表中可能使用不同别名。优先保留表题/表头等更直接证据；
+    # 证据等级相同时保留文档中先出现的名称，保证结果稳定且不依赖字符串长度。
+    if identity.display and (
+        not bucket["pkg"] or identity.priority > bucket["_pkg_priority"]
+    ):
+        bucket["pkg"] = identity.display
+        bucket["_pkg_priority"] = identity.priority
     return bucket
 
 
@@ -1268,7 +1331,12 @@ def build_public_result(packages: dict[str, dict[str, Any]], include_debug: bool
     for bucket in packages.values():
         groups = [{"group": group.group, "pin_list": group.pin_list} for group in bucket["_groups"].values() if group.pin_list]
         if groups:
-            item = {"pkg": bucket["pkg"], "group_list": groups}
+            pkg = clean_package_label(bucket["pkg"])
+            if "|" in pkg:
+                raise ValueError(
+                    f"最终 pkg 不能包含别名拼接符 '|': {pkg!r}"
+                )
+            item = {"pkg": pkg, "group_list": groups}
             if include_debug:
                 item["pkg_key"] = bucket["pkg_key"]
             result.append(item)

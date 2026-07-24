@@ -828,3 +828,33 @@ PDF 解析后的主要后处理顺序如下：
 - `extract/test_package_semantic_resolution.py`
   - 使用不依赖具体 PDF 的伪模型结果验证：虚构名称拒绝、表头具体封装优先
     于表题家族、表题/表头具体身份冲突不猜、表归属只能选择已有 package ID。
+
+## 2026-07-24：pkg 单一规范名称
+
+涉及文件：
+
+- `extract/package_resolver.py`
+  - `PackageCandidate.aliases` 继续保存同一封装的原文别名，但
+    `PackageCandidate.display` 只返回一个规范名称，不再通过 `|` 拼接。
+  - `TablePackageAssignment.selected_label` 保存当前表题或表头实际命中的名称；
+    单封装表按“当前表题 > 当前表头 > 其他上下文 > 候选规范名”输出 pkg。
+  - package drawing/code 是没有表级名称时的强兜底；名称不超过 15 个字符
+    只作为排序信号，不截断证据充分的原文名称。
+  - `display_for_label(...)` 保留多封装表头/控制列中的单个原始名称，不扩展
+    为候选实体的全部别名。
+  - 续表和同章节继承会同时继承唯一且一致的 `selected_label`；名称存在冲突
+    时只继承内部 package key，再由候选规范名兜底。
+
+- `extract/pin_package_extractor.py`
+  - 最终封装桶使用解析阶段的内部 package key 分组，避免不同 drawing/code
+    因显示名称相似而错误归并。
+  - 同一 key 遇到多个别名时只保留证据等级最高的一个名称；等级相同时保留
+    文档中先出现的名称，别名仅保存在内部调试结构。
+  - 最终公开 JSON 增加强制校验：`pkg` 包含 `|` 时直接报错，不能静默输出
+    非法的别名拼接结果。
+  - 真正的多封装表继续生成多个外层 package 对象；调试信息使用数组记录
+    多个 package，不再生成看似单一 pkg 的拼接字符串。
+
+- `extract/test_package_semantic_resolution.py`
+  - 新增通用测试覆盖：别名只内部保存、表题别名优先、最终桶只输出一个
+    高优先级名称，以及不同 package key 必须生成不同外层对象。

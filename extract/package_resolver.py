@@ -31,6 +31,16 @@
 单封装表出现多个候选时，当前表题中的具体 pkg 优先，其次是当前表头。
 真正的多封装表不执行“选择一个”的规则，继续保留多封装模块已经建立的
 全部 package 与 pin 列/行绑定。
+
+候选实体可以在内部保留多个别名，但最终 ``pkg`` 永远只能是一个名称：
+
+* 当前表题命中的原始名称优先于当前表头，表头优先于其他上下文；
+* 没有表级名称时，优先使用明确的 package drawing/code，再使用候选实体
+  中得分最高的具体短名称；
+* ``|`` 只允许作为内部 key 的组成字符，绝不能出现在最终 ``pkg``；
+* 多个不同封装不能拼成一个字符串，必须由多封装分支生成多个外层对象；
+* 名称通常不超过 15 个字符，短名称是优先信号而不是截断规则。证据充分的
+  长名称可以保留，代码不能擅自截断或改写原文。
 """
 
 from __future__ import annotations
@@ -131,12 +141,16 @@ class PackageCandidate:
     role: str = "package_identity"
     device_scope: str = ""
     evidence: list[PackageEvidence] = field(default_factory=list)
+    # alias_priorities 只参与内部规范名称选择，不写入最终 JSON。字典的 key
+    # 使用清洗后的原始名称，value 越大表示证据来源越直接、名称越具体。
+    alias_priorities: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    canonical_name: str = ""
 
     @property
     def display(self) -> str:
-        """按发现顺序输出全部别名，满足同一封装追加名称的项目规则。"""
+        """返回一个规范名称；别名只作内部证据，不能用 ``|`` 拼接输出。"""
 
-        return " | ".join(self.aliases)
+        return _clean_output_package_label(self.canonical_name)
 
 
 @dataclass(frozen=True)
@@ -147,6 +161,9 @@ class TablePackageAssignment:
     mode: str = "unresolved"
     confidence: float = 0.0
     reason: str = ""
+    # selected_label 保存当前表题/表头实际命中的名称。它只属于当前表，
+    # 不能反向覆盖候选实体中其他表格使用的别名。
+    selected_label: str = ""
 
 
 @dataclass
@@ -163,7 +180,38 @@ class PackageResolutionResult:
         assignment = self.assignments.get(table_id)
         if assignment is None or len(assignment.package_keys) != 1:
             return ""
+        selected = _clean_output_package_label(assignment.selected_label)
+        if selected:
+            return selected
         return self.registry.display_for_key(assignment.package_keys[0])
+
+    def package_key(self, table_id: int) -> str:
+        """返回单封装表唯一的内部 package key，供最终分组保持身份边界。"""
+
+        assignment = self.assignments.get(table_id)
+        if assignment is None or len(assignment.package_keys) != 1:
+            return ""
+        return assignment.package_keys[0]
+
+    def package_priority(self, table_id: int) -> int:
+        """返回当前表 pkg 证据等级，供同一实体出现别名时选择显示名称。"""
+
+        assignment = self.assignments.get(table_id)
+        if assignment is None:
+            return 0
+        return {
+            "multi_package_columns": 110,
+            "multi_package_control_column": 110,
+            "multi_package_sections": 110,
+            "table_title": 100,
+            "table_header": 90,
+            "rule_declared": 85,
+            "semantic_context": 70,
+            "continuation": 65,
+            "current_chapter": 60,
+            "same_section": 55,
+            "pin_overlap": 40,
+        }.get(assignment.mode, 0)
 
 
 @dataclass
@@ -286,6 +334,18 @@ class PackageRegistry:
             if label not in candidate.aliases:
                 candidate.aliases.append(label)
             self._alias_to_keys.setdefault(_normalize(label), set()).add(candidate.key)
+            # 每次登记都更新该别名的证据等级。这里不删除旧别名，只重新计算
+            # 哪一个名称可以作为该实体在缺少表级命中时的规范显示名称。
+            priority = _package_output_label_priority(
+                label,
+                source=evidence.source,
+                drawing_code=drawing_code,
+                is_primary=_normalize(label) == _normalize(primary_label),
+            )
+            previous = candidate.alias_priorities.get(label)
+            if previous is None or priority > previous:
+                candidate.alias_priorities[label] = priority
+        candidate.canonical_name = _select_candidate_canonical_name(candidate)
         # family 可用于识别“QFN 同时对应多个 drawing”的歧义，但不追加到
         # 最终 pkg 显示别名，也不能作为具体身份命中表题/表头。
         if family:
@@ -362,6 +422,28 @@ class PackageRegistry:
                     break
         return result
 
+    def best_label_for_key_in_text(self, key: str, value: str) -> str:
+        """返回文本中属于指定实体的最佳原始别名，不从其他上下文猜名称。"""
+
+        candidate = self.candidates.get(key)
+        if candidate is None:
+            return ""
+        matching = [
+            alias
+            for alias in candidate.aliases
+            if _is_specific_output_package_label(alias)
+            and _text_contains_exact_label(value, alias)
+        ]
+        if not matching:
+            return ""
+        return max(
+            matching,
+            key=lambda alias: candidate.alias_priorities.get(
+                alias,
+                _package_output_label_priority(alias),
+            ),
+        )
+
     def keys_for_table_sources(self, table_id: int, sources: set[str]) -> set[str]:
         """返回某张表由指定局部证据直接发现的封装。"""
 
@@ -379,10 +461,28 @@ class PackageRegistry:
         return candidate.display if candidate is not None else ""
 
     def display_for_label(self, value: str) -> str:
-        """把多封装计划中的原标签转换为候选库中完整的别名显示。"""
+        """返回多封装绑定中的一个原始名称，绝不扩展成别名拼接字符串。"""
 
+        cleaned = _clean_output_package_label(value)
         key = self.unique_key_for_label(value)
-        return self.display_for_key(key) if key else _clean_package_label(value)
+        if key:
+            candidate = self.candidates.get(key)
+            # QFN、SSOP 等文本单独出现时只是机械家族，但若多封装结构分析
+            # 已把它绑定为一条独立 pin_no 列，它就是该列必须保留的 pkg。
+            # 这种结构证据优先于通用的“家族不能作具体身份”过滤规则。
+            is_multi_package_binding = bool(
+                candidate
+                and any(
+                    evidence.source == "multi_package_plan"
+                    for evidence in candidate.evidence
+                )
+            )
+            if cleaned and (
+                _is_specific_output_package_label(cleaned)
+                or is_multi_package_binding
+            ):
+                return cleaned
+        return self.display_for_key(key) if key else cleaned
 
     def _make_unique_key(
         self,
@@ -834,6 +934,7 @@ def assignment_to_debug(
     return {
         "packages": [registry.display_for_key(key) for key in assignment.package_keys],
         "package_keys": list(assignment.package_keys),
+        "selected_label": _clean_output_package_label(assignment.selected_label),
         "mode": assignment.mode,
         "confidence": assignment.confidence,
         "reason": assignment.reason,
@@ -919,18 +1020,28 @@ def _resolve_direct_assignment(
             "当前表题与表头指向不同具体封装，保持未解析",
         )
     if len(title_keys) == 1:
+        package_key = next(iter(title_keys))
         return TablePackageAssignment(
-            tuple(title_keys),
+            (package_key,),
             "table_title",
             0.98,
             "当前表格标题明确包含唯一封装",
+            selected_label=registry.best_label_for_key_in_text(
+                package_key,
+                target.title,
+            ),
         )
     if len(header_keys) == 1:
+        package_key = next(iter(header_keys))
         return TablePackageAssignment(
-            tuple(header_keys),
+            (package_key,),
             "table_header",
             0.95,
             "当前表头明确包含唯一具体封装",
+            selected_label=registry.best_label_for_key_in_text(
+                package_key,
+                header_text,
+            ),
         )
 
     # 兼容规则层已经从当前表题得到的 pkg，但它不能覆盖表题/表头冲突。
@@ -939,22 +1050,35 @@ def _resolve_direct_assignment(
             registry.keys_for_label(target.declared_package)
         )
         if len(declared_keys) == 1:
+            package_key = next(iter(declared_keys))
             return TablePackageAssignment(
-                tuple(declared_keys),
+                (package_key,),
                 "rule_declared",
                 0.94,
                 "规则层从当前表局部信息得到唯一封装",
+                selected_label=(
+                    _clean_output_package_label(target.declared_package)
+                    if registry.unique_key_for_label(target.declared_package)
+                    == package_key
+                    else ""
+                ),
             )
 
     heading_keys: set[str] = set()
     for heading in target.current_chapter_titles:
         heading_keys.update(registry.specific_keys_in_text(heading))
     if len(heading_keys) == 1:
+        package_key = next(iter(heading_keys))
+        heading_text = "\n".join(target.current_chapter_titles)
         return TablePackageAssignment(
-            tuple(heading_keys),
+            (package_key,),
             "current_chapter",
             0.9,
             "当前章节上下文只包含一个明确封装",
+            selected_label=registry.best_label_for_key_in_text(
+                package_key,
+                heading_text,
+            ),
         )
     if len(heading_keys) > 1:
         return TablePackageAssignment(
@@ -1156,6 +1280,10 @@ def _validate_semantic_assignment(
             "semantic_context",
             0.86,
             f"语义上下文证据：{', '.join(evidence_ids)}",
+            selected_label=registry.best_label_for_key_in_text(
+                package_key,
+                "\n".join(all_blocks[block_id].text for block_id in evidence_ids),
+            ),
         ),
         "",
     )
@@ -1167,24 +1295,38 @@ def _resolve_continuation_assignments(
 ) -> None:
     """规范化表题相同的续表继承唯一 pkg。"""
 
-    title_packages: dict[str, set[str]] = {}
+    title_packages: dict[str, list[TablePackageAssignment]] = {}
     for target in targets:
-        keys = assignments[target.table_id].package_keys
+        assignment = assignments[target.table_id]
+        keys = assignment.package_keys
         title_key = _normalized_continuation_title(target.title)
         if title_key and len(keys) == 1:
-            title_packages.setdefault(title_key, set()).update(keys)
+            title_packages.setdefault(title_key, []).append(assignment)
 
     for target in targets:
         if assignments[target.table_id].mode != "unresolved":
             continue
         title_key = _normalized_continuation_title(target.title)
-        keys = title_packages.get(title_key, set())
+        source_assignments = title_packages.get(title_key, [])
+        keys = {
+            assignment.package_keys[0]
+            for assignment in source_assignments
+            if len(assignment.package_keys) == 1
+        }
         if title_key and len(keys) == 1:
+            selected_labels = {
+                _clean_output_package_label(assignment.selected_label)
+                for assignment in source_assignments
+                if _clean_output_package_label(assignment.selected_label)
+            }
             assignments[target.table_id] = TablePackageAssignment(
                 tuple(keys),
                 "continuation",
                 0.9,
                 "规范化后的 Table 编号/标题与已归属续表完全一致",
+                selected_label=(
+                    next(iter(selected_labels)) if len(selected_labels) == 1 else ""
+                ),
             )
 
 
@@ -1194,26 +1336,39 @@ def _resolve_unique_section_assignments(
 ) -> None:
     """同一最深章节只有一个明确封装时，为未标注表继承该封装。"""
 
-    scope_packages: dict[str, set[str]] = {}
+    scope_packages: dict[str, list[TablePackageAssignment]] = {}
     for target in targets:
         assignment = assignments[target.table_id]
         if len(assignment.package_keys) != 1:
             continue
         scope = _section_scope(target.current_chapter_titles)
         if scope:
-            scope_packages.setdefault(scope, set()).update(assignment.package_keys)
+            scope_packages.setdefault(scope, []).append(assignment)
 
     for target in targets:
         if assignments[target.table_id].mode != "unresolved":
             continue
         scope = _section_scope(target.current_chapter_titles)
-        keys = scope_packages.get(scope, set())
+        source_assignments = scope_packages.get(scope, [])
+        keys = {
+            assignment.package_keys[0]
+            for assignment in source_assignments
+            if len(assignment.package_keys) == 1
+        }
         if scope and len(keys) == 1:
+            selected_labels = {
+                _clean_output_package_label(assignment.selected_label)
+                for assignment in source_assignments
+                if _clean_output_package_label(assignment.selected_label)
+            }
             assignments[target.table_id] = TablePackageAssignment(
                 tuple(keys),
                 "same_section",
                 0.82,
                 "同一最深章节中的明确目标表只属于一个封装",
+                selected_label=(
+                    next(iter(selected_labels)) if len(selected_labels) == 1 else ""
+                ),
             )
 
 
@@ -1803,6 +1958,86 @@ def _unique_labels(values: Sequence[str]) -> list[str]:
             result.append(cleaned)
             normalized_seen.add(normalized)
     return result
+
+
+def _clean_output_package_label(value: str) -> str:
+    """清理最终 pkg；发现别名拼接符时拒绝整串，不能截取其中一段猜测。"""
+
+    cleaned = _clean_package_label(value)
+    if "|" in cleaned:
+        return ""
+    return cleaned
+
+
+def _is_specific_output_package_label(value: str) -> bool:
+    """判断名称能否作为一个独立 pkg 输出，机械家族只保留为内部上下文。"""
+
+    cleaned = _clean_output_package_label(value)
+    return bool(
+        cleaned
+        and _package_label_role(cleaned) == "package_identity"
+        and _looks_like_package_value(cleaned)
+    )
+
+
+def _package_output_label_priority(
+    value: str,
+    *,
+    source: str = "",
+    drawing_code: str = "",
+    is_primary: bool = False,
+) -> tuple[int, ...]:
+    """为同一实体的别名排序，不通过拼接制造新的 pkg 名称。
+
+    长度不超过 15 只是优先信号，不是硬截断条件。证据充分但更长的具体名称
+    仍可以作为最后兜底，避免代码擅自改写原文。
+    """
+
+    cleaned = _clean_output_package_label(value)
+    if not _is_specific_output_package_label(cleaned):
+        return (0,)
+    source_priority = {
+        "multi_package_plan": 100,
+        "table_title": 95,
+        "package_drawing_column": 92,
+        "package_name_column": 88,
+        "package_type_column": 75,
+        "semantic_document": 70,
+        "current_heading": 60,
+    }.get(source, 50)
+    normalized = _normalize(cleaned)
+    normalized_drawing = _normalize(drawing_code)
+    return (
+        1,
+        int(bool(normalized_drawing and normalized == normalized_drawing)),
+        source_priority,
+        int(len(cleaned) <= 15),
+        int(bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", cleaned))),
+        int(is_primary),
+        -len(cleaned),
+    )
+
+
+def _select_candidate_canonical_name(candidate: PackageCandidate) -> str:
+    """从候选实体内部别名中选择一个规范名称，绝不返回别名列表。"""
+
+    eligible = [
+        alias
+        for alias in candidate.aliases
+        if _is_specific_output_package_label(alias)
+    ]
+    if not eligible:
+        return ""
+    return max(
+        eligible,
+        key=lambda alias: candidate.alias_priorities.get(
+            alias,
+            _package_output_label_priority(
+                alias,
+                drawing_code=candidate.drawing_code,
+            ),
+        ),
+    )
 
 
 def _unique_keys(values: Iterable[str]) -> tuple[str, ...]:
