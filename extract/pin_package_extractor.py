@@ -371,6 +371,7 @@ def extract_pin_package_info_from_table_candidates(
                             "name": entry.name,
                             "aliases": entry.aliases,
                             "package_type": entry.package_type,
+                            "package_drawing": entry.package_drawing,
                             "pin_count": entry.pin_count,
                             "evidence_table_ids": entry.evidence_table_ids,
                         }

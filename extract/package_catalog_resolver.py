@@ -6,16 +6,14 @@
 
 固定处理流程：
 
-1. 从全文表格中定位可能的封装总述表。定位只决定是否值得送模型，不直接
-   认定封装名称。
-2. 模型读取候选总述表的完整内容，返回该表是否为封装总述表，以及其中
-   表示独立引脚映射空间的真实封装名称。
-3. 合并多个总述表中重复出现的同名封装；订购后缀、温度等级和包装数量
-   不能由代码主观裁剪，模型必须返回总述语义中的规范名称。
-4. 使用已经完成的多封装结构计划校验封装数量，并把表内封装列/行绑定到
-   文档封装目录。
-5. 单封装表只通过表题、当前章节标题和表头中的明确名称绑定；没有证据时
-   保持未解析，不使用相似字符串强行归并。
+1. 从全文表格中宽松定位可能的封装总述表或包装信息表。
+2. 模型只判断表格角色、表头行和列角色，不返回任何 pkg 值。
+3. 代码按照模型给出的列索引逐行读取原表。只有 ``identity_summary`` 表
+   的 ``package_identity`` 列可以创建 pkg。
+4. ``packaging_metadata`` 表只能通过 ``orderable_sku`` 给已有 pkg 补充
+   package_type、package_drawing 和 pin_count，不能创建新 pkg。
+5. 目标引脚表只通过表题、章节标题、表头和多封装列标签绑定目录项；
+   description 和数据行不能参与绑定。
 6. 最终返回稳定的内部 package_key 和单个真实 pkg 名称。内部 key 只用于
    分组，绝不写入公开 JSON。
 
@@ -27,6 +25,7 @@
 * 一个 pkg 只能是一个字符串，禁止使用 ``|`` 拼接多个候选名称。
 * pkg 名称最长 15 个字符；超过长度的标题、描述或多个名称拼接结果直接拒绝。
 * 无法确定真实名称时输出空字符串；不能退回旧的 a/b/c 假名称。
+* 订购型号、封装类型和封装 Drawing 都不能单独创建 pkg。
 """
 
 from __future__ import annotations
@@ -78,14 +77,34 @@ class PackageTargetTable:
 
 @dataclass
 class PackageCatalogEntry:
-    """一个经过规范化和证据校验的真实封装候选。"""
+    """一个由总述表原始单元格创建的真实封装目录项。"""
 
     package_key: str
     name: str
     aliases: list[str] = field(default_factory=list)
     package_type: str = ""
+    package_drawing: str = ""
     pin_count: str = ""
     evidence_table_ids: list[int] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PackageColumnRole:
+    """模型确认的一列语义；这里只保存列索引和角色，不保存单元格值。"""
+
+    column_index: int
+    role: str
+    header: str = ""
+
+
+@dataclass(frozen=True)
+class PackageCatalogDecision:
+    """模型对一张候选表的结构判断。"""
+
+    is_package_summary: bool
+    table_role: str
+    header_row_index: int
+    columns: tuple[PackageColumnRole, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -118,10 +137,7 @@ class PackageCatalogResolution:
         )
 
 
-PackageCatalogClassifier = Callable[
-    [PackageCatalogTable, str],
-    Mapping[str, Any],
-]
+PackageCatalogClassifier = Callable[..., Mapping[str, Any]]
 
 
 def resolve_document_package_catalog(
@@ -148,12 +164,14 @@ def resolve_document_package_catalog(
         entries, semantic_diagnostics = classify_package_catalog_candidates(
             catalog_candidates,
             source_name=source_name,
+            target_tables=target_tables,
             classifier=classifier,
         )
         diagnostics.extend(semantic_diagnostics)
 
-    # 表内多封装绑定是已经验证过的列/行结构证据。模型漏掉某个名称时，
-    # 允许用绑定标签补充目录，但不会覆盖模型已经确认的同名条目。
+    # 只有整篇文档没有找到任何身份总述表时，才允许表内多封装标签作为
+    # 兜底目录。目录一旦存在，package type/drawing 标签只能参与绑定，
+    # 不能再创建与真实器件身份并列的新 pkg。
     entries = merge_plan_package_labels(
         entries,
         target_tables=target_tables,
@@ -297,9 +315,15 @@ def classify_package_catalog_candidates(
     tables: Sequence[PackageCatalogTable],
     *,
     source_name: str,
+    target_tables: Sequence[PackageTargetTable],
     classifier: PackageCatalogClassifier | None = None,
 ) -> tuple[list[PackageCatalogEntry], list[dict[str, Any]]]:
-    """并发判断候选总述表，并按原文顺序合并模型返回的封装名称。"""
+    """并发判断表格结构，再由代码从原始行中建立封装目录。
+
+    模型只能返回表格角色、表头行和列角色。pkg、封装类型、Drawing 和
+    pin_count 的实际值都由本函数后续调用的确定性代码从 ``table.rows``
+    读取，避免模型改写名称或把元数据误当成 pkg。
+    """
 
     if not tables:
         return [], []
@@ -329,7 +353,12 @@ def classify_package_catalog_candidates(
     diagnostics: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=min(workers, len(tables))) as executor:
         futures = {
-            executor.submit(classifier, table, source_name): (order, table)
+            executor.submit(
+                classifier,
+                table,
+                source_name,
+                target_tables,
+            ): (order, table)
             for order, table in enumerate(tables)
         }
         for completed, future in enumerate(as_completed(futures), 1):
@@ -350,9 +379,14 @@ def classify_package_catalog_candidates(
                 flush=True,
             )
 
-    entries: list[PackageCatalogEntry] = []
-    for _, table, response in sorted(responses, key=lambda item: item[0]):
-        if not bool(response.get("is_package_summary")):
+    decisions: list[tuple[int, PackageCatalogTable, PackageCatalogDecision]] = []
+    # 模型并发完成顺序不可控；按 table_id 恢复全文原始表格顺序。
+    for _, table, response in sorted(
+        responses,
+        key=lambda item: item[1].table_id,
+    ):
+        decision = package_catalog_decision_from_response(table, response)
+        if not decision.is_package_summary:
             diagnostics.append(
                 {
                     "stage": "package_catalog",
@@ -362,78 +396,348 @@ def classify_package_catalog_candidates(
                 }
             )
             continue
-        accepted_names = []
-        for raw_package in response.get("packages") or []:
-            entry = entry_from_model_package(raw_package, table)
-            if entry is None:
-                continue
-            merge_catalog_entry(entries, entry)
-            accepted_names.append(entry.name)
+        decisions.append((table.table_id, table, decision))
         diagnostics.append(
             {
                 "stage": "package_catalog",
                 "table_id": table.table_id,
-                "status": "accepted" if accepted_names else "empty",
-                "packages": accepted_names,
+                "status": "structure_accepted",
+                "table_role": decision.table_role,
+                "header_row_index": decision.header_row_index,
+                "columns": [
+                    {
+                        "column_index": column.column_index,
+                        "role": column.role,
+                    }
+                    for column in decision.columns
+                ],
             }
         )
+    entries = build_catalog_entries_from_decisions(decisions, diagnostics)
     return entries, diagnostics
 
 
-def entry_from_model_package(
-    raw_package: Any,
+def package_catalog_decision_from_response(
     table: PackageCatalogTable,
+    response: Mapping[str, Any],
+) -> PackageCatalogDecision:
+    """把模型返回值转换成只含结构信息的内部对象。"""
+
+    table_role = str(response.get("table_role") or "irrelevant")
+    if table_role not in {
+        "identity_summary",
+        "packaging_metadata",
+        "irrelevant",
+    }:
+        table_role = "irrelevant"
+    try:
+        header_row_index = int(response.get("header_row_index", 0))
+    except (TypeError, ValueError):
+        header_row_index = 0
+    if not table.rows:
+        header_row_index = 0
+    else:
+        header_row_index = min(max(header_row_index, 0), len(table.rows) - 1)
+
+    allowed_roles = {
+        "package_identity",
+        "package_type",
+        "package_drawing",
+        "pin_count",
+        "orderable_sku",
+    }
+    width = max((len(row) for row in table.rows), default=len(table.headers))
+    columns: list[PackageColumnRole] = []
+    seen: set[tuple[int, str]] = set()
+    for item in response.get("columns") or []:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            column_index = int(item.get("column_index"))
+        except (TypeError, ValueError):
+            continue
+        role = str(item.get("role") or "")
+        if role not in allowed_roles or column_index < 0 or column_index >= width:
+            continue
+        key = (column_index, role)
+        if key in seen:
+            continue
+        seen.add(key)
+        columns.append(
+            PackageColumnRole(
+                column_index=column_index,
+                role=role,
+                header=(
+                    str(table.rows[header_row_index][column_index])
+                    if (
+                        table.rows
+                        and column_index < len(table.rows[header_row_index])
+                    )
+                    else table.headers[column_index]
+                    if column_index < len(table.headers)
+                    else f"column_{column_index + 1}"
+                ),
+            )
+        )
+
+    # 只有身份总述表具有 package_identity，或者包装信息表具有
+    # orderable_sku 时，结构判断才可进入确定性读取。
+    roles = {column.role for column in columns}
+    structurally_valid = (
+        table_role == "identity_summary" and "package_identity" in roles
+    ) or (
+        table_role == "packaging_metadata" and "orderable_sku" in roles
+    )
+    return PackageCatalogDecision(
+        is_package_summary=(
+            bool(response.get("is_package_summary")) and structurally_valid
+        ),
+        table_role=table_role if structurally_valid else "irrelevant",
+        header_row_index=header_row_index,
+        columns=tuple(columns),
+    )
+
+
+def build_catalog_entries_from_decisions(
+    decisions: Sequence[
+        tuple[int, PackageCatalogTable, PackageCatalogDecision]
+    ],
+    diagnostics: list[dict[str, Any]],
+) -> list[PackageCatalogEntry]:
+    """先由身份总述表创建 pkg，再由包装信息表补充元数据。"""
+
+    entries: list[PackageCatalogEntry] = []
+
+    # 第一遍只处理身份总述表。无论包装信息表在文档中位于前部还是后部，
+    # 都必须等真实 pkg 目录建立后才能参与补充。
+    for _, table, decision in decisions:
+        if decision.table_role != "identity_summary":
+            continue
+        created_names = create_identity_entries_from_table(
+            entries,
+            table,
+            decision,
+        )
+        diagnostics.append(
+            {
+                "stage": "package_catalog_rows",
+                "table_id": table.table_id,
+                "table_role": decision.table_role,
+                "created_or_merged": created_names,
+            }
+        )
+
+    # 第二遍只允许补充已有目录项。即使订购型号、Drawing、Package Type
+    # 看起来像短名称，也绝不能在这一遍创建 pkg。
+    for _, table, decision in decisions:
+        if decision.table_role != "packaging_metadata":
+            continue
+        enriched_names = enrich_entries_from_packaging_table(
+            entries,
+            table,
+            decision,
+        )
+        diagnostics.append(
+            {
+                "stage": "package_catalog_rows",
+                "table_id": table.table_id,
+                "table_role": decision.table_role,
+                "enriched": enriched_names,
+            }
+        )
+    return entries
+
+
+def create_identity_entries_from_table(
+    entries: list[PackageCatalogEntry],
+    table: PackageCatalogTable,
+    decision: PackageCatalogDecision,
+) -> list[str]:
+    """从身份总述表逐行创建 pkg；模型不接触实际输出名称。"""
+
+    created_names: list[str] = []
+    identity_columns = columns_for_role(decision, "package_identity")
+    for row in table.rows[decision.header_row_index + 1 :]:
+        for identity_column in identity_columns:
+            name = clean_package_name(cell_value(row, identity_column))
+            if (
+                not name
+                or is_generic_package_label(name)
+                or is_repeated_header_value(name, identity_column.header)
+            ):
+                continue
+            package_type = first_role_value(row, decision, "package_type")
+            pin_count = clean_pin_count(
+                first_role_value(row, decision, "pin_count")
+            )
+            package_type, type_pin_count = split_package_type_and_pin_count(
+                package_type
+            )
+            incoming = PackageCatalogEntry(
+                package_key=make_package_key(name),
+                name=name,
+                package_type=package_type,
+                package_drawing=first_role_value(
+                    row,
+                    decision,
+                    "package_drawing",
+                ),
+                pin_count=pin_count or type_pin_count,
+                evidence_table_ids=[table.table_id],
+            )
+            merge_catalog_entry(entries, incoming)
+            if name not in created_names:
+                created_names.append(name)
+    return created_names
+
+
+def enrich_entries_from_packaging_table(
+    entries: list[PackageCatalogEntry],
+    table: PackageCatalogTable,
+    decision: PackageCatalogDecision,
+) -> list[str]:
+    """按订购型号前缀关联已有 pkg，并补充包装元数据。"""
+
+    enriched_names: list[str] = []
+    lookup_columns = [
+        *columns_for_role(decision, "package_identity"),
+        *columns_for_role(decision, "orderable_sku"),
+    ]
+    for row in table.rows[decision.header_row_index + 1 :]:
+        lookup_values = [
+            cell_value(row, column)
+            for column in lookup_columns
+            if cell_value(row, column)
+        ]
+        entry = match_existing_entry_from_orderable_values(entries, lookup_values)
+        if entry is None:
+            continue
+
+        package_type = first_role_value(row, decision, "package_type")
+        pin_count = clean_pin_count(
+            first_role_value(row, decision, "pin_count")
+        )
+        package_type, type_pin_count = split_package_type_and_pin_count(
+            package_type
+        )
+        update_entry_metadata(
+            entry,
+            package_type=package_type,
+            package_drawing=first_role_value(
+                row,
+                decision,
+                "package_drawing",
+            ),
+            pin_count=pin_count or type_pin_count,
+            evidence_table_id=table.table_id,
+        )
+        if entry.name not in enriched_names:
+            enriched_names.append(entry.name)
+    return enriched_names
+
+
+def columns_for_role(
+    decision: PackageCatalogDecision,
+    role: str,
+) -> list[PackageColumnRole]:
+    """按模型确认的角色读取列，保持原表从左到右顺序。"""
+
+    return [column for column in decision.columns if column.role == role]
+
+
+def cell_value(
+    row: Sequence[str],
+    column: PackageColumnRole,
+) -> str:
+    """按列索引读取原始单元格并做最小空白清理。"""
+
+    if column.column_index >= len(row):
+        return ""
+    return clean_metadata(str(row[column.column_index]))
+
+
+def first_role_value(
+    row: Sequence[str],
+    decision: PackageCatalogDecision,
+    role: str,
+) -> str:
+    """读取一行中第一个非空的指定角色值。"""
+
+    for column in columns_for_role(decision, role):
+        value = cell_value(row, column)
+        if value and not is_repeated_header_value(value, column.header):
+            return value
+    return ""
+
+
+def is_repeated_header_value(value: str, header: str) -> bool:
+    """防止多段表格中重复出现的表头被当成 pkg 或元数据。"""
+
+    normalized_value = normalize_text(value)
+    normalized_header = normalize_text(header)
+    return bool(
+        normalized_value
+        and normalized_header
+        and normalized_value == normalized_header
+    )
+
+
+def split_package_type_and_pin_count(value: str) -> tuple[str, str]:
+    """拆解 ``SC-70 (5)`` 这类同格元数据，不改变 pkg 身份。"""
+
+    value = clean_metadata(value)
+    match = re.fullmatch(r"(.*?)\s*\(\s*(\d+)\s*\)", value)
+    if not match:
+        return value, ""
+    return clean_metadata(match.group(1)), match.group(2)
+
+
+def match_existing_entry_from_orderable_values(
+    entries: Sequence[PackageCatalogEntry],
+    values: Sequence[str],
 ) -> PackageCatalogEntry | None:
-    """校验一个模型候选，拒绝长段文本和缺少原表证据的名称。"""
+    """用完整身份或订购型号前缀匹配已有 pkg，歧义时不补充。"""
 
-    if not isinstance(raw_package, Mapping):
+    ranked: list[tuple[int, PackageCatalogEntry]] = []
+    for entry in entries:
+        identity = normalize_compact(entry.name)
+        if not identity:
+            continue
+        for value in values:
+            candidate = normalize_compact(value)
+            if candidate == identity or candidate.startswith(identity):
+                ranked.append((len(identity), entry))
+                break
+    if not ranked:
         return None
-    name = clean_package_name(str(raw_package.get("name") or ""))
-    if not name:
-        return None
-
-    # 名称必须能在完整表格或绑定的标题/章节上下文中找到。允许规范名称作为
-    # 较长订购型号的连续子串，例如 SF2507 来自 SF2507IPMP。
-    evidence_text = normalize_compact(
-        " ".join(
-            [
-                table.title,
-                table.group_context,
-                *table.current_chapter_titles,
-                *(" ".join(row) for row in table.rows),
-            ]
-        )
-    )
-    if normalize_compact(name) not in evidence_text:
-        return None
-    aliases = [
-        clean_package_name(str(alias))
-        for alias in raw_package.get("aliases") or []
+    best_length = max(length for length, _ in ranked)
+    best_entries = [
+        entry
+        for length, entry in ranked
+        if length == best_length
     ]
-    aliases = [
-        alias
-        for alias in aliases
-        if (
-            alias
-            and alias != name
-            and normalize_compact(alias) in evidence_text
-        )
-    ]
+    unique = {entry.package_key: entry for entry in best_entries}
+    return next(iter(unique.values())) if len(unique) == 1 else None
 
-    package_type = clean_metadata(str(raw_package.get("package_type") or ""))
-    # package_type 后续可参与目标表绑定，因此同样必须真实出现在证据中；
-    # 模型补充但原文没有的封装家族不能进入确定性绑定。
-    if package_type and normalize_compact(package_type) not in evidence_text:
-        package_type = ""
 
-    return PackageCatalogEntry(
-        package_key=make_package_key(name),
-        name=name,
-        aliases=aliases,
-        package_type=package_type,
-        pin_count=clean_pin_count(raw_package.get("pin_count")),
-        evidence_table_ids=[table.table_id],
-    )
+def update_entry_metadata(
+    entry: PackageCatalogEntry,
+    *,
+    package_type: str,
+    package_drawing: str,
+    pin_count: str,
+    evidence_table_id: int,
+) -> None:
+    """只填充尚未确定的元数据，不能覆盖身份总述表已有信息。"""
+
+    if package_type and not entry.package_type:
+        entry.package_type = package_type
+    if package_drawing and not entry.package_drawing:
+        entry.package_drawing = package_drawing
+    if pin_count and not entry.pin_count:
+        entry.pin_count = pin_count
+    if evidence_table_id not in entry.evidence_table_ids:
+        entry.evidence_table_ids.append(evidence_table_id)
 
 
 def merge_catalog_entry(
@@ -461,6 +765,8 @@ def merge_catalog_entry(
                 existing.evidence_table_ids.append(table_id)
         if not existing.package_type:
             existing.package_type = incoming.package_type
+        if not existing.package_drawing:
+            existing.package_drawing = incoming.package_drawing
         if not existing.pin_count:
             existing.pin_count = incoming.pin_count
         return
@@ -473,9 +779,15 @@ def merge_plan_package_labels(
     target_tables: Sequence[PackageTargetTable],
     multi_package_plans: Mapping[int, MultiPackagePlanLike],
 ) -> list[PackageCatalogEntry]:
-    """用表内多封装计划补充模型漏掉、但结构已经确认的真实标签。"""
+    """目录为空时，才用表内多封装标签建立兜底目录。
+
+    身份总述表已经创建真实 pkg 后，表内 ``QFN``、``VSSOP``、``DGK`` 等
+    标签只能用于后面的绑定，不能再创建新的 pkg。
+    """
 
     result = list(entries)
+    if result:
+        return result
     target_ids = {table.table_id for table in target_tables}
     for table_id, plan in multi_package_plans.items():
         if table_id not in target_ids or not plan.is_multi_package:
@@ -483,10 +795,6 @@ def merge_plan_package_labels(
         for binding in plan.bindings:
             name = clean_package_name(binding.package)
             if not name or is_generic_package_label(name):
-                continue
-            # 总述目录中的规范名称、别名或已验证 package_type 能解释当前
-            # 表内标签时，标签只作为绑定证据，不能再创建第二个 pkg。
-            if match_entries_in_text(result, name):
                 continue
             merge_catalog_entry(
                 result,
@@ -606,12 +914,13 @@ def match_entries_in_text(
     normalized_text = normalize_text(text)
     matches = []
     for entry in entries:
-        # 真实名称和显式别名优先；经过原文证据校验的 package_type 也可用于
-        # 表题只写封装类型的情况。若同一类型对应多个目录项，会得到多个
-        # matches 并保持未解析，绝不武断选择其中一个。
+        # 真实名称和显式别名优先；封装类型和 Drawing 只能用于绑定，不会
+        # 创建目录项。若同一种元数据对应多个 pkg，会保持歧义而不武断选择。
         names = [entry.name, *entry.aliases]
         if entry.package_type:
             names.append(entry.package_type)
+        if entry.package_drawing:
+            names.append(entry.package_drawing)
         if any(package_name_in_text(name, normalized_text) for name in names):
             matches.append(entry)
     return matches
@@ -650,7 +959,7 @@ def chapter_context_key(table: PackageTargetTable) -> str:
 
 
 def clean_package_name(value: str) -> str:
-    """清理模型名称；一个名称必须保持为单个短字符串。"""
+    """清理原始身份单元格；一个名称必须保持为单个短字符串。"""
 
     value = re.sub(r"<[^>]+>", " ", value)
     value = re.sub(r"\s+", " ", value).strip(" \t\r\n,;:")
@@ -690,7 +999,7 @@ def clean_metadata(value: str) -> str:
 
 
 def clean_pin_count(value: Any) -> str:
-    """把模型返回的 pin_count 规范成数字字符串。"""
+    """把原始表格中的 pin_count 规范成数字字符串。"""
 
     match = re.search(r"\d+", str(value or ""))
     return match.group(0) if match else ""

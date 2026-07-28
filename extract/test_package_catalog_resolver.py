@@ -16,6 +16,7 @@ from extract.pin_package_extractor import (
     TableCandidate,
     TableDecision,
 )
+from extract.semantic_classifier import normalize_package_catalog_response
 
 
 def catalog_table(table_id, title, headers, rows, page_idx=0):
@@ -116,7 +117,12 @@ def test_catalog_filters_unrelated_summary_devices_by_target_evidence():
         0,
         "Device Comparison",
         ["DEVICE", "PACKAGE"],
-        [["VSC8224", "BGA"], ["VSC8234", "BGA"], ["VSC8244", "BGA"]],
+        [
+            ["DEVICE", "PACKAGE"],
+            ["VSC8224", "BGA"],
+            ["VSC8234", "BGA"],
+            ["VSC8244", "BGA"],
+        ],
     )
     target = target_table(
         1,
@@ -124,13 +130,14 @@ def test_catalog_filters_unrelated_summary_devices_by_target_evidence():
         ["HSBGA BALL", "SIGNAL NAME", "TYPE"],
     )
 
-    def classifier(table, source_name):
+    def classifier(table, source_name, target_tables):
         return {
             "is_package_summary": True,
-            "packages": [
-                {"name": "VSC8224"},
-                {"name": "VSC8234"},
-                {"name": "VSC8244"},
+            "table_role": "identity_summary",
+            "header_row_index": 0,
+            "columns": [
+                {"column_index": 0, "role": "package_identity"},
+                {"column_index": 1, "role": "package_type"},
             ],
         }
 
@@ -152,7 +159,11 @@ def test_verified_package_type_can_bind_a_target_title():
         0,
         "Device Information",
         ["DEVICE", "PACKAGE"],
-        [["DEV100", "QFN 32"], ["DEV200", "BGA 64"]],
+        [
+            ["DEVICE", "PACKAGE"],
+            ["DEV100", "QFN 32"],
+            ["DEV200", "BGA 64"],
+        ],
     )
     target = target_table(
         1,
@@ -160,12 +171,14 @@ def test_verified_package_type_can_bind_a_target_title():
         ["PIN NO", "PIN NAME", "TYPE"],
     )
 
-    def classifier(table, source_name):
+    def classifier(table, source_name, target_tables):
         return {
             "is_package_summary": True,
-            "packages": [
-                {"name": "DEV100", "package_type": "QFN 32"},
-                {"name": "DEV200", "package_type": "BGA 64"},
+            "table_role": "identity_summary",
+            "header_row_index": 0,
+            "columns": [
+                {"column_index": 0, "role": "package_identity"},
+                {"column_index": 1, "role": "package_type"},
             ],
         }
 
@@ -211,7 +224,11 @@ def test_multi_package_type_labels_do_not_duplicate_catalog_entries():
         0,
         "Device Information",
         ["DEVICE", "PACKAGE"],
-        [["DEV100", "SSOP 28"], ["DEV200", "QFN 28"]],
+        [
+            ["DEVICE", "PACKAGE"],
+            ["DEV100", "SSOP 28"],
+            ["DEV200", "QFN 28"],
+        ],
     )
     target = target_table(
         2,
@@ -227,12 +244,14 @@ def test_multi_package_type_labels_do_not_duplicate_catalog_entries():
         ),
     )
 
-    def classifier(table, source_name):
+    def classifier(table, source_name, target_tables):
         return {
             "is_package_summary": True,
-            "packages": [
-                {"name": "DEV100", "package_type": "SSOP 28"},
-                {"name": "DEV200", "package_type": "QFN 28"},
+            "table_role": "identity_summary",
+            "header_row_index": 0,
+            "columns": [
+                {"column_index": 0, "role": "package_identity"},
+                {"column_index": 1, "role": "package_type"},
             ],
         }
 
@@ -247,6 +266,129 @@ def test_multi_package_type_labels_do_not_duplicate_catalog_entries():
     assert [entry.name for entry in result.entries] == ["DEV100", "DEV200"]
     assert result.assignment_for(2, 0).pkg == "DEV100"
     assert result.assignment_for(2, 1).pkg == "DEV200"
+
+
+def test_identity_summary_creates_real_packages_and_packaging_only_enriches():
+    """总述表创建 INA 身份，包装表只能补 DCK/DGK/RGV 等元数据。"""
+
+    identity_summary = catalog_table(
+        0,
+        "器件信息",
+        ["器件型号", "封装", "封装尺寸"],
+        [
+            ["器件型号", "封装", "封装尺寸"],
+            ["INA290", "SC-70 (5)", "2.0 x 2.1"],
+            ["INA2290", "VSSOP (8)", "3.0 x 3.0"],
+            ["INA4290", "QFN (16)", "3.0 x 3.0"],
+        ],
+    )
+    packaging = catalog_table(
+        15,
+        "Packaging Information",
+        ["Orderable Device", "Package Type", "Package Drawing", "Pins"],
+        [
+            ["Orderable Device", "Package Type", "Package Drawing", "Pins"],
+            ["INA290A1IDCKR", "SC-70", "DCK", "5"],
+            ["INA2290A1IDGKR", "VSSOP", "DGK", "8"],
+            ["INA4290A1IRGVR", "VQFN", "RGV", "16"],
+        ],
+        page_idx=30,
+    )
+    targets = [
+        target_table(1, "Table 5-1. Pin Functions: INA290", ["PIN", "NAME"]),
+        target_table(2, "Table 5-2. Pin Functions: INA2290", ["PIN", "NAME"]),
+        target_table(3, "Table 5-3. Pin Functions: INA4290", ["PIN", "NAME"]),
+    ]
+
+    def classifier(table, source_name, target_tables):
+        if table.table_id == 0:
+            return {
+                "is_package_summary": True,
+                "table_role": "identity_summary",
+                "header_row_index": 0,
+                "columns": [
+                    {"column_index": 0, "role": "package_identity"},
+                    {"column_index": 1, "role": "package_type"},
+                ],
+            }
+        return {
+            "is_package_summary": True,
+            "table_role": "packaging_metadata",
+            "header_row_index": 0,
+            "columns": [
+                {"column_index": 0, "role": "orderable_sku"},
+                {"column_index": 1, "role": "package_type"},
+                {"column_index": 2, "role": "package_drawing"},
+                {"column_index": 3, "role": "pin_count"},
+            ],
+        }
+
+    result = resolve_document_package_catalog(
+        all_tables=[identity_summary, packaging],
+        target_tables=targets,
+        multi_package_plans={
+            target.table_id: MultiPackagePlan(False, "single_package")
+            for target in targets
+        },
+        use_semantic_classifier=True,
+        classifier=classifier,
+    )
+
+    assert [entry.name for entry in result.entries] == [
+        "INA290",
+        "INA2290",
+        "INA4290",
+    ]
+    assert [
+        (entry.package_type, entry.package_drawing, entry.pin_count)
+        for entry in result.entries
+    ] == [
+        ("SC-70", "DCK", "5"),
+        ("VSSOP", "DGK", "8"),
+        ("QFN", "RGV", "16"),
+    ]
+    assert [result.assignment_for(table_id, 0).pkg for table_id in (1, 2, 3)] == [
+        "INA290",
+        "INA2290",
+        "INA4290",
+    ]
+
+
+def test_packaging_metadata_cannot_create_package_without_identity_summary():
+    """只有 SKU/Type/Drawing 的包装表不能自行创建 pkg。"""
+
+    packaging = catalog_table(
+        0,
+        "Packaging Information",
+        ["Orderable Device", "Package Type", "Package Drawing", "Pins"],
+        [
+            ["Orderable Device", "Package Type", "Package Drawing", "Pins"],
+            ["INA2290A1IDGKR", "VSSOP", "DGK", "8"],
+        ],
+    )
+
+    def classifier(table, source_name, target_tables):
+        return {
+            "is_package_summary": True,
+            "table_role": "packaging_metadata",
+            "header_row_index": 0,
+            "columns": [
+                {"column_index": 0, "role": "orderable_sku"},
+                {"column_index": 1, "role": "package_type"},
+                {"column_index": 2, "role": "package_drawing"},
+                {"column_index": 3, "role": "pin_count"},
+            ],
+        }
+
+    result = resolve_document_package_catalog(
+        all_tables=[packaging],
+        target_tables=[],
+        multi_package_plans={},
+        use_semantic_classifier=True,
+        classifier=classifier,
+    )
+
+    assert result.entries == []
 
 
 def test_unresolved_package_never_falls_back_to_abc():
@@ -270,6 +412,32 @@ def test_package_name_rejects_multiple_or_overlong_values():
     assert clean_package_name("SF2507") == "SF2507"
     assert clean_package_name("SF2507|SF2507E") == ""
     assert clean_package_name("ABCDEFGHIJKLMNOP") == ""
+
+
+def test_catalog_model_response_keeps_only_structure_not_package_values():
+    normalized = normalize_package_catalog_response(
+        {
+            "is_package_summary": True,
+            "table_role": "identity_summary",
+            "header_row_index": 0,
+            "columns": [
+                {"column_index": 0, "role": "package_identity"},
+                {"column_index": 1, "role": "package_type"},
+            ],
+            # 即使模型违规返回名称，规范化层也必须彻底丢弃。
+            "packages": [{"name": "WRONG_MODEL_VALUE"}],
+        }
+    )
+
+    assert normalized == {
+        "is_package_summary": True,
+        "table_role": "identity_summary",
+        "header_row_index": 0,
+        "columns": [
+            {"column_index": 0, "role": "package_identity"},
+            {"column_index": 1, "role": "package_type"},
+        ],
+    }
 
 
 def test_full_pipeline_uses_catalog_name_without_changing_pin_mapping():
@@ -313,7 +481,12 @@ def test_full_pipeline_uses_catalog_name_without_changing_pin_mapping():
             "extract.semantic_classifier.classify_package_catalog_table",
             return_value={
                 "is_package_summary": True,
-                "packages": [{"name": "DEV100", "package_type": "QFN 32"}],
+                "table_role": "identity_summary",
+                "header_row_index": 0,
+                "columns": [
+                    {"column_index": 0, "role": "package_identity"},
+                    {"column_index": 1, "role": "package_type"},
+                ],
             },
         ),
     ):

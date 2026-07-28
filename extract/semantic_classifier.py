@@ -18,7 +18,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Any, Sequence
 
 
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -47,8 +47,9 @@ def classify_table_schema(
 def classify_package_catalog_table(
     table: Any,
     source_name: str = "",
+    target_tables: Sequence[Any] = (),
 ) -> dict[str, Any]:
-    """判断完整候选表是否为封装总述表，并返回独立 pinout 的真实名称。
+    """判断候选表角色及列角色，不返回任何封装名称或单元格值。
 
     ``table`` 使用鸭子类型，避免语义模块反向依赖封装目录的数据类。
     """
@@ -59,19 +60,23 @@ def classify_package_catalog_table(
 
     payload = {
         "task": (
-            "Decide whether this complete table is a document-level package/device summary. "
-            "If it is, list the canonical real names of the independent physical pinout "
-            "namespaces described by the document."
+            "Classify this complete candidate table for document-level package resolution. "
+            "Return only the table role, the last header row index, and semantic roles of "
+            "columns. Never return package names or extracted cell values."
         ),
         "rules": [
             "Read the complete table, title and chapter context.",
-            "A package entry means one independent physical pin/ball mapping namespace.",
-            "Return model or device variants separately only when the document gives them independent physical pin mappings.",
-            "When one table contains multiple package-specific physical pin-number columns, return each independent package column.",
-            "Do not return every orderable SKU, temperature suffix, tape-and-reel variant, package quantity or package drawing row as a separate package.",
-            "Do not return unrelated comparison devices merely because they appear in a comparison table.",
-            "The name must be one short canonical string of at most 15 characters present in, or a continuous substring of, the supplied evidence.",
-            "Return exactly one name per entry. Never join candidates with |.",
+            "Use target pin-table titles only as context for deciding which candidate column contains the primary package/device identity.",
+            "identity_summary means each data row directly names an independent physical pinout identity, such as INA290, INA2290 and INA4290.",
+            "packaging_metadata means rows contain orderable SKUs, package type, package drawing, pin count or shipment variants that only enrich an existing identity.",
+            "An ordering or packaging table must never be identity_summary merely because its SKU contains a device name.",
+            "package_identity is the short primary device/package variant that identifies one independent pin mapping and is expected in target pin-table titles.",
+            "package_type is a physical family such as SC-70, VSSOP or QFN; it is metadata, not package_identity.",
+            "package_drawing is a drawing/code such as DCK, DGK or RGV; it is metadata, not package_identity.",
+            "orderable_sku is a purchasable ordering string with grade, temperature or shipment suffixes; it is not package_identity.",
+            "pin_count is the number of physical pins or balls.",
+            "header_row_index is zero-based and points to the last header row; data starts on the following row.",
+            "Return irrelevant when the table neither establishes identities nor supplies packaging metadata.",
             "This task does not identify pin_no, pin_name, type, group names or row values.",
         ],
         "document": {"source_name": source_name},
@@ -93,14 +98,28 @@ def classify_package_catalog_table(
                 for row in (getattr(table, "rows", ()) or ())
             ],
         },
+        "target_pin_tables": [
+            {
+                "table_id": getattr(target, "table_id", None),
+                "title": getattr(target, "title", ""),
+                "current_chapter_titles": list(
+                    getattr(target, "current_chapter_titles", ()) or ()
+                ),
+                "headers": list(getattr(target, "headers", ()) or ()),
+            }
+            for target in target_tables
+        ],
         "output_schema": {
             "is_package_summary": "boolean",
-            "packages": [
+            "table_role": "identity_summary|packaging_metadata|irrelevant",
+            "header_row_index": "zero-based integer",
+            "columns": [
                 {
-                    "name": "one canonical real package/device pinout name",
-                    "aliases": ["explicit alias only"],
-                    "package_type": "optional package family/type",
-                    "pin_count": "optional integer",
+                    "column_index": "zero-based integer",
+                    "role": (
+                        "package_identity|package_type|package_drawing|"
+                        "pin_count|orderable_sku|ignore"
+                    ),
                 }
             ],
         },
@@ -109,9 +128,9 @@ def classify_package_catalog_table(
         payload,
         api_key=api_key,
         system_prompt=(
-            "You identify a document's independent semiconductor package/pinout namespaces "
-            "from one complete candidate summary table. Return valid JSON containing only "
-            "is_package_summary and packages. Do not map pin fields or generate pin records."
+            "You classify one complete semiconductor package-summary or packaging table. "
+            "Return valid JSON containing only is_package_summary, table_role, "
+            "header_row_index and columns. Never output package names or cell values."
         ),
         max_tokens=int(os.getenv("EXTRACT_PACKAGE_MAX_TOKENS", "4000")),
         timeout=float(os.getenv("EXTRACT_PACKAGE_TIMEOUT", "60")),
@@ -326,35 +345,63 @@ def normalize_schema_response(response: dict[str, Any], headers: list[str]) -> d
 
 
 def normalize_package_catalog_response(response: dict[str, Any]) -> dict[str, Any]:
-    """只保留封装总述判断协议中的字段，禁止混入字段映射或最终记录。"""
+    """只保留表格结构协议，彻底丢弃模型生成的名称和值。"""
 
-    packages = []
-    for item in response.get("packages") or []:
+    table_role = re.sub(
+        r"[^a-z_]+",
+        "",
+        str(response.get("table_role") or "").lower(),
+    )
+    if table_role not in {
+        "identity_summary",
+        "packaging_metadata",
+        "irrelevant",
+    }:
+        table_role = "irrelevant"
+    try:
+        header_row_index = max(0, int(response.get("header_row_index", 0)))
+    except (TypeError, ValueError):
+        header_row_index = 0
+
+    allowed_roles = {
+        "package_identity",
+        "package_type",
+        "package_drawing",
+        "pin_count",
+        "orderable_sku",
+        "ignore",
+    }
+    columns = []
+    seen = set()
+    for item in response.get("columns") or []:
         if not isinstance(item, dict):
             continue
-        name = re.sub(r"\s+", " ", str(item.get("name") or "")).strip()
-        if not name or "|" in name:
+        try:
+            column_index = int(item.get("column_index"))
+        except (TypeError, ValueError):
             continue
-        aliases = []
-        for alias in item.get("aliases") or []:
-            alias = re.sub(r"\s+", " ", str(alias or "")).strip()
-            if alias and "|" not in alias and alias != name and alias not in aliases:
-                aliases.append(alias)
-        packages.append(
+        role = re.sub(
+            r"[^a-z_]+",
+            "",
+            str(item.get("role") or "").lower(),
+        )
+        if column_index < 0 or role not in allowed_roles:
+            continue
+        key = (column_index, role)
+        if key in seen:
+            continue
+        seen.add(key)
+        columns.append(
             {
-                "name": name,
-                "aliases": aliases,
-                "package_type": re.sub(
-                    r"\s+",
-                    " ",
-                    str(item.get("package_type") or ""),
-                ).strip(),
-                "pin_count": item.get("pin_count"),
+                "column_index": column_index,
+                "role": role,
             }
         )
     return {
         "is_package_summary": bool(response.get("is_package_summary")),
-        "packages": packages,
+        "table_role": table_role,
+        "header_row_index": header_row_index,
+        "columns": columns,
     }
 
 
