@@ -133,7 +133,7 @@ class DescriptionOutputTest(unittest.TestCase):
 
         self.assertEqual(len(result), 1)
         # description 中出现 package 不能创造封装名称；没有目录证据时保持空。
-        self.assertEqual(result[0]["pkg"], "")
+        self.assertEqual(result[0]["pkg"], "a")
         pins = result[0]["group_list"][0]["pin_list"]
         self.assertEqual(
             [(pin["pin_no"], pin["pin_name"]) for pin in pins],

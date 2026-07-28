@@ -150,7 +150,7 @@ def test_catalog_filters_unrelated_summary_devices_by_target_evidence():
     )
 
     assignment = result.assignment_for(1, 0)
-    assert assignment.pkg == "VSC8234"
+    assert assignment.pkg == "BGA"
     assert assignment.reason == "table_title_or_header"
 
 
@@ -190,7 +190,7 @@ def test_verified_package_type_can_bind_a_target_title():
         classifier=classifier,
     )
 
-    assert result.assignment_for(1, 0).pkg == "DEV100"
+    assert result.assignment_for(1, 0).pkg == "QFN 32"
     assert result.assignment_for(1, 0).reason == "table_title_or_header"
 
 
@@ -263,9 +263,12 @@ def test_multi_package_type_labels_do_not_duplicate_catalog_entries():
         classifier=classifier,
     )
 
-    assert [entry.name for entry in result.entries] == ["DEV100", "DEV200"]
-    assert result.assignment_for(2, 0).pkg == "DEV100"
-    assert result.assignment_for(2, 1).pkg == "DEV200"
+    assert [entry.identity_name for entry in result.entries] == [
+        "DEV100",
+        "DEV200",
+    ]
+    assert result.assignment_for(2, 0).pkg == "SSOP 28"
+    assert result.assignment_for(2, 1).pkg == "QFN 28"
 
 
 def test_identity_summary_creates_real_packages_and_packaging_only_enriches():
@@ -334,7 +337,7 @@ def test_identity_summary_creates_real_packages_and_packaging_only_enriches():
         classifier=classifier,
     )
 
-    assert [entry.name for entry in result.entries] == [
+    assert [entry.identity_name for entry in result.entries] == [
         "INA290",
         "INA2290",
         "INA4290",
@@ -348,14 +351,59 @@ def test_identity_summary_creates_real_packages_and_packaging_only_enriches():
         ("QFN", "RGV", "16"),
     ]
     assert [result.assignment_for(table_id, 0).pkg for table_id in (1, 2, 3)] == [
-        "INA290",
-        "INA2290",
-        "INA4290",
+        "SC-70",
+        "VSSOP",
+        "QFN",
     ]
 
 
-def test_packaging_metadata_cannot_create_package_without_identity_summary():
-    """只有 SKU/Type/Drawing 的包装表不能自行创建 pkg。"""
+def test_same_public_package_type_does_not_merge_independent_identity_slots():
+    """两个独立型号即使同为 QFN，也必须保持两个物理映射槽位。"""
+
+    summary = catalog_table(
+        0,
+        "Device Information",
+        ["DEVICE", "PACKAGE", "DRAWING", "PINS"],
+        [
+            ["DEVICE", "PACKAGE", "DRAWING", "PINS"],
+            ["DEV-A", "QFN", "RGV", "16"],
+            ["DEV-B", "QFN", "RGT", "16"],
+        ],
+    )
+
+    def classifier(table, source_name, target_tables):
+        return {
+            "is_package_summary": True,
+            "table_role": "identity_summary",
+            "header_row_index": 0,
+            "columns": [
+                {"column_index": 0, "role": "package_identity"},
+                {"column_index": 1, "role": "package_type"},
+                {"column_index": 2, "role": "package_drawing"},
+                {"column_index": 3, "role": "pin_count"},
+            ],
+        }
+
+    result = resolve_document_package_catalog(
+        all_tables=[summary],
+        target_tables=[],
+        multi_package_plans={},
+        use_semantic_classifier=True,
+        classifier=classifier,
+    )
+
+    assert [entry.package_key for entry in result.entries] == [
+        "slot:0",
+        "slot:1",
+    ]
+    assert [item.pkg for item in result.declared_assignments()] == [
+        "QFN",
+        "QFN",
+    ]
+
+
+def test_packaging_metadata_can_establish_physical_slot_without_identity():
+    """没有身份总述时，完整物理元数据可以确定槽位，但 SKU 不能成为 pkg。"""
 
     packaging = catalog_table(
         0,
@@ -388,24 +436,33 @@ def test_packaging_metadata_cannot_create_package_without_identity_summary():
         classifier=classifier,
     )
 
-    assert result.entries == []
+    assert len(result.entries) == 1
+    assert result.entries[0].identity_name == ""
+    assert result.entries[0].package_type == "VSSOP"
+    assert result.declared_assignments()[0].pkg == "VSSOP"
 
 
-def test_unresolved_package_never_falls_back_to_abc():
-    target = target_table(
-        3,
-        "Pin Functions",
-        ["PIN NO", "PIN NAME"],
-    )
+def test_unresolved_tables_share_one_frozen_fallback_slot():
+    targets = [
+        target_table(3, "Pin Functions A", ["PIN NO", "PIN NAME"]),
+        target_table(4, "Pin Functions B", ["PIN NO", "PIN NAME"]),
+        target_table(5, "Pin Functions C", ["PIN NO", "PIN NAME"]),
+    ]
     result = resolve_document_package_catalog(
         all_tables=[],
-        target_tables=[target],
-        multi_package_plans={3: MultiPackagePlan(False, "single_package")},
+        target_tables=targets,
+        multi_package_plans={
+            target.table_id: MultiPackagePlan(False, "single_package")
+            for target in targets
+        },
     )
 
-    assignment = result.assignment_for(3, 0)
-    assert assignment.pkg == ""
-    assert not assignment.pkg in {"a", "b", "c"}
+    assert len(result.entries) == 1
+    assert {
+        result.assignment_for(table.table_id, 0).package_key
+        for table in targets
+    } == {"slot:0"}
+    assert [item.pkg for item in result.declared_assignments()] == ["a"]
 
 
 def test_package_name_rejects_multiple_or_overlong_values():
@@ -471,6 +528,24 @@ def test_full_pipeline_uses_catalog_name_without_changing_pin_mapping():
         ColumnDecision(2, "TYPE", "type"),
     ]
 
+    def package_classifier(table, source_name, target_tables):
+        if table.title != "Device Information":
+            return {
+                "is_package_summary": False,
+                "table_role": "irrelevant",
+                "header_row_index": 0,
+                "columns": [],
+            }
+        return {
+            "is_package_summary": True,
+            "table_role": "identity_summary",
+            "header_row_index": 0,
+            "columns": [
+                {"column_index": 0, "role": "package_identity"},
+                {"column_index": 1, "role": "package_type"},
+            ],
+        }
+
     with (
         patch.object(
             pin_extractor,
@@ -479,15 +554,7 @@ def test_full_pipeline_uses_catalog_name_without_changing_pin_mapping():
         ),
         patch(
             "extract.semantic_classifier.classify_package_catalog_table",
-            return_value={
-                "is_package_summary": True,
-                "table_role": "identity_summary",
-                "header_row_index": 0,
-                "columns": [
-                    {"column_index": 0, "role": "package_identity"},
-                    {"column_index": 1, "role": "package_type"},
-                ],
-            },
+            side_effect=package_classifier,
         ),
     ):
         result = pin_extractor.extract_pin_package_info_from_table_candidates(
@@ -497,7 +564,7 @@ def test_full_pipeline_uses_catalog_name_without_changing_pin_mapping():
         )
 
     assert len(result) == 1
-    assert result[0]["pkg"] == "DEV100"
+    assert result[0]["pkg"] == "QFN 32"
     assert result[0]["group_list"][0]["pin_list"] == [
         {"pin_no": "1", "pin_name": "VDD", "type": "P"}
     ]

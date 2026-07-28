@@ -7,9 +7,9 @@
 1. 表格判断：判断当前表是不是“物理引脚/封装关系表”。
 2. 字段判断：只判断每一列的语义，不读取行来生成输出记录。
 3. 多封装分析：只按表格结构生成多个编号列/行的绑定计划。
-4. 封装目录：定位全文封装总述表，确定真实 pkg，并绑定每张引脚表。
+4. 封装槽位：先冻结物理封装数量，再绑定每张引脚表；器件型号只用于关联。
 5. 行提取：单封装和多封装走各自独立逻辑，完整读取已经绑定的数据行。
-6. 结果整理：清洗字段，按已经确定的真实 pkg 分组并输出。
+6. 结果整理：按固定槽位分组；pkg 使用物理封装名，未知时按 a/b/c 回退。
 
 特别重要的项目规则：
 
@@ -61,8 +61,11 @@
   定位封装总述候选，再结合已经确认的多封装结构和当前表题/表头完成绑定。
 * 封装目录判断不能修改表格是否提取、字段映射、行内容或 group；逐行提取
   不能反过来创造、合并或重命名 pkg。
-* 一个 pkg 只能是一个真实名称字符串，禁止使用 ``|`` 拼接多个名称。
-  名称最长 15 个字符；证据不足时保留空字符串，不能退回 a/b/c 假名称。
+* 封装槽位数量在行提取前冻结；未匹配表不能按 table_id 创建新的外层 pkg。
+* 器件型号只参与槽位关联，不能写入 pkg。pkg 只使用物理封装类型；名称
+  不明确时按固定槽位顺序使用 a、b、c……，但槽位数量保持不变。
+* 一个 pkg 只能是一个名称字符串，禁止使用 ``|`` 拼接多个名称；真实名称
+  最长 15 个字符。
 * 语义字段判断默认并发数为 4，可通过 ``EXTRACT_SCHEMA_WORKERS`` 覆盖。
 """
 
@@ -326,8 +329,8 @@ def extract_pin_package_info_from_table_candidates(
         multi_package_plans[item["table_id"]] = plan
         item["debug"]["multi_package_plan"] = plan_to_debug(plan)
 
-    # 第四阶段：使用全文表格建立唯一的封装目录，并为每张已确认的引脚表
-    # 绑定真实 pkg。封装判断与行提取保持分离，此处仍不创建 pin 记录。
+    # 第四阶段：使用全文表格冻结物理封装槽位，并为每张已确认的引脚表
+    # 绑定已有槽位。封装判断与行提取保持分离，此处仍不创建 pin 记录。
     all_catalog_tables = [
         PackageCatalogTable(
             table_id=table_id,
@@ -361,6 +364,11 @@ def extract_pin_package_info_from_table_candidates(
         source_name=source_name,
         use_semantic_classifier=use_semantic_classifier,
     )
+    # 在读取任何引脚行之前建立全部外层封装桶。即使某个已确认槽位暂时
+    # 没有关联到引脚表，最终 JSON 仍保留正确的封装数量。
+    for declared_assignment in package_resolution.declared_assignments():
+        get_package_bucket(packages, declared_assignment)
+
     if include_debug:
         for debug in LAST_EXTRACTION_DEBUG:
             if debug["table_id"] == 0:
@@ -368,8 +376,8 @@ def extract_pin_package_info_from_table_candidates(
                     "entries": [
                         {
                             "package_key": entry.package_key,
-                            "name": entry.name,
-                            "aliases": entry.aliases,
+                            "identity_name": entry.identity_name,
+                            "identity_aliases": entry.identity_aliases,
                             "package_type": entry.package_type,
                             "package_drawing": entry.package_drawing,
                             "pin_count": entry.pin_count,
@@ -1211,8 +1219,8 @@ def local_package_index_for_bound_row(
     """把多封装绑定行映射到它在当前表中的封装索引。
 
     ``binding.package`` 只是多封装模块定位列/行时使用的内部标签。这里仅用
-    它在当前 plan 中查找本表索引，标签内容本身不会保存、跨表比较或输出，
-    更不会生成旧方案中的 a/b/c 匿名 pkg。
+    它在当前 plan 中查找本表索引；最终 pkg 由文档级槽位提供真实物理封装名，
+    名称缺失时才按槽位顺序使用 a/b/c。
     """
 
     for slot, binding in enumerate(plan.bindings):
@@ -1251,16 +1259,15 @@ def build_public_result(
     packages: dict[str, dict[str, Any]],
     include_debug: bool,
 ) -> list[dict[str, Any]]:
-    """按首次提取顺序生成公开 JSON，pkg 只读取封装目录的单一名称。"""
+    """按冻结槽位顺序生成公开 JSON，包括暂时没有引脚记录的槽位。"""
 
     result = []
     for bucket in packages.values():
         groups = [{"group": group.group, "pin_list": group.pin_list} for group in bucket["_groups"].values() if group.pin_list]
-        if groups:
-            item = {"pkg": bucket["pkg"], "group_list": groups}
-            if include_debug:
-                item["package_key"] = bucket["package_key"]
-            result.append(item)
+        item = {"pkg": bucket["pkg"], "group_list": groups}
+        if include_debug:
+            item["package_key"] = bucket["package_key"]
+        result.append(item)
     return result
 
 

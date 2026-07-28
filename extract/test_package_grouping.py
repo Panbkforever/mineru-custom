@@ -1,4 +1,4 @@
-"""验证最终 pkg 使用封装目录中的真实名称。"""
+"""验证最终 pkg 使用物理封装名，并保持固定槽位数量。"""
 
 import unittest
 from unittest.mock import patch
@@ -13,9 +13,9 @@ from extract.pin_package_extractor import (
 
 
 class PackageGroupingTest(unittest.TestCase):
-    """覆盖单封装未解析和表内多封装真实名称的通用行为。"""
+    """覆盖单封装名称回退和表内多封装真实名称的通用行为。"""
 
-    def test_single_package_without_catalog_keeps_empty_name(self) -> None:
+    def test_single_package_without_catalog_uses_slot_fallback(self) -> None:
         table = TableCandidate(
             html=(
                 "<table>"
@@ -30,7 +30,7 @@ class PackageGroupingTest(unittest.TestCase):
 
         result = extract_pin_package_info_from_table_candidates([table])
 
-        self.assertEqual([item["pkg"] for item in result], [""])
+        self.assertEqual([item["pkg"] for item in result], ["a"])
         self.assertEqual(
             result[0]["group_list"][0]["pin_list"][0]["pin_name"],
             "VDD",
@@ -75,6 +75,76 @@ class PackageGroupingTest(unittest.TestCase):
             [pin["pin_no"] for pin in result[1]["group_list"][0]["pin_list"]],
             ["A1", "A2"],
         )
+
+    def test_confirmed_package_count_is_kept_when_one_slot_has_no_rows(self) -> None:
+        """名称关联失败不能删除已由总述表确认的物理封装槽位。"""
+
+        summary = TableCandidate(
+            html=(
+                "<table>"
+                "<tr><td>DEVICE</td><td>PACKAGE</td></tr>"
+                "<tr><td>DEV-A</td><td>QFN</td></tr>"
+                "<tr><td>DEV-B</td><td>BGA</td></tr>"
+                "</table>"
+            ),
+            page_idx=0,
+            title="Device Information",
+            group_context="Device Information",
+        )
+        pin_table = TableCandidate(
+            html=(
+                "<table>"
+                "<tr><td>PIN NO.</td><td>PIN NAME</td><td>TYPE</td></tr>"
+                "<tr><td>1</td><td>VDD</td><td>P</td></tr>"
+                "</table>"
+            ),
+            page_idx=1,
+            title="DEV-A Pin Functions",
+            group_context="DEV-A Pin Functions",
+        )
+        columns = [
+            ColumnDecision(0, "PIN NO.", "pin_no"),
+            ColumnDecision(1, "PIN NAME", "pin_name"),
+            ColumnDecision(2, "TYPE", "type"),
+        ]
+
+        def package_classifier(table, source_name, target_tables):
+            if table.title != "Device Information":
+                return {
+                    "is_package_summary": False,
+                    "table_role": "irrelevant",
+                    "header_row_index": 0,
+                    "columns": [],
+                }
+            return {
+                "is_package_summary": True,
+                "table_role": "identity_summary",
+                "header_row_index": 0,
+                "columns": [
+                    {"column_index": 0, "role": "package_identity"},
+                    {"column_index": 1, "role": "package_type"},
+                ],
+            }
+
+        with (
+            patch.object(
+                extractor,
+                "decide_all_tables",
+                return_value={1: TableDecision(True, columns=columns)},
+            ),
+            patch(
+                "extract.semantic_classifier.classify_package_catalog_table",
+                side_effect=package_classifier,
+            ),
+        ):
+            result = extract_pin_package_info_from_table_candidates(
+                [summary, pin_table],
+                use_semantic_classifier=True,
+            )
+
+        self.assertEqual([item["pkg"] for item in result], ["QFN", "BGA"])
+        self.assertEqual(len(result[0]["group_list"]), 1)
+        self.assertEqual(result[1]["group_list"], [])
 
 
 if __name__ == "__main__":
