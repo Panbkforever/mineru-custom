@@ -26,6 +26,8 @@ CELL_RE = re.compile(
     r"(<t[dh][^>]*>)(.*?)(</t[dh]>)",
     re.DOTALL | re.IGNORECASE,
 )
+TR_RE = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.DOTALL | re.IGNORECASE)
+SPAN_RE = re.compile(r"\b(rowspan|colspan)\s*=\s*[\"']?(\d+)", re.IGNORECASE)
 
 
 @dataclass
@@ -70,33 +72,41 @@ def restore_cell_line_breaks_in_middle_json(
         return stats
 
     cache: dict[tuple[int, tuple[float, ...], str], tuple[str, int, int]] = {}
+    page_text_cache: dict[int, str] = {}
     for page_info in pdf_info:
-        page_index = int(page_info.get("page_idx", 0))
-        if page_index < 0 or page_index >= len(pdf_doc):
-            continue
-
-        page = pdf_doc[page_index]
-        pdf_width, pdf_height = _pdf_page_size(page)
-        if pdf_width <= 0 or pdf_height <= 0:
+        declared_page_index = int(page_info.get("page_idx", 0))
+        if declared_page_index < 0 or declared_page_index >= len(pdf_doc):
             continue
 
         source_width, source_height = _page_size(page_info)
-        if source_width <= 0 or source_height <= 0:
-            source_width, source_height = pdf_width, pdf_height
-
-        text_page = page.get_textpage()
         for span in _iter_html_spans(page_info):
             table_html = span.get("html")
             bbox = span.get("bbox")
             if not isinstance(table_html, str) or not _valid_bbox(bbox):
                 continue
 
+            # 个别 MinerU 输出的 page_idx 与原 PDF 实际页码存在一页偏移。
+            # 使用当前表格自身的文本锚点在相邻页面中校正，不依赖文档标题、
+            # 表格业务类型或任何抽取字段。
+            page_index = _resolve_pdf_page_index(
+                pdf_doc,
+                declared_page_index,
+                table_html,
+                page_text_cache,
+            )
+            page = pdf_doc[page_index]
+            pdf_width, pdf_height = _pdf_page_size(page)
+            if pdf_width <= 0 or pdf_height <= 0:
+                continue
+
+            effective_source_width = source_width or pdf_width
+            effective_source_height = source_height or pdf_height
             # middle_json 的 bbox 与 PDFium 字符框不一定处于同一尺度。
             # 统一转换为 PDF 点坐标，并继续使用左上角为原点的方向。
             pdf_bbox = _scale_bbox_to_pdf(
                 [float(value) for value in bbox],
-                source_width,
-                source_height,
+                effective_source_width,
+                effective_source_height,
                 pdf_width,
                 pdf_height,
             )
@@ -108,12 +118,37 @@ def restore_cell_line_breaks_in_middle_json(
             )
             cached = cache.get(cache_key)
             if cached is None:
+                text_page = page.get_textpage()
                 runs_by_line = _extract_visual_runs(
                     text_page,
                     pdf_bbox,
                     pdf_height,
                 )
-                cached = _restore_table_cells(table_html, runs_by_line)
+                logical_cells, column_count = _logical_cell_columns(table_html)
+                column_boundaries = _detect_table_column_boundaries(
+                    page,
+                    pdf_bbox,
+                    pdf_height,
+                    column_count,
+                )
+                runs_by_column = None
+                if column_boundaries is not None:
+                    runs_by_column = []
+                    for left, right in zip(
+                        column_boundaries,
+                        column_boundaries[1:],
+                    ):
+                        runs_by_column.append(_extract_visual_runs(
+                            text_page,
+                            [left, pdf_bbox[1], right, pdf_bbox[3]],
+                            pdf_height,
+                        ))
+                cached = _restore_table_cells(
+                    table_html,
+                    runs_by_line,
+                    logical_cells=logical_cells,
+                    runs_by_column=runs_by_column,
+                )
                 cache[cache_key] = cached
 
             corrected_html, changed_cells, added_breaks = cached
@@ -129,12 +164,18 @@ def restore_cell_line_breaks_in_middle_json(
 def _restore_table_cells(
     table_html: str,
     runs_by_line: list[list[TextRun]],
+    *,
+    logical_cells: list[tuple[int, int]] | None = None,
+    runs_by_column: list[list[list[TextRun]]] | None = None,
 ) -> tuple[str, int, int]:
     changed_cells = 0
     added_breaks = 0
+    cell_index = 0
 
     def replace_cell(match: re.Match[str]) -> str:
-        nonlocal changed_cells, added_breaks
+        nonlocal changed_cells, added_breaks, cell_index
+        current_index = cell_index
+        cell_index += 1
         inner = match.group(2)
         if "<br" in inner.lower():
             return match.group(0)
@@ -145,7 +186,20 @@ def _restore_table_cells(
 
         # 单元格独立匹配 PDF 中的视觉文本行。这里不读取列名，也不要求
         # 当前单元格与其他列具有相同的行数。
-        parts = _match_visual_lines(plain, runs_by_line)
+        candidate_runs = runs_by_line
+        if (
+            runs_by_column is not None
+            and logical_cells is not None
+            and current_index < len(logical_cells)
+        ):
+            column_start, column_end = logical_cells[current_index]
+            if (
+                column_end == column_start + 1
+                and column_start < len(runs_by_column)
+            ):
+                candidate_runs = runs_by_column[column_start]
+
+        parts = _match_visual_lines(plain, candidate_runs)
         if len(parts) < 2:
             return match.group(0)
 
@@ -294,9 +348,27 @@ def _extract_visual_runs(
     median_height = heights[len(heights) // 2]
     y_tolerance = max(1.5, median_height * 0.45)
 
+    # PDFium 返回的是紧字符框。逗号和下划线的中心通常明显低于同一行的
+    # 字母数字，直接按全部字符聚类会把标点误判成独立视觉行。因此先用
+    # 字母数字建立基线，再把标点归入距离最近的真实基线。
+    anchor_characters = [
+        item for item in characters
+        if str(item["char"]).isalnum()
+    ]
+    floating_characters = [
+        item for item in characters
+        if not str(item["char"]).isalnum()
+    ]
+    if not anchor_characters:
+        anchor_characters = characters
+        floating_characters = []
+
     visual_lines: list[list[dict[str, Any]]] = []
     line_centers: list[float] = []
-    for item in sorted(characters, key=lambda value: (value["cy"], value["x0"])):
+    for item in sorted(
+        anchor_characters,
+        key=lambda value: (value["cy"], value["x0"]),
+    ):
         best_index = -1
         best_distance = float("inf")
         for index, center in enumerate(line_centers):
@@ -312,6 +384,17 @@ def _extract_visual_runs(
             line_centers[best_index] = sum(
                 value["cy"] for value in visual_lines[best_index]
             ) / len(visual_lines[best_index])
+
+    punctuation_tolerance = max(4.0, median_height * 1.5)
+    for item in floating_characters:
+        if not line_centers:
+            break
+        nearest_index = min(
+            range(len(line_centers)),
+            key=lambda index: abs(item["cy"] - line_centers[index]),
+        )
+        if abs(item["cy"] - line_centers[nearest_index]) <= punctuation_tolerance:
+            visual_lines[nearest_index].append(item)
 
     ordered = sorted(zip(line_centers, visual_lines), key=lambda value: value[0])
     result: list[list[TextRun]] = []
@@ -440,6 +523,237 @@ def _page_size(page_info: dict[str, Any]) -> tuple[float, float]:
     if isinstance(page_size, (list, tuple)) and len(page_size) >= 2:
         return float(page_size[0]), float(page_size[1])
     return 0.0, 0.0
+
+
+def _resolve_pdf_page_index(
+    pdf_doc: Any,
+    declared_page_index: int,
+    table_html: str,
+    page_text_cache: dict[int, str],
+) -> int:
+    """用表格文本锚点在相邻页面中校正 middle_json 页码。
+
+    只比较解析文本是否出现在候选 PDF 页，不读取表格字段语义。若没有
+    足够证据证明其他页面更匹配，则保留 middle_json 原页码。
+    """
+
+    anchors = _table_text_anchors(table_html)
+    if not anchors:
+        return declared_page_index
+
+    candidate_indexes = range(
+        max(0, declared_page_index - 2),
+        min(len(pdf_doc), declared_page_index + 3),
+    )
+    scores: dict[int, int] = {}
+    for candidate_index in candidate_indexes:
+        normalized_page = page_text_cache.get(candidate_index)
+        if normalized_page is None:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    page_text = (
+                        pdf_doc[candidate_index]
+                        .get_textpage()
+                        .get_text_range()
+                    )
+            except Exception:
+                page_text = ""
+            normalized_page = _normalize(page_text)
+            page_text_cache[candidate_index] = normalized_page
+        scores[candidate_index] = sum(
+            min(len(anchor), 24)
+            for anchor in anchors
+            if anchor in normalized_page
+        )
+
+    declared_score = scores.get(declared_page_index, 0)
+    best_index = max(scores, key=scores.get)
+    best_score = scores[best_index]
+    if best_score >= 24 and best_score > declared_score:
+        return best_index
+    return declared_page_index
+
+
+def _table_text_anchors(table_html: str) -> list[str]:
+    """从表格原文提取用于页码校正的非业务文本片段。"""
+
+    plain = _plain_text(table_html)
+    candidates = re.findall(
+        r"[A-Za-z0-9][A-Za-z0-9_:\[\].+\-/]{4,}",
+        plain,
+    )
+    generic = {
+        "table",
+        "signal",
+        "name",
+        "type",
+        "description",
+        "number",
+    }
+    anchors = []
+    seen = set()
+    for candidate in sorted(candidates, key=len, reverse=True):
+        normalized = _normalize(candidate)
+        if (
+            len(normalized) < 5
+            or normalized in generic
+            or normalized in seen
+        ):
+            continue
+        seen.add(normalized)
+        anchors.append(normalized)
+        if len(anchors) >= 40:
+            break
+    return anchors
+
+
+def _logical_cell_columns(
+    table_html: str,
+) -> tuple[list[tuple[int, int]], int]:
+    """按 HTML 阅读顺序计算每个源单元格占用的逻辑列范围。"""
+
+    result: list[tuple[int, int]] = []
+    active_rowspans: dict[int, int] = {}
+    maximum_column = 0
+
+    for row_match in TR_RE.finditer(table_html):
+        blocked_columns = set(active_rowspans)
+        new_rowspans: dict[int, int] = {}
+        logical_column = 0
+
+        for cell_match in CELL_RE.finditer(row_match.group(1)):
+            attrs = cell_match.group(1)
+            spans = {
+                name.lower(): max(1, int(value))
+                for name, value in SPAN_RE.findall(attrs)
+            }
+            colspan = spans.get("colspan", 1)
+            rowspan = spans.get("rowspan", 1)
+
+            while logical_column in blocked_columns:
+                logical_column += 1
+            while any(
+                column in blocked_columns
+                for column in range(logical_column, logical_column + colspan)
+            ):
+                logical_column += 1
+                while logical_column in blocked_columns:
+                    logical_column += 1
+
+            column_end = logical_column + colspan
+            result.append((logical_column, column_end))
+            maximum_column = max(maximum_column, column_end)
+            if rowspan > 1:
+                for column in range(logical_column, column_end):
+                    new_rowspans[column] = max(
+                        new_rowspans.get(column, 0),
+                        rowspan - 1,
+                    )
+            logical_column = column_end
+
+        active_rowspans = {
+            column: remaining - 1
+            for column, remaining in active_rowspans.items()
+            if remaining > 1
+        }
+        for column, remaining in new_rowspans.items():
+            active_rowspans[column] = max(
+                active_rowspans.get(column, 0),
+                remaining,
+            )
+
+    return result, maximum_column
+
+
+def _detect_table_column_boundaries(
+    page: Any,
+    bbox: list[float],
+    pdf_height: float,
+    expected_columns: int,
+) -> list[float] | None:
+    """从 PDF 矢量竖线中读取表格列边界。
+
+    只接受贯穿大部分表格高度、数量与 HTML 逻辑列完全一致的竖线集合。
+    证据不足时返回 ``None``，由调用方退回整表范围匹配。
+    """
+
+    if expected_columns <= 0:
+        return None
+
+    table_width = bbox[2] - bbox[0]
+    table_height = bbox[3] - bbox[1]
+    if table_width <= 0 or table_height <= 0:
+        return None
+
+    candidates: list[tuple[float, float]] = []
+    try:
+        objects = page.get_objects()
+    except Exception:
+        return None
+
+    for page_object in objects:
+        # PDFium 类型 1 是文字对象。这里只读取路径/线框对象，避免把
+        # 细长文字笔画误认为表格竖线。
+        if getattr(page_object, "type", 1) == 1:
+            continue
+        try:
+            left, bottom, right, top = [
+                float(value) for value in page_object.get_pos()
+            ]
+        except Exception:
+            continue
+
+        object_y0 = pdf_height - top
+        object_y1 = pdf_height - bottom
+        object_width = right - left
+        overlap_y = max(
+            0.0,
+            min(object_y1, bbox[3]) - max(object_y0, bbox[1]),
+        )
+        if (
+            object_width <= max(2.5, table_width * 0.01)
+            and overlap_y >= table_height * 0.75
+            and bbox[0] - 3.0 <= (left + right) / 2.0 <= bbox[2] + 3.0
+        ):
+            candidates.append(((left + right) / 2.0, overlap_y))
+
+    if not candidates:
+        return None
+
+    clusters: list[list[tuple[float, float]]] = []
+    for candidate in sorted(candidates):
+        if not clusters or candidate[0] - clusters[-1][-1][0] > 2.0:
+            clusters.append([candidate])
+        else:
+            clusters[-1].append(candidate)
+
+    clustered = [
+        (
+            sum(x * length for x, length in cluster)
+            / max(1.0, sum(length for _, length in cluster)),
+            max(length for _, length in cluster),
+        )
+        for cluster in clusters
+    ]
+    if len(clustered) < expected_columns + 1:
+        return None
+
+    # 若候选竖线略多，优先保留贯穿高度最长的边界，再按横坐标排序。
+    selected = sorted(
+        sorted(clustered, key=lambda item: item[1], reverse=True)[
+            :expected_columns + 1
+        ],
+        key=lambda item: item[0],
+    )
+    boundaries = [x for x, _ in selected]
+    minimum_width = table_width * 0.015
+    if any(
+        right - left < minimum_width
+        for left, right in zip(boundaries, boundaries[1:])
+    ):
+        return None
+    return boundaries
 
 
 def _pdf_page_size(page: Any) -> tuple[float, float]:

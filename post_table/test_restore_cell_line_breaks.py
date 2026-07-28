@@ -1,5 +1,6 @@
 from post_table.restore_cell_line_breaks import (
     TextRun,
+    _logical_cell_columns,
     _restore_table_cells,
     _scale_bbox_to_pdf,
 )
@@ -91,3 +92,48 @@ def test_middle_json_bbox_is_scaled_to_pdf_points():
         pdf_width=600.0,
         pdf_height=800.0,
     ) == [50.0, 100.0, 450.0, 700.0]
+
+
+def test_logical_columns_preserve_source_colspan_structure():
+    html = (
+        "<table>"
+        "<tr><td>A</td><td colspan=\"2\">B</td></tr>"
+        "<tr><td>C</td><td>D</td><td>E</td></tr>"
+        "</table>"
+    )
+
+    cells, column_count = _logical_cell_columns(html)
+
+    assert cells == [(0, 1), (1, 3), (0, 1), (1, 2), (2, 3)]
+    assert column_count == 3
+
+
+def test_column_runs_prevent_adjacent_cells_from_becoming_one_text_run():
+    html = "<table><tr><td>A1A2</td><td>N1N2</td></tr></table>"
+    whole_table_runs = [
+        [_run("A1 N1", 0, 80, 0)],
+        [_run("A2 N2", 0, 80, 1)],
+    ]
+    runs_by_column = [
+        [
+            [_run("A1", 0, 20, 0)],
+            [_run("A2", 0, 20, 1)],
+        ],
+        [
+            [_run("N1", 50, 70, 0)],
+            [_run("N2", 50, 70, 1)],
+        ],
+    ]
+
+    corrected, changed_cells, added_breaks = _restore_table_cells(
+        html,
+        whole_table_runs,
+        logical_cells=[(0, 1), (1, 2)],
+        runs_by_column=runs_by_column,
+    )
+
+    assert corrected == (
+        "<table><tr><td>A1<br>A2</td><td>N1<br>N2</td></tr></table>"
+    )
+    assert changed_cells == 2
+    assert added_breaks == 2
