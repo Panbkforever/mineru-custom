@@ -1,9 +1,15 @@
-"""Restore table-cell line breaks from PDF-native character coordinates.
+"""根据 PDF 原生字符坐标恢复 HTML 表格单元格中的真实换行。
 
-VLM table recognition sometimes concatenates visually separate lines inside a
-single cell. This module does not wrap text by length. It inserts ``<br>`` only
-when the complete HTML cell text matches consecutive visual text runs in the
-original PDF table image.
+MinerU/VLM 有时会把同一单元格内原本分开的多条视觉文本行直接粘连。本模块
+只负责修复解析结果，不参与任何引脚或封装抽取：
+
+* 每个 HTML 单元格独立处理，不比较相邻列的行数。
+* 不根据列名、逗号、空格、文本长度或抽取需求猜测换行。
+* 只有单元格完整文本能与 PDF 中连续视觉文本行可靠对应时才插入 ``<br>``。
+* 只在原 HTML 内容中插入 ``<br>``，不使用 PDF 文字覆盖 MinerU 识别结果。
+
+MinerU 的 ``page_size`` 和表格 ``bbox`` 可能使用渲染像素坐标，而 PDFium
+字符坐标使用 PDF 点坐标。读取字符前必须先把表格范围换算到 PDF 坐标系。
 """
 
 from __future__ import annotations
@@ -68,29 +74,44 @@ def restore_cell_line_breaks_in_middle_json(
         page_index = int(page_info.get("page_idx", 0))
         if page_index < 0 or page_index >= len(pdf_doc):
             continue
-        page_height = _page_size(page_info)[1]
-        if page_height <= 0:
+
+        page = pdf_doc[page_index]
+        pdf_width, pdf_height = _pdf_page_size(page)
+        if pdf_width <= 0 or pdf_height <= 0:
             continue
 
-        text_page = pdf_doc[page_index].get_textpage()
+        source_width, source_height = _page_size(page_info)
+        if source_width <= 0 or source_height <= 0:
+            source_width, source_height = pdf_width, pdf_height
+
+        text_page = page.get_textpage()
         for span in _iter_html_spans(page_info):
             table_html = span.get("html")
             bbox = span.get("bbox")
             if not isinstance(table_html, str) or not _valid_bbox(bbox):
                 continue
 
+            # middle_json 的 bbox 与 PDFium 字符框不一定处于同一尺度。
+            # 统一转换为 PDF 点坐标，并继续使用左上角为原点的方向。
+            pdf_bbox = _scale_bbox_to_pdf(
+                [float(value) for value in bbox],
+                source_width,
+                source_height,
+                pdf_width,
+                pdf_height,
+            )
             stats["tables_checked"] += 1
             cache_key = (
                 page_index,
-                tuple(round(float(value), 3) for value in bbox),
+                tuple(round(value, 3) for value in pdf_bbox),
                 table_html,
             )
             cached = cache.get(cache_key)
             if cached is None:
                 runs_by_line = _extract_visual_runs(
                     text_page,
-                    [float(value) for value in bbox],
-                    page_height,
+                    pdf_bbox,
+                    pdf_height,
                 )
                 cached = _restore_table_cells(table_html, runs_by_line)
                 cache[cache_key] = cached
@@ -119,9 +140,11 @@ def _restore_table_cells(
             return match.group(0)
 
         plain = _plain_text(inner)
-        if len(_normalize(plain)) < 5:
+        if not _normalize(plain):
             return match.group(0)
 
+        # 单元格独立匹配 PDF 中的视觉文本行。这里不读取列名，也不要求
+        # 当前单元格与其他列具有相同的行数。
         parts = _match_visual_lines(plain, runs_by_line)
         if len(parts) < 2:
             return match.group(0)
@@ -417,6 +440,49 @@ def _page_size(page_info: dict[str, Any]) -> tuple[float, float]:
     if isinstance(page_size, (list, tuple)) and len(page_size) >= 2:
         return float(page_size[0]), float(page_size[1])
     return 0.0, 0.0
+
+
+def _pdf_page_size(page: Any) -> tuple[float, float]:
+    """读取 PDFium 页面尺寸，返回 PDF 点坐标下的宽和高。"""
+
+    try:
+        width, height = page.get_size()
+        return float(width), float(height)
+    except Exception:
+        return 0.0, 0.0
+
+
+def _scale_bbox_to_pdf(
+    bbox: list[float],
+    source_width: float,
+    source_height: float,
+    pdf_width: float,
+    pdf_height: float,
+) -> list[float]:
+    """把 middle_json 表格范围换算到 PDFium 使用的 PDF 点坐标。
+
+    两个坐标系都按页面左上角表示表格范围，因此这里只做横纵尺度换算，
+    不改变 y 轴方向。PDF 字符框的 y 轴转换仍由 ``_extract_visual_runs``
+    统一完成。
+    """
+
+    if (
+        source_width <= 0
+        or source_height <= 0
+        or pdf_width <= 0
+        or pdf_height <= 0
+    ):
+        return list(bbox)
+
+    scale_x = pdf_width / source_width
+    scale_y = pdf_height / source_height
+    x0, y0, x1, y1 = bbox
+    return [
+        x0 * scale_x,
+        y0 * scale_y,
+        x1 * scale_x,
+        y1 * scale_y,
+    ]
 
 
 def _valid_bbox(bbox: Any) -> bool:
