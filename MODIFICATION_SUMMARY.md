@@ -901,3 +901,15 @@ PDF 解析后的主要后处理顺序如下：
 - 删除 `extract/test_package_resolver.py` 和
   `extract/test_package_semantic_resolution.py`，新增
   `extract/test_package_slot_grouping.py` 验证匿名槽位分组。
+
+# 文档级封装目录识别
+
+新增 `extract/package_catalog_resolver.py`，将真实 `pkg` 判断与表格字段判断、
+多封装表内结构分析和逐行提取彻底分离。系统现在先从全文前后区域及封装语义
+表格中召回总述候选，再由独立模型协议返回真实封装目录，最后使用表题、当前
+章节、表头和已确认的多封装绑定将引脚表归入对应封装。
+
+旧的 `a/b/c` 结构槽位输出已经从主流程删除。无法确认真实名称时保留空
+`pkg`，不会用假名称代替；一个 `pkg` 只能输出一个名称，禁止使用 `|`
+拼接候选，且真实名称最长 15 个字符。`multi_package_extractor.py`继续只处理单张表内部的列、行和分段
+绑定，不参与文档级名称判断。

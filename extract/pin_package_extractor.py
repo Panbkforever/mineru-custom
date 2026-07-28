@@ -2,13 +2,14 @@
 
 本文件只做一件事：把表格转换为项目约定的 JSON 结构。
 
-处理流程固定为五个阶段，阶段之间不互相调用：
+处理流程固定为六个阶段，阶段之间不互相调用：
 
 1. 表格判断：判断当前表是不是“物理引脚/封装关系表”。
 2. 字段判断：只判断每一列的语义，不读取行来生成输出记录。
 3. 多封装分析：只按表格结构生成多个编号列/行的绑定计划。
-4. 行提取：单封装和多封装走各自独立逻辑，完整读取已经绑定的数据行。
-5. 结果整理：清洗字段并按结构槽位分组，最后依次输出 pkg=a、b、c。
+4. 封装目录：定位全文封装总述表，确定真实 pkg，并绑定每张引脚表。
+5. 行提取：单封装和多封装走各自独立逻辑，完整读取已经绑定的数据行。
+6. 结果整理：清洗字段，按已经确定的真实 pkg 分组并输出。
 
 特别重要的项目规则：
 
@@ -55,13 +56,13 @@
   顺序完全一致才命中；命中后整张表直接排除，不送模型、不进入行提取。
 * 通过表格/字段判断后调用 ``multi_package_extractor.py``。多个封装专属
   pin_no 列、package 控制列和 package 分段行走多封装分支；其中的 package
-  文字只用于判断结构和绑定列，绝不作为最终 pkg 名称。
-* 不再识别真实封装名称，也不扫描全文、标题、表头或 DESCRIPTION 猜测 pkg。
-  单封装表固定进入内部槽位 0；多封装表按绑定在原表中的先后顺序进入槽位
-  0、1、2……。不同表只按槽位序号汇总，不按任何封装字符串归并。
-* 最终 JSON 序列化时，非空槽位按序输出 ``pkg: "a"``、``"b"``、``"c"``；
-  超过 26 个槽位后继续使用 ``aa``、``ab``。字母只是稳定分组编号，不表示
-  真实封装名称，也不能反向参与表格或字段判断。
+  文字是表内结构证据，但最终名称仍由文档级目录统一校验。
+* ``package_catalog_resolver.py`` 是唯一的真实 pkg 判断模块。它先从全文表格
+  定位封装总述候选，再结合已经确认的多封装结构和当前表题/表头完成绑定。
+* 封装目录判断不能修改表格是否提取、字段映射、行内容或 group；逐行提取
+  不能反过来创造、合并或重命名 pkg。
+* 一个 pkg 只能是一个真实名称字符串，禁止使用 ``|`` 拼接多个名称。
+  名称最长 15 个字符；证据不足时保留空字符串，不能退回 a/b/c 假名称。
 * 语义字段判断默认并发数为 4，可通过 ``EXTRACT_SCHEMA_WORKERS`` 覆盖。
 """
 
@@ -97,6 +98,13 @@ from extract.group_title_context import (
     extract_numbered_table_title,
     join_group_titles,
     resolve_table_title,
+)
+from extract.package_catalog_resolver import (
+    PackageAssignment,
+    PackageCatalogTable,
+    PackageTargetTable,
+    catalog_header_hints,
+    resolve_document_package_catalog,
 )
 
 
@@ -218,15 +226,18 @@ def extract_pin_package_info_from_table_candidates(
 
     global LAST_EXTRACTION_DEBUG
     LAST_EXTRACTION_DEBUG = []
-    # 转成列表，保证后面可以重复访问候选表；packages 保存结构槽位分组结果。
+    # 转成列表，保证封装目录扫描和引脚表判断读取的是同一份有序表格。
     candidates = list(tables)
-    packages: dict[int, dict[str, Any]] = {}
+    packages: dict[str, dict[str, Any]] = {}
 
     # 第一阶段：只准备候选表，不创建任何 pin 记录。
     prepared = []
-    for table_id, table in enumerate(candidates):
+    parsed_tables = [
+        (table_id, table, parse_html_table(table.html))
+        for table_id, table in enumerate(candidates)
+    ]
+    for table_id, table, rows in parsed_tables:
         # 一个候选表对应一个二维字符串数组，后续判断和提取都基于它。
-        rows = parse_html_table(table.html)
         debug = {
             "table_id": table_id,
             "source": source_name,
@@ -315,9 +326,60 @@ def extract_pin_package_info_from_table_candidates(
         multi_package_plans[item["table_id"]] = plan
         item["debug"]["multi_package_plan"] = plan_to_debug(plan)
 
-    # 第四阶段：前三个判断阶段全部结束后，才允许创建 pin 记录。
-    # 此处不再识别真实封装名。单封装使用槽位 0；多封装按照绑定顺序使用
-    # 槽位 0、1、2……，最终输出阶段再把槽位转换为 a、b、c。
+    # 第四阶段：使用全文表格建立唯一的封装目录，并为每张已确认的引脚表
+    # 绑定真实 pkg。封装判断与行提取保持分离，此处仍不创建 pin 记录。
+    all_catalog_tables = [
+        PackageCatalogTable(
+            table_id=table_id,
+            page_idx=table.page_idx,
+            title=table.title,
+            group_context=table.group_context,
+            current_chapter_titles=table.current_chapter_titles,
+            # 总述表可能存在多级表头，因此目录定位读取前几行的逐列提示；
+            # 完整原始 rows 仍原样交给模型，不在这里改表格结构。
+            headers=catalog_header_hints(rows),
+            rows=tuple(tuple(row) for row in rows),
+        )
+        for table_id, table, rows in parsed_tables
+    ]
+    target_package_tables = [
+        PackageTargetTable(
+            table_id=item["table_id"],
+            page_idx=item["table"].page_idx,
+            title=item["table"].title,
+            group_context=item["table"].group_context,
+            current_chapter_titles=item["table"].current_chapter_titles,
+            headers=tuple(item["headers"]),
+        )
+        for item in prepared
+        if decisions[item["table_id"]].should_extract
+    ]
+    package_resolution = resolve_document_package_catalog(
+        all_tables=all_catalog_tables,
+        target_tables=target_package_tables,
+        multi_package_plans=multi_package_plans,
+        source_name=source_name,
+        use_semantic_classifier=use_semantic_classifier,
+    )
+    if include_debug:
+        for debug in LAST_EXTRACTION_DEBUG:
+            if debug["table_id"] == 0:
+                debug["package_catalog"] = {
+                    "entries": [
+                        {
+                            "package_key": entry.package_key,
+                            "name": entry.name,
+                            "aliases": entry.aliases,
+                            "package_type": entry.package_type,
+                            "pin_count": entry.pin_count,
+                            "evidence_table_ids": entry.evidence_table_ids,
+                        }
+                        for entry in package_resolution.entries
+                    ],
+                    "diagnostics": package_resolution.diagnostics,
+                }
+
+    # 第五阶段：前四个判断阶段全部结束后，才允许创建 pin 记录。
     for item in prepared:
         table_decision = decisions[item["table_id"]]
         debug = item["debug"]
@@ -344,9 +406,13 @@ def extract_pin_package_info_from_table_candidates(
         # 不能再进入普通逻辑把多个编号列拼接成一个字段。
         if plan.is_multi_package:
             for bound_row in iter_bound_package_rows(plan, item["data_rows"]):
-                # binding 在原表中的顺序就是内部槽位顺序。这里只比较同一个
-                # plan 内的结构标签，标签本身不会进入最终 pkg。
-                package_slot = package_slot_for_bound_row(plan, bound_row)
+                # 先确定绑定行在当前多封装计划中的本地槽位，再读取文档级
+                # 封装目录的唯一绑定。表内标签不能直接绕过目录写入输出。
+                local_slot = local_package_index_for_bound_row(plan, bound_row)
+                package_assignment = package_resolution.assignment_for(
+                    item["table_id"],
+                    local_slot,
+                )
                 for record in extract_records_from_bound_package_row(bound_row):
                     # 多封装绑定对象只保存 pin_no/pin_name/type。description
                     # 必须使用 row_index 回到同一原始数据行读取，不能从相邻
@@ -362,13 +428,17 @@ def extract_pin_package_info_from_table_candidates(
                         record["source"] = source_name
                     if include_debug and item["table"].page_idx is not None:
                         record["source_page"] = item["table"].page_idx + 1
-                    bucket = get_package_slot_bucket(packages, package_slot)
+                    bucket = get_package_bucket(packages, package_assignment)
                     group = get_or_create_group(bucket, current_group_name)
                     add_pin_record_to_group(group, record)
                     extracted_count += 1
 
         # 单封装表保留原有逐行提取逻辑，不经过多封装绑定。
         else:
+            package_assignment = package_resolution.assignment_for(
+                item["table_id"],
+                0,
+            )
             for row_index, row in enumerate(item["data_rows"]):
                 if (
                     table_decision.included_row_indexes is not None
@@ -391,7 +461,7 @@ def extract_pin_package_info_from_table_candidates(
                         record["source"] = source_name
                     if include_debug and item["table"].page_idx is not None:
                         record["source_page"] = item["table"].page_idx + 1
-                    bucket = get_package_slot_bucket(packages, 0)
+                    bucket = get_package_bucket(packages, package_assignment)
                     group = get_or_create_group(bucket, current_group_name)
                     add_pin_record_to_group(group, record)
                     extracted_count += 1
@@ -400,11 +470,24 @@ def extract_pin_package_info_from_table_candidates(
             debug.update({
                 "status": "extracted",
                 "pin_count": extracted_count,
-                "package_slots": (
-                    list(range(len(plan.bindings)))
-                    if plan.is_multi_package
-                    else [0]
-                ),
+                "package_assignments": [
+                    {
+                        "local_slot": local_slot,
+                        "pkg": package_resolution.assignment_for(
+                            item["table_id"],
+                            local_slot,
+                        ).pkg,
+                        "reason": package_resolution.assignment_for(
+                            item["table_id"],
+                            local_slot,
+                        ).reason,
+                    }
+                    for local_slot in (
+                        range(len(plan.bindings))
+                        if plan.is_multi_package
+                        else range(1)
+                    )
+                ],
                 "group": group_name,
             })
         else:
@@ -1025,7 +1108,7 @@ def add_pin_record_to_group(group: ExtractedGroup, record: dict[str, Any]) -> No
 
 
 # ---------------------------------------------------------------------------
-# 表格读取、标题和结构槽位分组
+# 表格读取、标题和输出分组
 # ---------------------------------------------------------------------------
 
 
@@ -1120,38 +1203,39 @@ def clean_group_name(value: str) -> str:
     return join_group_titles(value)
 
 
-def package_slot_for_bound_row(
+def local_package_index_for_bound_row(
     plan: MultiPackagePlan,
     bound_row: BoundPackageRow,
 ) -> int:
-    """把多封装绑定行映射到它在当前表中的结构槽位。
+    """把多封装绑定行映射到它在当前表中的封装索引。
 
     ``binding.package`` 只是多封装模块定位列/行时使用的内部标签。这里仅用
-    它在当前 plan 中查找序号，标签内容本身不会保存、比较或输出。
+    它在当前 plan 中查找本表索引，标签内容本身不会保存、跨表比较或输出，
+    更不会生成旧方案中的 a/b/c 匿名 pkg。
     """
 
     for slot, binding in enumerate(plan.bindings):
         if binding.package == bound_row.package:
             return slot
     raise ValueError(
-        f"多封装绑定行没有对应的结构槽位: {bound_row.package!r}"
+        f"多封装绑定行没有对应的本表封装索引: {bound_row.package!r}"
     )
 
 
-def get_package_slot_bucket(
-    packages: dict[int, dict[str, Any]],
-    slot: int,
+def get_package_bucket(
+    packages: dict[str, dict[str, Any]],
+    assignment: PackageAssignment,
 ) -> dict[str, Any]:
-    """按非负结构槽位获取输出桶，不读取任何真实封装名称。"""
+    """按文档级 package_key 获取输出桶；公开名称与内部 key 分开保存。"""
 
-    if slot < 0:
-        raise ValueError(f"package slot 必须为非负整数: {slot}")
-    if slot not in packages:
-        packages[slot] = {
-            "package_slot": slot,
+    key = str(assignment.package_key)
+    if key not in packages:
+        packages[key] = {
+            "package_key": key,
+            "pkg": str(assignment.pkg),
             "_groups": {},
         }
-    return packages[slot]
+    return packages[key]
 
 
 def get_or_create_group(bucket: dict[str, Any], name: str) -> ExtractedGroup:
@@ -1162,33 +1246,19 @@ def get_or_create_group(bucket: dict[str, Any], name: str) -> ExtractedGroup:
     return bucket["_groups"][name]
 
 
-def package_slot_label(slot: int) -> str:
-    """把从零开始的槽位转换为 a..z、aa..az、ba.. 的稳定编号。"""
-
-    if slot < 0:
-        raise ValueError(f"package slot 必须为非负整数: {slot}")
-    value = slot + 1
-    parts: list[str] = []
-    while value:
-        value, remainder = divmod(value - 1, 26)
-        parts.append(chr(ord("a") + remainder))
-    return "".join(reversed(parts))
-
-
 def build_public_result(
-    packages: dict[int, dict[str, Any]],
+    packages: dict[str, dict[str, Any]],
     include_debug: bool,
 ) -> list[dict[str, Any]]:
-    """按槽位顺序生成公开 JSON，并仅在这里写入 a/b/c pkg。"""
+    """按首次提取顺序生成公开 JSON，pkg 只读取封装目录的单一名称。"""
 
     result = []
-    for slot in sorted(packages):
-        bucket = packages[slot]
+    for bucket in packages.values():
         groups = [{"group": group.group, "pin_list": group.pin_list} for group in bucket["_groups"].values() if group.pin_list]
         if groups:
-            item = {"pkg": package_slot_label(slot), "group_list": groups}
+            item = {"pkg": bucket["pkg"], "group_list": groups}
             if include_debug:
-                item["package_slot"] = slot
+                item["package_key"] = bucket["package_key"]
             result.append(item)
     return result
 

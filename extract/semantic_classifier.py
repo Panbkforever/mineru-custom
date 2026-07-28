@@ -5,8 +5,9 @@
 1. 接收初筛后的表格标题、表头和完整表格内容，判断该表是否需要提取。
 2. 表格需要提取时，把目标列映射为 ``pin_no``、``pin_name`` 或 ``type``。
 
-模型不判断封装名、分组名或表格角色，也不生成最终引脚记录。后续逐行提取、
-字段清洗、结构槽位分组均由 ``pin_package_extractor.py`` 负责。
+``classify_table_schema`` 不判断封装名、分组名或表格角色，也不生成最终引脚
+记录。文档级封装总述表使用独立的 ``classify_package_catalog_table`` 请求和
+返回协议，两种任务不能复用返回字段。
 """
 
 from __future__ import annotations
@@ -41,6 +42,81 @@ def classify_table_schema(
     )
     response = call_deepseek_json(payload, api_key=api_key)
     return normalize_schema_response(response, headers)
+
+
+def classify_package_catalog_table(
+    table: Any,
+    source_name: str = "",
+) -> dict[str, Any]:
+    """判断完整候选表是否为封装总述表，并返回独立 pinout 的真实名称。
+
+    ``table`` 使用鸭子类型，避免语义模块反向依赖封装目录的数据类。
+    """
+
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise RuntimeError("启用封装目录判断需要先设置环境变量 DEEPSEEK_API_KEY")
+
+    payload = {
+        "task": (
+            "Decide whether this complete table is a document-level package/device summary. "
+            "If it is, list the canonical real names of the independent physical pinout "
+            "namespaces described by the document."
+        ),
+        "rules": [
+            "Read the complete table, title and chapter context.",
+            "A package entry means one independent physical pin/ball mapping namespace.",
+            "Return model or device variants separately only when the document gives them independent physical pin mappings.",
+            "When one table contains multiple package-specific physical pin-number columns, return each independent package column.",
+            "Do not return every orderable SKU, temperature suffix, tape-and-reel variant, package quantity or package drawing row as a separate package.",
+            "Do not return unrelated comparison devices merely because they appear in a comparison table.",
+            "The name must be one short canonical string of at most 15 characters present in, or a continuous substring of, the supplied evidence.",
+            "Return exactly one name per entry. Never join candidates with |.",
+            "This task does not identify pin_no, pin_name, type, group names or row values.",
+        ],
+        "document": {"source_name": source_name},
+        "table": {
+            "table_id": getattr(table, "table_id", None),
+            "page": (
+                getattr(table, "page_idx", None) + 1
+                if isinstance(getattr(table, "page_idx", None), int)
+                else None
+            ),
+            "title": getattr(table, "title", ""),
+            "group_context": getattr(table, "group_context", ""),
+            "current_chapter_titles": list(
+                getattr(table, "current_chapter_titles", ()) or ()
+            ),
+            "headers": list(getattr(table, "headers", ()) or ()),
+            "rows": [
+                list(row)
+                for row in (getattr(table, "rows", ()) or ())
+            ],
+        },
+        "output_schema": {
+            "is_package_summary": "boolean",
+            "packages": [
+                {
+                    "name": "one canonical real package/device pinout name",
+                    "aliases": ["explicit alias only"],
+                    "package_type": "optional package family/type",
+                    "pin_count": "optional integer",
+                }
+            ],
+        },
+    }
+    response = call_model_json(
+        payload,
+        api_key=api_key,
+        system_prompt=(
+            "You identify a document's independent semiconductor package/pinout namespaces "
+            "from one complete candidate summary table. Return valid JSON containing only "
+            "is_package_summary and packages. Do not map pin fields or generate pin records."
+        ),
+        max_tokens=int(os.getenv("EXTRACT_PACKAGE_MAX_TOKENS", "4000")),
+        timeout=float(os.getenv("EXTRACT_PACKAGE_TIMEOUT", "60")),
+    )
+    return normalize_package_catalog_response(response)
 
 
 def build_schema_prompt_payload(
@@ -89,9 +165,35 @@ def build_schema_prompt_payload(
 def call_deepseek_json(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
     """调用唯一的字段判断模型并返回 JSON。"""
 
+    return call_model_json(
+        payload,
+        api_key=api_key,
+        system_prompt=(
+            "You only decide whether one complete semiconductor datasheet table should "
+            "be extracted and map its needed columns. Return valid JSON containing only "
+            "should_extract and columns. Do not return any other fields or final pin records."
+        ),
+        max_tokens=int(os.getenv("DEEPSEEK_MAX_TOKENS", "3000")),
+    )
+
+
+def call_model_json(
+    payload: dict[str, Any],
+    *,
+    api_key: str,
+    system_prompt: str,
+    max_tokens: int,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """调用 OpenAI 兼容 JSON 接口；业务协议由调用方的 prompt 决定。"""
+
     base_url = os.getenv("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL).rstrip("/")
     model = os.getenv("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL)
-    request_timeout = float(os.getenv("DEEPSEEK_TIMEOUT", "30"))
+    request_timeout = (
+        float(timeout)
+        if timeout is not None
+        else float(os.getenv("DEEPSEEK_TIMEOUT", "30"))
+    )
     url = f"{base_url}/chat/completions"
 
     body = {
@@ -99,11 +201,7 @@ def call_deepseek_json(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
         "messages": [
             {
                 "role": "system",
-                "content": (
-                    "You only decide whether one complete semiconductor datasheet table should "
-                    "be extracted and map its needed columns. Return valid JSON containing only "
-                    "should_extract and columns. Do not return any other fields or final pin records."
-                ),
+                "content": system_prompt,
             },
             {
                 "role": "user",
@@ -112,7 +210,7 @@ def call_deepseek_json(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
         ],
         "response_format": {"type": "json_object"},
         "temperature": 0,
-        "max_tokens": int(os.getenv("DEEPSEEK_MAX_TOKENS", "3000")),
+        "max_tokens": max_tokens,
         "stream": False,
     }
 
@@ -224,6 +322,39 @@ def normalize_schema_response(response: dict[str, Any], headers: list[str]) -> d
     return {
         "should_extract": bool(response.get("should_extract")),
         "columns": columns,
+    }
+
+
+def normalize_package_catalog_response(response: dict[str, Any]) -> dict[str, Any]:
+    """只保留封装总述判断协议中的字段，禁止混入字段映射或最终记录。"""
+
+    packages = []
+    for item in response.get("packages") or []:
+        if not isinstance(item, dict):
+            continue
+        name = re.sub(r"\s+", " ", str(item.get("name") or "")).strip()
+        if not name or "|" in name:
+            continue
+        aliases = []
+        for alias in item.get("aliases") or []:
+            alias = re.sub(r"\s+", " ", str(alias or "")).strip()
+            if alias and "|" not in alias and alias != name and alias not in aliases:
+                aliases.append(alias)
+        packages.append(
+            {
+                "name": name,
+                "aliases": aliases,
+                "package_type": re.sub(
+                    r"\s+",
+                    " ",
+                    str(item.get("package_type") or ""),
+                ).strip(),
+                "pin_count": item.get("pin_count"),
+            }
+        )
+    return {
+        "is_package_summary": bool(response.get("is_package_summary")),
+        "packages": packages,
     }
 
 
