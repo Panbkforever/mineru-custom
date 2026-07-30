@@ -47,9 +47,11 @@
   表格的独立短标题，例如 ``Pin Functions``，不要求包含 Pin、Signal 等
   固定关键词。局部窗口进入新章节时禁止继承上一章节的旧表题；没有新章节
   和新标题时才继承上一表题，用于无重复标题的跨页续表。
-* 每张表的 group 还要包含上一章的全部章节标题、当前章开始到该表之前
-  已出现的全部章节标题以及当前表格标题，各标题使用换行符分隔。章节上下文
-  只用于 group，不替代发送给模型和多封装判断的当前表格标题。
+* 最终 JSON 的 group 只使用当前表格表题；``(continued)`` 清理后相同的
+  原表和续表归入同一 group。上一章和当前章标题仍作为内部上下文保留，
+  只供模型判断和封装绑定使用，不能写入最终 group。
+* 表内的 Power Pins、PCI INTERFACE 等结构标题行只负责划分原表内容；
+  行提取时跳过这些标题行，但不得追加或覆盖最终 group。
 * 初筛后先调用 ``special_table_handlers.py``。特殊表只有完整命中专用规则才
   绕过模型；当前 Reserved/NC 表会直接保留真实 Reserved 行并排除不存在位置。
 * 横向重复的 ``Pin# | Pin Name | Type`` 字段块必须至少完整重复两次且字段
@@ -97,7 +99,6 @@ from extract.multi_package_extractor import (
 )
 from extract.group_title_context import (
     GroupTitleContextTracker,
-    append_group_subtitle,
     extract_numbered_table_title,
     join_group_titles,
     resolve_table_title,
@@ -397,18 +398,16 @@ def extract_pin_package_info_from_table_candidates(
             skip(debug, table_decision.reason or "table_rejected")
             continue
 
+        # 最终 group 只取当前表格表题。章节上下文仍保存在 TableCandidate
+        # 中供语义判断和封装绑定使用，不能在这里写入最终 JSON。
         group_name = clean_group_name(
-            item["table"].group_context
+            infer_group_name(item["table"].title)
             or table_decision.group
-            or infer_group_name(item["table"].title)
             or infer_group_name_from_headers(item["headers"])
             or "Pin/Package Table"
         )
 
         plan = multi_package_plans[item["table_id"]]
-        # 表内小分组只能追加到这段基础上下文，不能覆盖上一章、当前章和表题。
-        base_group_name = group_name
-        current_group_name = group_name
         extracted_count = 0
 
         # 真正的多封装表严格执行绑定计划。每个封装独立读取自己的 pin_no，
@@ -438,7 +437,7 @@ def extract_pin_package_info_from_table_candidates(
                     if include_debug and item["table"].page_idx is not None:
                         record["source_page"] = item["table"].page_idx + 1
                     bucket = get_package_bucket(packages, package_assignment)
-                    group = get_or_create_group(bucket, current_group_name)
+                    group = get_or_create_group(bucket, group_name)
                     add_pin_record_to_group(group, record)
                     extracted_count += 1
 
@@ -459,10 +458,7 @@ def extract_pin_package_info_from_table_candidates(
                 if not any(cell.strip() for cell in row):
                     continue
                 if is_group_row(row):
-                    current_group_name = (
-                        append_group_subtitle(base_group_name, first_non_empty(row))
-                        or current_group_name
-                    )
+                    # 表内结构标题不是引脚数据，也不再创建新的输出 group。
                     continue
                 for record in extract_records_from_row(row, table_decision.columns):
                     record.pop("_raw_fields", None)
@@ -471,7 +467,7 @@ def extract_pin_package_info_from_table_candidates(
                     if include_debug and item["table"].page_idx is not None:
                         record["source_page"] = item["table"].page_idx + 1
                     bucket = get_package_bucket(packages, package_assignment)
-                    group = get_or_create_group(bucket, current_group_name)
+                    group = get_or_create_group(bucket, group_name)
                     add_pin_record_to_group(group, record)
                     extracted_count += 1
 
@@ -1172,11 +1168,6 @@ def is_group_row(row: list[str]) -> bool:
     """识别只有一个重复文本的分组标题行，而不是普通数据行。"""
     values = [cell.strip() for cell in row if cell.strip()]
     return bool(values) and (len(values) == 1 or len(set(values)) == 1) and not looks_like_pin_list(values[0])
-
-
-def first_non_empty(row: list[str]) -> str:
-    """返回一行中第一个非空单元格，用于读取分组标题。"""
-    return next((cell.strip() for cell in row if cell.strip()), "")
 
 
 def infer_group_name(text: str) -> str:

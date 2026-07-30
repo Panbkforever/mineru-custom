@@ -2,7 +2,6 @@
 
 from extract.group_title_context import (
     GroupTitleContextTracker,
-    append_group_subtitle,
     join_group_titles,
     resolve_table_title,
 )
@@ -145,21 +144,20 @@ Table 5-1. Pin Description (continued)
     ]
 
 
-def test_group_cleanup_preserves_lines_and_appends_internal_subtitle():
-    base = join_group_titles(
+def test_group_cleanup_preserves_context_lines():
+    context = join_group_titles(
         "# 4 Previous\n# 5 Current",
         "Table 5-1. Pins (continued)",
     )
 
-    assert append_group_subtitle(base, "Power Pins") == (
-        "4 Previous\n5 Current\nTable 5-1. Pins\nPower Pins"
-    )
+    assert context == "4 Previous\n5 Current\nTable 5-1. Pins"
 
 
-def test_complete_context_is_written_to_final_extraction_group():
+def test_only_table_title_is_written_to_final_extraction_group():
     html = (
         "<table>"
         "<tr><td>PIN NO.</td><td>PIN NAME</td><td>TYPE</td></tr>"
+        "<tr><td colspan=\"3\">Power Pins</td></tr>"
         "<tr><td>1</td><td>VDD</td><td>Power</td></tr>"
         "<tr><td>2</td><td>GND</td><td>Ground</td></tr>"
         "</table>"
@@ -177,7 +175,9 @@ def test_complete_context_is_written_to_final_extraction_group():
         ]
     )
 
-    assert result[0]["group_list"][0]["group"] == context
+    assert len(result[0]["group_list"]) == 1
+    assert result[0]["group_list"][0]["group"] == "Table 5-1. Pin List"
+    assert len(result[0]["group_list"][0]["pin_list"]) == 2
 
 
 def test_unnumbered_local_title_replaces_previous_numbered_table_title():

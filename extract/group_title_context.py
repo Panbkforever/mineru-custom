@@ -1,14 +1,16 @@
-"""收集表格所属章节的标题上下文。
+"""收集表格所属章节的内部标题上下文。
 
-本模块只负责 group 标题，不参与表格筛选、字段判断、封装判断和行提取。
+本模块不生成最终 JSON 的 group，也不参与表格筛选、字段判断、封装判断和
+行提取。这里收集的章节上下文只供语义判断和封装绑定使用；最终 group 由
+主提取器直接使用当前表格表题生成。
 扫描文档时按阅读顺序维护两个窗口：
 
 1. 上一章从章标题到章末出现的全部章节标题；
 2. 当前章从章标题到当前扫描位置出现的全部章节标题。
 
 遇到表格时，将“上一章标题 + 当前章已出现标题 + 当前表格标题”按顺序
-用换行符连接。表格标题仍由主提取器单独保存，不能用这段上下文替代后
-发送给模型的当前表格标题。
+用换行符连接成内部上下文。表格标题仍由主提取器单独保存，不能用这段
+上下文替代发送给模型的当前表格标题，也不能直接写入最终 group。
 
 当前表格标题只在“上一张表结束到当前表开始”的局部文本窗口内判断：
 
@@ -266,12 +268,6 @@ def join_group_titles(*values: str) -> str:
             if cleaned:
                 _append_unique(result, cleaned)
     return "\n".join(result)
-
-
-def append_group_subtitle(group_context: str, subtitle: str) -> str:
-    """把表内小分组追加到章节上下文末尾，而不是覆盖完整 group。"""
-
-    return join_group_titles(group_context, subtitle)
 
 
 def clean_group_title_line(value: str) -> str:
