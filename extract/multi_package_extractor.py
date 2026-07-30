@@ -11,6 +11,7 @@
 之一时，才返回多封装绑定：
 
 * package_columns：多个封装各有独立 pin_no 列，共享 pin_name/type；
+* package_name_columns：共享一个 pin_no/type，多个分支各有独立 pin_name 列；
 * package_rows：一个 package 控制列把数据行划分给不同封装；
 * package_sections：表内用“XXX Package”分段行切换当前封装；
 * shared_packages：标题明确说明同一套引脚映射同时适用于多个封装。
@@ -27,6 +28,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Protocol, Sequence
+
+from extract.table_header_structure import NameColumnLayout
 
 
 class ColumnLike(Protocol):
@@ -85,6 +88,7 @@ def analyze_multi_package_table(
     headers: Sequence[str],
     data_rows: Sequence[Sequence[str]],
     columns: Sequence[ColumnLike],
+    name_layout: NameColumnLayout | None = None,
 ) -> MultiPackagePlan:
     """按固定优先级判断表格结构，并返回一个多封装提取计划。
 
@@ -104,6 +108,16 @@ def analyze_multi_package_table(
     )
     if package_column_plan is not None:
         return package_column_plan
+
+    # 与 package_columns 相反，这一结构只有一个共享编号列，但每个表头
+    # 分支拥有自己的名称列。它必须由 span-aware 表头结构明确证明。
+    package_name_column_plan = detect_package_specific_name_columns(
+        data_rows=data_rows,
+        columns=columns,
+        name_layout=name_layout,
+    )
+    if package_name_column_plan is not None:
+        return package_name_column_plan
 
     package_row_plan = detect_package_selector_column(
         headers=headers,
@@ -132,6 +146,76 @@ def analyze_multi_package_table(
         False,
         "single_package",
         evidence=("未发现足够的多封装结构证据",),
+    )
+
+
+def detect_package_specific_name_columns(
+    *,
+    data_rows: Sequence[Sequence[str]],
+    columns: Sequence[ColumnLike],
+    name_layout: NameColumnLayout | None,
+) -> MultiPackagePlan | None:
+    """识别“一个共享编号列 + 多个分支名称列”的多封装表。
+
+    分支数量和标签只能来自已经展开 rowspan/colspan 的多层表头。模型的
+    列映射只负责确认字段语义，不能自行创造分支或把普通等价名称列误判
+    为多封装。
+    """
+
+    if name_layout is None or name_layout.mode != "package_branches":
+        return None
+
+    pin_columns = _selected_columns(columns, "pin_no")
+    name_columns = _selected_columns(columns, "pin_name")
+    type_columns = _selected_columns(columns, "type")
+    if len(pin_columns) != 1 or len(type_columns) > 1:
+        return None
+
+    selected_name_indexes = {column.index for column in name_columns}
+    if len(name_layout.branches) < 2:
+        return None
+
+    # 字段校验阶段应当为每个结构分支保留一个名称列。此处再次严格验证，
+    # 防止部分分支缺失时生成错误的多封装计划。
+    branch_columns: list[tuple[str, int]] = []
+    for branch in name_layout.branches:
+        selected = [
+            index
+            for index in branch.column_indexes
+            if index in selected_name_indexes
+        ]
+        if len(selected) != 1:
+            return None
+        branch_columns.append((branch.label, selected[0]))
+
+    normalized_labels = {
+        _normalize_text(label)
+        for label, _ in branch_columns
+        if label
+    }
+    if len(normalized_labels) != len(branch_columns):
+        return None
+
+    pin_column = pin_columns[0].index
+    type_column = type_columns[0].index if type_columns else None
+    bindings = tuple(
+        PackageBinding(
+            package=branch_label,
+            pin_no_column=pin_column,
+            pin_name_column=name_column,
+            type_column=type_column,
+        )
+        for branch_label, name_column in branch_columns
+    )
+    return MultiPackagePlan(
+        True,
+        "package_name_columns",
+        bindings,
+        evidence=(
+            "表头结构只有一个共享 pin_no 列",
+            f"完整多层表头识别出 {len(bindings)} 个名称分支",
+            "每个分支都绑定一个独立 pin_name 列并共享 type",
+        ),
     )
 
 

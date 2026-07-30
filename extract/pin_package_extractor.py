@@ -2,14 +2,16 @@
 
 本文件只做一件事：把表格转换为项目约定的 JSON 结构。
 
-处理流程固定为六个阶段，阶段之间不互相调用：
+处理流程固定为八个阶段，阶段之间不互相调用：
 
 1. 表格判断：判断当前表是不是“物理引脚/封装关系表”。
-2. 字段判断：只判断每一列的语义，不读取行来生成输出记录。
-3. 多封装分析：只按表格结构生成多个编号列/行的绑定计划。
-4. 封装槽位：先冻结物理封装数量，再绑定每张引脚表；器件型号只用于关联。
-5. 行提取：单封装和多封装走各自独立逻辑，完整读取已经绑定的数据行。
-6. 结果整理：按固定槽位分组；pkg 使用物理封装名，未知时按 a/b/c 回退。
+2. 表头结构：仅对候选表展开 rowspan/colspan，建立每列的完整表头路径。
+3. 字段判断：只判断每一列的语义，不读取行来生成输出记录。
+4. 字段校验：按表头结构恢复被模型漏掉的分支列，或固定选择一个等价名称列。
+5. 多封装分析：只按表格结构生成多个编号列/行的绑定计划。
+6. 封装槽位：先冻结物理封装数量，再绑定每张引脚表；器件型号只用于关联。
+7. 行提取：单封装和多封装走各自独立逻辑，完整读取已经绑定的数据行。
+8. 结果整理：按固定槽位分组；pkg 使用物理封装名，未知时按 a/b/c 回退。
 
 特别重要的项目规则：
 
@@ -39,6 +41,14 @@
 * pin_name 为空填 ``Reserved``；去掉末尾的 ``(数字)`` 和 ``(continued)``。
 * 同一个 pin_no 出现多次时不合并记录；不同 type 也不合并。
 * 多个 type 列同时存在时，只保留最接近 signal/pin 语义的一个，优先 SIGNAL TYPE、PIN TYPE、I/O TYPE。
+* BALL NAME、SIGNAL NAME、PIN NAME、TERMINAL NAME 在项目中属于等价
+  的 pin_name 语义。普通表同时出现多个等价名称列时，只固定选择完整度最高
+  的一列，同分时选择最左列，禁止使用 ``|`` 合并多个名称。
+* 多个名称列只有在多层表头中共享同一个名称父节点，并具有不同的子分支标签
+  时，才属于“一个共享 pin_no + 多个分支 pin_name”的多封装结构。此时每个
+  分支必须保留一个名称列，模型漏选的分支由确定性表头结构恢复。
+* “多个封装各有 pin_no、共享一个 pin_name”和“共享一个 pin_no、多个封装
+  各有 pin_name”是两条独立多封装分支，不能通过合并同名字段相互转换。
 * “Pin Configuration and Function” 这类坐标矩阵不是物理引脚表，表级直接排除。
 * 开启语义判断时，模型接收初筛后的表格标题、表头和完整表格；模型只返回
   ``should_extract`` 以及 ``pin_no``、``pin_name``、``type`` 的列映射。
@@ -109,6 +119,16 @@ from extract.package_catalog_resolver import (
     PackageTargetTable,
     catalog_header_hints,
     resolve_document_package_catalog,
+)
+from extract.table_header_structure import (
+    NameColumnBranch,
+    NameColumnLayout,
+    analyze_name_column_layout,
+    build_header_paths,
+    extend_header_index_for_name_branches,
+    header_paths_to_lists,
+    name_layout_to_dict,
+    parse_spanned_table,
 )
 
 
@@ -240,46 +260,94 @@ def extract_pin_package_info_from_table_candidates(
         (table_id, table, parse_html_table(table.html))
         for table_id, table in enumerate(candidates)
     ]
-    for table_id, table, rows in parsed_tables:
-        # 一个候选表对应一个二维字符串数组，后续判断和提取都基于它。
+    for table_id, table, rough_rows in parsed_tables:
+        # rough_rows 只用于低成本初筛。通过初筛后会重新按 rowspan/colspan
+        # 展开候选表，字段判断和最终提取不能继续使用错位的扁平数组。
         debug = {
             "table_id": table_id,
             "source": source_name,
             "page": table.page_idx + 1 if isinstance(table.page_idx, int) else None,
             "title": table.title,
             "group_context": table.group_context,
-            "row_count": len(rows),
+            "row_count": len(rough_rows),
             "status": "pending",
             "skip_reason": "",
         }
         LAST_EXTRACTION_DEBUG.append(debug)
 
-        if len(rows) < 2:
+        if len(rough_rows) < 2:
             skip(debug, "too_few_rows")
             continue
-        if is_pinout_matrix_table(rows, table.title):
+        if is_pinout_matrix_table(rough_rows, table.title):
             skip(debug, "pinout_matrix_table")
             continue
 
-        header_index, headers = choose_header_row(rows, table.title, semantic=use_semantic_classifier)
-        if header_index < 0:
+        rough_header_index, rough_headers = choose_header_row(
+            rough_rows,
+            table.title,
+            semantic=use_semantic_classifier,
+        )
+        if rough_header_index < 0:
             skip(debug, "no_candidate_header")
             continue
+        rough_data_rows = rough_rows[rough_header_index + 1 :]
+        if is_ordering_table(rough_headers):
+            skip(debug, "ordering_table")
+            continue
+        if not is_loose_candidate(
+            table.title,
+            rough_headers,
+            rough_data_rows,
+        ):
+            skip(debug, "not_pin_table_candidate")
+            continue
+        if is_non_physical_port_function_table(table.title, rough_headers):
+            skip(debug, "non_physical_port_function_table")
+            continue
+
+        # 只有已经通过宽松初筛的表才执行 span-aware 解析。展开后的 rows
+        # 是后续字段判断、多封装分析和逐行提取共同使用的唯一二维表。
+        rows = parse_spanned_table(table.html) or rough_rows
+        if len(rows) < 2:
+            skip(debug, "too_few_rows_after_span_expansion")
+            continue
+        if is_pinout_matrix_table(rows, table.title):
+            skip(debug, "pinout_matrix_table_after_span_expansion")
+            continue
+
+        header_index, headers = choose_header_row(
+            rows,
+            table.title,
+            semantic=use_semantic_classifier,
+        )
+        if header_index < 0:
+            skip(debug, "no_candidate_header_after_span_expansion")
+            continue
+        # 多个名称列共享同一 PIN/NAME 父表头时，下一行可能是各分支标签。
+        # 严格结构判断命中后才延伸表头，普通第一条数据不会被吞掉。
+        header_index = extend_header_index_for_name_branches(
+            rows,
+            header_index,
+        )
+        header_paths = build_header_paths(rows, header_index)
+        headers = [path.combined for path in header_paths]
+        name_layout = analyze_name_column_layout(header_paths)
+        data_rows = rows[header_index + 1 :]
+
         # 横向重复字段块是已确认不需要的冗余引脚列表。必须在模型判断和
         # 多封装分析之前整表排除，不能再按普通单封装表进入行提取。
         if is_repeated_horizontal_pin_block_table(headers):
             debug["headers"] = headers
             skip(debug, "repeated_horizontal_pin_blocks")
             continue
-        data_rows = rows[header_index + 1 :]
         if is_ordering_table(headers):
-            skip(debug, "ordering_table")
+            skip(debug, "ordering_table_after_span_expansion")
             continue
         if not is_loose_candidate(table.title, headers, data_rows):
-            skip(debug, "not_pin_table_candidate")
+            skip(debug, "not_pin_table_candidate_after_span_expansion")
             continue
         if is_non_physical_port_function_table(table.title, headers):
-            skip(debug, "non_physical_port_function_table")
+            skip(debug, "non_physical_port_function_table_after_span_expansion")
             continue
 
         rule_columns = classify_columns(headers, data_rows, table.title)
@@ -290,17 +358,33 @@ def extract_pin_package_info_from_table_candidates(
                 "rows": rows,
                 "header_index": header_index,
                 "headers": headers,
+                "header_paths": header_paths,
+                "name_layout": name_layout,
                 "data_rows": data_rows,
                 "rule_columns": rule_columns,
                 "debug": debug,
             }
         )
         debug["headers"] = headers
+        debug["header_paths"] = header_paths_to_lists(header_paths)
+        debug["name_layout"] = name_layout_to_dict(name_layout)
         debug["rule_columns"] = decisions_to_debug(rule_columns)
 
     # 第二阶段：先完成所有表级和字段级判断，再进入任何行提取。
     # 此处一次性完成全部表格判断，避免边判断边产出 pin 记录。
     decisions = decide_all_tables(prepared, use_semantic_classifier, include_debug)
+
+    # 模型只提供字段判断意见；名称列的数量和分支关系由完整表头结构校验。
+    # 该步骤必须发生在多封装分析之前，避免模型只选一个 name 后丢失分支。
+    for item in prepared:
+        decision = decisions[item["table_id"]]
+        if decision.should_extract:
+            decision.columns = reconcile_name_column_decisions(
+                decision.columns,
+                item["headers"],
+                item["data_rows"],
+                item["name_layout"],
+            )
 
     # DESCRIPTION 是最终输出的附加字段，不参与“是否为引脚表”的语义判断。
     # 因此在模型/规则完成核心字段判断后，再依据已确定的完整表头统一补充，
@@ -326,6 +410,7 @@ def extract_pin_package_info_from_table_candidates(
             headers=item["headers"],
             data_rows=item["data_rows"],
             columns=table_decision.columns,
+            name_layout=item["name_layout"],
         )
         multi_package_plans[item["table_id"]] = plan
         item["debug"]["multi_package_plan"] = plan_to_debug(plan)
@@ -560,6 +645,8 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
                 item["headers"],
                 # 把初筛后的完整二维表格交给模型，不能只发送样例行。
                 item["rows"],
+                header_paths_to_lists(item["header_paths"]),
+                name_layout_to_dict(item["name_layout"]),
             ): item
             for item in remaining
         }
@@ -737,6 +824,128 @@ def build_schema_column_decisions(schema: dict[str, Any], headers: list[str]) ->
         if index is None or field == "ignore":
             continue
         result.append(ColumnDecision(index, safe_header(headers, index), field, 10))
+    return result
+
+
+def reconcile_name_column_decisions(
+    columns: list[ColumnDecision],
+    headers: list[str],
+    data_rows: list[list[str]],
+    name_layout: NameColumnLayout,
+) -> list[ColumnDecision]:
+    """按完整表头结构校验模型/规则返回的名称列。
+
+    模型只负责语义判断，不能覆盖确定性的多层表头关系。分支名称列必须
+    每个分支保留一个；普通等价名称列只能保留一个。该函数只调整
+    ``pin_name``，不会创建、删除 pin_no/type/description 映射。
+    """
+
+    selected_name_indexes = {
+        column.index
+        for column in columns
+        if normalize_field_name(column.field_name) == "pin_name"
+    }
+    other_columns = [
+        column
+        for column in columns
+        if normalize_field_name(column.field_name) != "pin_name"
+    ]
+
+    if name_layout.mode == "package_branches":
+        # 每个结构分支独立选择一列。优先采用模型在该分支内已经选中的列；
+        # 模型漏选整个分支时，从该分支的候选列中按完整度确定性恢复。
+        chosen_indexes = [
+            choose_best_name_column(
+                branch,
+                selected_name_indexes,
+                data_rows,
+            )
+            for branch in name_layout.branches
+        ]
+    elif name_layout.mode == "equivalent_names":
+        # BALL NAME、SIGNAL NAME 等普通等价字段只能选一列。模型选了多列
+        # 也不拼接；优先在模型所选范围内比较完整度，同分取最左列。
+        candidates = [
+            index
+            for index in name_layout.name_column_indexes
+            if index in selected_name_indexes
+        ] or list(name_layout.name_column_indexes)
+        chosen_indexes = (
+            [best_column_by_completeness(candidates, data_rows)]
+            if candidates
+            else []
+        )
+    else:
+        # 单名称结构若模型重复返回同一语义的多个列，也只保留结构中最可信
+        # 的一列；模型完全没有选择 pin_name 时仍允许后续填充 Reserved。
+        candidates = sorted(selected_name_indexes)
+        if len(candidates) <= 1:
+            return deduplicate_column_decisions(columns)
+        chosen_indexes = [
+            best_column_by_completeness(candidates, data_rows)
+        ]
+
+    result = list(other_columns)
+    for column_index in chosen_indexes:
+        result.append(
+            ColumnDecision(
+                column_index,
+                safe_header(headers, column_index),
+                "pin_name",
+                10,
+            )
+        )
+    return deduplicate_column_decisions(result)
+
+
+def choose_best_name_column(
+    branch: NameColumnBranch,
+    selected_name_indexes: set[int],
+    data_rows: list[list[str]],
+) -> int:
+    """为一个表头分支选择唯一名称列，模型漏选时仍保留该结构分支。"""
+
+    selected = [
+        index
+        for index in branch.column_indexes
+        if index in selected_name_indexes
+    ]
+    candidates = selected or list(branch.column_indexes)
+    return best_column_by_completeness(candidates, data_rows)
+
+
+def best_column_by_completeness(
+    column_indexes: list[int],
+    data_rows: list[list[str]],
+) -> int:
+    """按非空数据数量选择整列；数量相同时固定选择最左列。"""
+
+    return max(
+        column_indexes,
+        key=lambda index: (
+            sum(
+                bool(row[index].strip())
+                for row in data_rows
+                if index < len(row)
+            ),
+            -index,
+        ),
+    )
+
+
+def deduplicate_column_decisions(
+    columns: list[ColumnDecision],
+) -> list[ColumnDecision]:
+    """按列号和标准字段去重，同时保持原有列顺序。"""
+
+    result = []
+    seen: set[tuple[int, str]] = set()
+    for column in sorted(columns, key=lambda item: item.index):
+        key = (column.index, normalize_field_name(column.field_name))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(column)
     return result
 
 

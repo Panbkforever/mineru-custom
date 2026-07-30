@@ -29,8 +29,10 @@ def classify_table_schema(
     title: str,
     headers: list[str],
     table_rows: list[list[str]],
+    header_paths: list[list[str]] | None = None,
+    name_layout: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """将一张完整候选表交给模型，并返回规范化的表/字段判断。"""
+    """将完整候选表及确定性表头结构交给模型，返回表/字段判断。"""
     api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
         raise RuntimeError("启用语义字段判断需要先设置环境变量 DEEPSEEK_API_KEY")
@@ -39,6 +41,8 @@ def classify_table_schema(
         title=title,
         headers=headers,
         table_rows=table_rows,
+        header_paths=header_paths,
+        name_layout=name_layout,
     )
     response = call_deepseek_json(payload, api_key=api_key)
     return normalize_schema_response(response, headers)
@@ -142,6 +146,8 @@ def build_schema_prompt_payload(
     title: str,
     headers: list[str],
     table_rows: list[list[str]],
+    header_paths: list[list[str]] | None = None,
+    name_layout: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """构造最小模型请求；``table_rows`` 不截断，必须包含完整表格。"""
 
@@ -157,7 +163,10 @@ def build_schema_prompt_payload(
             "If there is no physical pin_no, ball-number, or terminal-number column, return should_extract=false even when the table contains logical Pin Name, Signal Name, Type, Mode, or Function columns.",
             "A pin_name column is optional. A physical-number-only table may still be extracted because missing names are filled as Reserved by deterministic code.",
             "If different packages have separate physical pin/ball number columns, return every one of those columns as pin_no; do not select only one package.",
-            "For multiple name-like columns, select only the column that is the actual physical pin/signal name.",
+            "BALL NAME, SIGNAL NAME, PIN NAME and TERMINAL NAME are equivalent pin_name semantics in this project.",
+            "Read table.name_layout before selecting name columns. When mode=equivalent_names, return only one complete pin_name column.",
+            "When mode=package_branches, return one pin_name column for every listed branch; never collapse multiple branches into one column.",
+            "Structural branch labels identify parallel object/package branches, but they are not final public package names.",
             "For multiple type-like columns, select only the type most directly describing the pin/signal, such as SIGNAL TYPE rather than BUFFER TYPE.",
             "Do not select description, conditions, min/typ/max, unit, reset state, power source, notes, ordering, or other auxiliary columns.",
             "Do not return package names, group names, table roles, confidence scores, reasons, or extracted row values.",
@@ -166,6 +175,10 @@ def build_schema_prompt_payload(
         "table": {
             "title": title,
             "headers": headers,
+            # header_paths 是 span-aware 解析得到的完整父子表头，不由模型生成。
+            "header_paths": header_paths or [],
+            # name_layout 只提示名称列结构；模型仍只返回是否提取和列映射。
+            "name_layout": name_layout or {},
             # 不使用 sample_rows，也不截断。模型看到的是初筛后的完整表格。
             "rows": table_rows,
         },
