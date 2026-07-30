@@ -78,6 +78,8 @@
   不明确时按固定槽位顺序使用 a、b、c……，但槽位数量保持不变。
 * 一个 pkg 只能是一个名称字符串，禁止使用 ``|`` 拼接多个名称；真实名称
   最长 15 个字符。
+* 最终 JSON 不允许出现完全相同的 pkg 名称。同名 pkg 出现多次时，按冻结
+  槽位顺序从第一个开始追加 1、2、3……；只出现一次的 pkg 名称保持不变。
 * 语义字段判断默认并发数为 4，可通过 ``EXTRACT_SCHEMA_WORKERS`` 覆盖。
 """
 
@@ -87,6 +89,7 @@ import html as html_lib
 import json
 import os
 import re
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1468,6 +1471,31 @@ def build_public_result(
         if include_debug:
             item["package_key"] = bucket["package_key"]
         result.append(item)
+    return append_duplicate_pkg_suffixes(result)
+
+
+def append_duplicate_pkg_suffixes(
+    result: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """为最终 JSON 中重复的 pkg 名称按出现顺序追加数字后缀。
+
+    该函数只修改公开输出中的 ``pkg`` 字符串，不修改内部 ``package_key``、
+    group 或 pin_list。因此多个同名封装槽位仍然保留各自独立的数据。
+    """
+
+    # 先完成全量计数，确保只出现一次的 pkg 不会被无意义地追加 ``1``。
+    package_name_counts = Counter(str(item.get("pkg", "")) for item in result)
+    package_name_indexes: Counter[str] = Counter()
+
+    for item in result:
+        package_name = str(item.get("pkg", ""))
+        if package_name_counts[package_name] <= 1:
+            continue
+
+        # 重复名称从第一个槽位开始编号，保证输出中不存在两个相同 pkg。
+        package_name_indexes[package_name] += 1
+        item["pkg"] = f"{package_name}{package_name_indexes[package_name]}"
+
     return result
 
 
