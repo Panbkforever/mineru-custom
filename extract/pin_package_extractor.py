@@ -30,7 +30,9 @@
 * pin_no 和 pin_name 的多个值按位置对应；只有两列拆分后的数量完全一致时才同步拆分。
   数量不一致时保留原 pin_name，不强行猜测对应关系。
 * HTML 单元格中的 ``<br>`` 在表格读取阶段必须保留。只有 pin_no 和 pin_name
-  都具有相同数量的 ``<br>`` 分项时才按行对应；表头、描述和普通空格不按此规则拆分。
+  能按 ``<br>`` 直接一一对应，或相同分组内的数字范围展开后数量完全一致时，
+  才按位置配对；例如 ``LED[4:0]_3`` 可按降序展开。表头、描述和普通空格
+  不按此规则拆分，任一分组数量不一致时保留原 pin_name。
 * 当前只对 pin_no 和 pin_name 做跨值同步拆分，不拆 type、description 等其他字段。
 * 表格存在 DESCRIPTION 列时，每条输出记录增加 ``description``，取同一原始
   数据行中的完整描述；一行拆成多个引脚时共享该描述，没有 DESCRIPTION 列
@@ -1299,6 +1301,9 @@ def split_parallel_pin_names(
         pin_name_value=value,
         pin_no_value=pin_no_value,
         expected_count=expected_count,
+        # 复用主提取器唯一的 pin_no 规则，包括显式列表、A1-A5 和
+        # L[7:12]，避免并行拆分模块维护另一套编号解释逻辑。
+        split_pin_numbers=split_pin_numbers,
     )
 
 
