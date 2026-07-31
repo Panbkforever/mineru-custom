@@ -10,6 +10,8 @@ MinerU/VLM 有时会把同一单元格内原本分开的多条视觉文本行直
 * 行列边界可靠时，只在当前物理单元格范围内寻找视觉行，禁止借用其他行。
 * 若当前文本在 PDF 中存在完整单行，保留原样，不再尝试拆成多个视觉行。
 * 无法恢复物理单元格范围时，仅接受位置唯一且中间没有跳行的多行匹配。
+* 一个 HTML 表跨 PDF 续表页时，同时检查相关页面的完整单行证据，避免
+  当前页中的零散字符把 ``35``、``57`` 等正常值错误拆开。
 
 MinerU 的 ``page_size`` 和表格 ``bbox`` 可能使用渲染像素坐标，而 PDFium
 字符坐标使用 PDF 点坐标。读取字符前必须先把表格范围换算到 PDF 坐标系。
@@ -138,6 +140,43 @@ def restore_cell_line_breaks_in_middle_json(
                     pdf_height,
                 )
                 runs_by_line = _visual_runs_from_characters(table_characters)
+                # MinerU 可能把多个 PDF 续表页合并成一个 HTML <table>，
+                # 但只保留起始页的 page_idx/bbox。先收集相邻相关页面中
+                # 已经完整位于同一视觉行的文本，供宽范围回退匹配避错。
+                known_single_line_texts = _single_line_texts(runs_by_line)
+                for related_page_index in _related_pdf_page_indexes(
+                    pdf_doc,
+                    declared_page_index,
+                    table_html,
+                    page_text_cache,
+                ):
+                    if related_page_index == page_index:
+                        continue
+                    related_page = pdf_doc[related_page_index]
+                    related_width, related_height = _pdf_page_size(
+                        related_page
+                    )
+                    if related_width <= 0 or related_height <= 0:
+                        continue
+                    related_bbox = _scale_bbox_to_pdf(
+                        [float(value) for value in bbox],
+                        effective_source_width,
+                        effective_source_height,
+                        related_width,
+                        related_height,
+                    )
+                    related_characters = _extract_pdf_characters(
+                        related_page.get_textpage(),
+                        related_bbox,
+                        related_height,
+                    )
+                    known_single_line_texts.update(
+                        _single_line_texts(
+                            _visual_runs_from_characters(
+                                related_characters
+                            )
+                        )
+                    )
                 logical_cells, row_count, column_count = _logical_cell_layout(
                     table_html
                 )
@@ -197,6 +236,7 @@ def restore_cell_line_breaks_in_middle_json(
                     logical_cells=logical_cells,
                     runs_by_column=runs_by_column,
                     runs_by_cell=runs_by_cell,
+                    known_single_line_texts=known_single_line_texts,
                 )
                 cache[cache_key] = cached
 
@@ -217,6 +257,7 @@ def _restore_table_cells(
     logical_cells: list[LogicalCell | tuple[int, int]] | None = None,
     runs_by_column: list[list[list[TextRun]]] | None = None,
     runs_by_cell: list[list[list[TextRun]]] | None = None,
+    known_single_line_texts: set[str] | None = None,
 ) -> tuple[str, int, int]:
     changed_cells = 0
     added_breaks = 0
@@ -236,12 +277,13 @@ def _restore_table_cells(
 
         # 单元格独立匹配 PDF 中的视觉文本行。这里不读取列名，也不要求
         # 当前单元格与其他列具有相同的行数。
+        using_cell_scope = (
+            runs_by_cell is not None
+            and current_index < len(runs_by_cell)
+        )
         candidate_runs = (
             runs_by_cell[current_index]
-            if (
-                runs_by_cell is not None
-                and current_index < len(runs_by_cell)
-            )
+            if using_cell_scope
             else runs_by_line
         )
         if (
@@ -262,7 +304,17 @@ def _restore_table_cells(
             ):
                 candidate_runs = runs_by_column[column_start]
 
-        parts = _match_visual_lines(plain, candidate_runs)
+        parts = _match_visual_lines(
+            plain,
+            candidate_runs,
+            # 单元格物理边界可靠时，只相信当前单元格；只有退回整列或
+            # 整表搜索时，才用续表页的完整单行证据阻止误拆。
+            known_single_line_texts=(
+                None
+                if using_cell_scope
+                else known_single_line_texts
+            ),
+        )
         if len(parts) < 2:
             return match.group(0)
 
@@ -285,6 +337,8 @@ def _restore_table_cells(
 def _match_visual_lines(
     cell_text: str,
     runs_by_line: list[list[TextRun]],
+    *,
+    known_single_line_texts: set[str] | None = None,
 ) -> list[str]:
     """查找唯一、连续的多视觉行匹配。
 
@@ -295,6 +349,8 @@ def _match_visual_lines(
 
     target = _normalize(cell_text)
     if not target:
+        return []
+    if known_single_line_texts and target in known_single_line_texts:
         return []
 
     single_line_match = False
@@ -363,6 +419,19 @@ def _line_run_variants(runs: list[TextRun]) -> list[TextRun]:
                 line_index=group[0].line_index,
             ))
     return variants
+
+
+def _single_line_texts(
+    runs_by_line: list[list[TextRun]],
+) -> set[str]:
+    """收集 PDF 中已经完整处于同一视觉行的文本片段。"""
+
+    return {
+        normalized
+        for runs in runs_by_line
+        for run in _line_run_variants(runs)
+        if (normalized := _normalize(run.text))
+    }
 
 
 def _same_cell_column(previous: TextRun, current: TextRun) -> bool:
@@ -678,6 +747,55 @@ def _resolve_pdf_page_index(
     if best_score >= 24 and best_score > declared_score:
         return best_index
     return declared_page_index
+
+
+def _related_pdf_page_indexes(
+    pdf_doc: Any,
+    declared_page_index: int,
+    table_html: str,
+    page_text_cache: dict[int, str],
+) -> list[int]:
+    """找出同一个 HTML 表覆盖的相邻 PDF 续表页。
+
+    这里只把包含足够长表格文本锚点的相邻页面视为相关页。普通相邻页面
+    不参与保护，避免无关页面中的偶然同名文本干扰当前表格。
+    """
+
+    anchors = _table_text_anchors(table_html)
+    if not anchors:
+        return [declared_page_index]
+
+    related = []
+    for candidate_index in range(
+        max(0, declared_page_index - 2),
+        min(len(pdf_doc), declared_page_index + 3),
+    ):
+        normalized_page = page_text_cache.get(candidate_index)
+        if normalized_page is None:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    page_text = (
+                        pdf_doc[candidate_index]
+                        .get_textpage()
+                        .get_text_range()
+                    )
+            except Exception:
+                page_text = ""
+            normalized_page = _normalize(page_text)
+            page_text_cache[candidate_index] = normalized_page
+
+        score = sum(
+            min(len(anchor), 24)
+            for anchor in anchors
+            if anchor in normalized_page
+        )
+        if score >= 24:
+            related.append(candidate_index)
+
+    if declared_page_index not in related:
+        related.append(declared_page_index)
+    return sorted(set(related))
 
 
 def _table_text_anchors(table_html: str) -> list[str]:

@@ -161,6 +161,24 @@ def test_complete_single_line_prevents_borrowing_digits_from_other_rows():
     assert added_breaks == 0
 
 
+def test_related_continuation_page_single_line_prevents_wrong_split():
+    html = "<table><tr><td>57</td></tr></table>"
+    current_page_runs = [
+        [_run("5", 0, 10, 0)],
+        [_run("7", 0, 10, 1)],
+    ]
+
+    corrected, changed_cells, added_breaks = _restore_table_cells(
+        html,
+        current_page_runs,
+        known_single_line_texts={"57"},
+    )
+
+    assert corrected == html
+    assert changed_cells == 0
+    assert added_breaks == 0
+
+
 def test_multiple_possible_multiline_matches_are_left_unchanged():
     html = "<table><tr><td>A1A2</td></tr></table>"
     runs_by_line = [
