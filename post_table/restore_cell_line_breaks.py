@@ -7,6 +7,9 @@ MinerU/VLM 有时会把同一单元格内原本分开的多条视觉文本行直
 * 不根据列名、逗号、空格、文本长度或抽取需求猜测换行。
 * 只有单元格完整文本能与 PDF 中连续视觉文本行可靠对应时才插入 ``<br>``。
 * 只在原 HTML 内容中插入 ``<br>``，不使用 PDF 文字覆盖 MinerU 识别结果。
+* 行列边界可靠时，只在当前物理单元格范围内寻找视觉行，禁止借用其他行。
+* 若当前文本在 PDF 中存在完整单行，保留原样，不再尝试拆成多个视觉行。
+* 无法恢复物理单元格范围时，仅接受位置唯一且中间没有跳行的多行匹配。
 
 MinerU 的 ``page_size`` 和表格 ``bbox`` 可能使用渲染像素坐标，而 PDFium
 字符坐标使用 PDF 点坐标。读取字符前必须先把表格范围换算到 PDF 坐标系。
@@ -38,6 +41,16 @@ class TextRun:
     y0: float
     y1: float
     line_index: int
+
+
+@dataclass(frozen=True)
+class LogicalCell:
+    """HTML 源单元格在展开 rowspan/colspan 后占用的逻辑网格范围。"""
+
+    row_start: int
+    row_end: int
+    column_start: int
+    column_end: int
 
 
 def restore_cell_line_breaks_in_middle_json(
@@ -119,12 +132,15 @@ def restore_cell_line_breaks_in_middle_json(
             cached = cache.get(cache_key)
             if cached is None:
                 text_page = page.get_textpage()
-                runs_by_line = _extract_visual_runs(
+                table_characters = _extract_pdf_characters(
                     text_page,
                     pdf_bbox,
                     pdf_height,
                 )
-                logical_cells, column_count = _logical_cell_columns(table_html)
+                runs_by_line = _visual_runs_from_characters(table_characters)
+                logical_cells, row_count, column_count = _logical_cell_layout(
+                    table_html
+                )
                 column_boundaries = _detect_table_column_boundaries(
                     page,
                     pdf_bbox,
@@ -138,16 +154,49 @@ def restore_cell_line_breaks_in_middle_json(
                         column_boundaries,
                         column_boundaries[1:],
                     ):
-                        runs_by_column.append(_extract_visual_runs(
-                            text_page,
+                        column_characters = _characters_in_bbox(
+                            table_characters,
                             [left, pdf_bbox[1], right, pdf_bbox[3]],
-                            pdf_height,
-                        ))
+                        )
+                        runs_by_column.append(
+                            _visual_runs_from_characters(column_characters)
+                        )
+
+                # 只有行、列边界都能可靠恢复时，才生成当前单元格专属的
+                # 视觉文本行。边界不足时不猜测单元格位置，后面使用保守的
+                # 唯一匹配回退逻辑。
+                row_boundaries = _detect_table_row_boundaries(
+                    page,
+                    pdf_bbox,
+                    pdf_height,
+                    row_count,
+                )
+                runs_by_cell = None
+                if (
+                    column_boundaries is not None
+                    and row_boundaries is not None
+                ):
+                    runs_by_cell = []
+                    for logical_cell in logical_cells:
+                        cell_bbox = [
+                            column_boundaries[logical_cell.column_start],
+                            row_boundaries[logical_cell.row_start],
+                            column_boundaries[logical_cell.column_end],
+                            row_boundaries[logical_cell.row_end],
+                        ]
+                        cell_characters = _characters_in_bbox(
+                            table_characters,
+                            cell_bbox,
+                        )
+                        runs_by_cell.append(
+                            _visual_runs_from_characters(cell_characters)
+                        )
                 cached = _restore_table_cells(
                     table_html,
                     runs_by_line,
                     logical_cells=logical_cells,
                     runs_by_column=runs_by_column,
+                    runs_by_cell=runs_by_cell,
                 )
                 cache[cache_key] = cached
 
@@ -165,8 +214,9 @@ def _restore_table_cells(
     table_html: str,
     runs_by_line: list[list[TextRun]],
     *,
-    logical_cells: list[tuple[int, int]] | None = None,
+    logical_cells: list[LogicalCell | tuple[int, int]] | None = None,
     runs_by_column: list[list[list[TextRun]]] | None = None,
+    runs_by_cell: list[list[list[TextRun]]] | None = None,
 ) -> tuple[str, int, int]:
     changed_cells = 0
     added_breaks = 0
@@ -186,13 +236,26 @@ def _restore_table_cells(
 
         # 单元格独立匹配 PDF 中的视觉文本行。这里不读取列名，也不要求
         # 当前单元格与其他列具有相同的行数。
-        candidate_runs = runs_by_line
+        candidate_runs = (
+            runs_by_cell[current_index]
+            if (
+                runs_by_cell is not None
+                and current_index < len(runs_by_cell)
+            )
+            else runs_by_line
+        )
         if (
-            runs_by_column is not None
+            runs_by_cell is None
+            and runs_by_column is not None
             and logical_cells is not None
             and current_index < len(logical_cells)
         ):
-            column_start, column_end = logical_cells[current_index]
+            logical_cell = logical_cells[current_index]
+            if isinstance(logical_cell, LogicalCell):
+                column_start = logical_cell.column_start
+                column_end = logical_cell.column_end
+            else:
+                column_start, column_end = logical_cell
             if (
                 column_end == column_start + 1
                 and column_start < len(runs_by_column)
@@ -223,31 +286,42 @@ def _match_visual_lines(
     cell_text: str,
     runs_by_line: list[list[TextRun]],
 ) -> list[str]:
+    """查找唯一、连续的多视觉行匹配。
+
+    完整单行匹配优先级最高：只要 PDF 范围中存在一条视觉行已经等于
+    当前单元格文本，就不能再从其他行拼出同样文本后插入换行。多行匹配
+    必须使用连续视觉行，不允许跳过中间行，并且只能存在一种匹配位置。
+    """
+
     target = _normalize(cell_text)
     if not target:
         return []
 
-    max_line_window = min(40, len(runs_by_line))
+    single_line_match = False
+    multi_line_matches: dict[
+        tuple[tuple[int, str], ...],
+        list[str],
+    ] = {}
+
     for start_line, runs in enumerate(runs_by_line):
         for first_run in _line_run_variants(runs):
             first = _normalize(first_run.text)
-            if not first or not target.startswith(first) or first == target:
+            if not first:
+                continue
+            if first == target:
+                single_line_match = True
+                continue
+            if not target.startswith(first):
                 continue
 
-            candidates = [(first_run, [first_run.text], first, 0)]
+            candidates = [(first_run, [first_run.text], first)]
             for line_index in range(
                 start_line + 1,
-                min(len(runs_by_line), start_line + max_line_window),
+                len(runs_by_line),
             ):
                 next_candidates = []
                 line_variants = _line_run_variants(runs_by_line[line_index])
-                for previous_run, parts, combined, skipped_lines in candidates:
-                    matched_current_line = False
-                    same_column_present = any(
-                        _normalize(run.text)
-                        and _same_cell_column(previous_run, run)
-                        for run in runs_by_line[line_index]
-                    )
+                for previous_run, parts, combined in candidates:
                     for run in line_variants:
                         if not _same_cell_column(previous_run, run):
                             continue
@@ -259,27 +333,20 @@ def _match_visual_lines(
                             continue
                         next_parts = [*parts, run.text]
                         if next_combined == target:
-                            return next_parts
-                        matched_current_line = True
-                        next_candidates.append((run, next_parts, next_combined, 0))
-                    if (
-                        not matched_current_line
-                        and not same_column_present
-                        and skipped_lines < 2
-                    ):
-                        # Other columns can have slightly different baselines.
-                        # Skip such a visual line only when it has no text run
-                        # overlapping the current cell's horizontal region.
-                        next_candidates.append((
-                            previous_run,
-                            parts,
-                            combined,
-                            skipped_lines + 1,
-                        ))
+                            match_key = tuple(
+                                (start_line + offset, _normalize(part))
+                                for offset, part in enumerate(next_parts)
+                            )
+                            multi_line_matches[match_key] = next_parts
+                            continue
+                        next_candidates.append((run, next_parts, next_combined))
                 candidates = next_candidates
                 if not candidates:
                     break
-    return []
+
+    if single_line_match or len(multi_line_matches) != 1:
+        return []
+    return next(iter(multi_line_matches.values()))
 
 
 def _line_run_variants(runs: list[TextRun]) -> list[TextRun]:
@@ -312,6 +379,20 @@ def _extract_visual_runs(
     bbox: list[float],
     page_height: float,
 ) -> list[list[TextRun]]:
+    """兼容旧调用：读取范围内字符并按视觉基线组织为文本行。"""
+
+    return _visual_runs_from_characters(
+        _extract_pdf_characters(text_page, bbox, page_height)
+    )
+
+
+def _extract_pdf_characters(
+    text_page: Any,
+    bbox: list[float],
+    page_height: float,
+) -> list[dict[str, Any]]:
+    """一次性读取表格范围内的 PDF 原生字符及其左上角坐标。"""
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         page_text = text_page.get_text_range()
@@ -341,6 +422,30 @@ def _extract_visual_runs(
             "y1": top_down_y1,
             "cy": center_y,
         })
+    return characters
+
+
+def _characters_in_bbox(
+    characters: list[dict[str, Any]],
+    bbox: list[float],
+) -> list[dict[str, Any]]:
+    """按字符中心点截取当前逻辑单元格范围，避免读取相邻行列。"""
+
+    return [
+        item
+        for item in characters
+        if (
+            bbox[0] <= (item["x0"] + item["x1"]) / 2.0 <= bbox[2]
+            and bbox[1] <= item["cy"] <= bbox[3]
+        )
+    ]
+
+
+def _visual_runs_from_characters(
+    characters: list[dict[str, Any]],
+) -> list[list[TextRun]]:
+    """把已经限定范围的字符聚类为从上到下的视觉文本行。"""
+
     if not characters:
         return []
 
@@ -611,15 +716,33 @@ def _table_text_anchors(table_html: str) -> list[str]:
 def _logical_cell_columns(
     table_html: str,
 ) -> tuple[list[tuple[int, int]], int]:
-    """按 HTML 阅读顺序计算每个源单元格占用的逻辑列范围。"""
+    """兼容旧调用：返回每个源单元格占用的逻辑列范围。"""
 
-    result: list[tuple[int, int]] = []
+    cells, _, column_count = _logical_cell_layout(table_html)
+    return [
+        (cell.column_start, cell.column_end)
+        for cell in cells
+    ], column_count
+
+
+def _logical_cell_layout(
+    table_html: str,
+) -> tuple[list[LogicalCell], int, int]:
+    """按 HTML 阅读顺序展开 rowspan/colspan，记录每格的行列范围。"""
+
+    result: list[LogicalCell] = []
+    # 保存每个逻辑列被 rowspan 占用到哪一行，结束行使用开区间。
     active_rowspans: dict[int, int] = {}
+    maximum_row = 0
     maximum_column = 0
 
-    for row_match in TR_RE.finditer(table_html):
+    for row_index, row_match in enumerate(TR_RE.finditer(table_html)):
+        active_rowspans = {
+            column: row_end
+            for column, row_end in active_rowspans.items()
+            if row_end > row_index
+        }
         blocked_columns = set(active_rowspans)
-        new_rowspans: dict[int, int] = {}
         logical_column = 0
 
         for cell_match in CELL_RE.finditer(row_match.group(1)):
@@ -642,28 +765,26 @@ def _logical_cell_columns(
                     logical_column += 1
 
             column_end = logical_column + colspan
-            result.append((logical_column, column_end))
+            row_end = row_index + rowspan
+            result.append(LogicalCell(
+                row_start=row_index,
+                row_end=row_end,
+                column_start=logical_column,
+                column_end=column_end,
+            ))
+            maximum_row = max(maximum_row, row_end)
             maximum_column = max(maximum_column, column_end)
             if rowspan > 1:
                 for column in range(logical_column, column_end):
-                    new_rowspans[column] = max(
-                        new_rowspans.get(column, 0),
-                        rowspan - 1,
+                    active_rowspans[column] = max(
+                        active_rowspans.get(column, 0),
+                        row_end,
                     )
             logical_column = column_end
 
-        active_rowspans = {
-            column: remaining - 1
-            for column, remaining in active_rowspans.items()
-            if remaining > 1
-        }
-        for column, remaining in new_rowspans.items():
-            active_rowspans[column] = max(
-                active_rowspans.get(column, 0),
-                remaining,
-            )
+        maximum_row = max(maximum_row, row_index + 1)
 
-    return result, maximum_column
+    return result, maximum_row, maximum_column
 
 
 def _detect_table_column_boundaries(
@@ -674,11 +795,52 @@ def _detect_table_column_boundaries(
 ) -> list[float] | None:
     """从 PDF 矢量竖线中读取表格列边界。
 
-    只接受贯穿大部分表格高度、数量与 HTML 逻辑列完全一致的竖线集合。
-    证据不足时返回 ``None``，由调用方退回整表范围匹配。
+    同一条列边界可能由每个表格行各自绘制的短线段组成，因此先按横坐标
+    聚类，再计算所有线段在表格高度方向上的联合覆盖率。
     """
 
-    if expected_columns <= 0:
+    return _detect_table_vector_boundaries(
+        page,
+        bbox,
+        pdf_height,
+        expected_segments=expected_columns,
+        axis="vertical",
+    )
+
+
+def _detect_table_row_boundaries(
+    page: Any,
+    bbox: list[float],
+    pdf_height: float,
+    expected_rows: int,
+) -> list[float] | None:
+    """从 PDF 矢量横线中读取表格行边界。"""
+
+    return _detect_table_vector_boundaries(
+        page,
+        bbox,
+        pdf_height,
+        expected_segments=expected_rows,
+        axis="horizontal",
+    )
+
+
+def _detect_table_vector_boundaries(
+    page: Any,
+    bbox: list[float],
+    pdf_height: float,
+    *,
+    expected_segments: int,
+    axis: str,
+) -> list[float] | None:
+    """按线段联合覆盖率读取横向或纵向表格边界。
+
+    ``expected_segments`` 是 HTML 展开后的行数或列数，边界数量必须为
+    ``expected_segments + 1``。证据不足或边界数量不一致时返回 ``None``，
+    禁止使用不可靠边界裁剪字符。
+    """
+
+    if expected_segments <= 0 or axis not in {"horizontal", "vertical"}:
         return None
 
     table_width = bbox[2] - bbox[0]
@@ -686,74 +848,142 @@ def _detect_table_column_boundaries(
     if table_width <= 0 or table_height <= 0:
         return None
 
-    candidates: list[tuple[float, float]] = []
     try:
-        objects = page.get_objects()
+        page_objects = page.get_objects()
     except Exception:
         return None
 
-    for page_object in objects:
-        # PDFium 类型 1 是文字对象。这里只读取路径/线框对象，避免把
-        # 细长文字笔画误认为表格竖线。
+    candidates: list[tuple[float, tuple[float, float]]] = []
+    for page_object in page_objects:
+        # PDFium 类型 1 是文字对象，只读取路径和线框对象。
         if getattr(page_object, "type", 1) == 1:
             continue
-        try:
-            left, bottom, right, top = [
-                float(value) for value in page_object.get_pos()
-            ]
-        except Exception:
+        bounds = _page_object_bounds(page_object)
+        if bounds is None:
             continue
-
+        left, bottom, right, top = bounds
         object_y0 = pdf_height - top
         object_y1 = pdf_height - bottom
         object_width = right - left
-        overlap_y = max(
-            0.0,
-            min(object_y1, bbox[3]) - max(object_y0, bbox[1]),
-        )
+        object_height = object_y1 - object_y0
+
+        if axis == "vertical":
+            position = (left + right) / 2.0
+            interval = (
+                max(object_y0, bbox[1]),
+                min(object_y1, bbox[3]),
+            )
+            thickness = object_width
+            maximum_thickness = max(2.5, table_width * 0.01)
+            inside = bbox[0] - 3.0 <= position <= bbox[2] + 3.0
+        else:
+            position = (object_y0 + object_y1) / 2.0
+            interval = (
+                max(left, bbox[0]),
+                min(right, bbox[2]),
+            )
+            thickness = object_height
+            maximum_thickness = max(2.5, table_height * 0.01)
+            inside = bbox[1] - 3.0 <= position <= bbox[3] + 3.0
+
         if (
-            object_width <= max(2.5, table_width * 0.01)
-            and overlap_y >= table_height * 0.75
-            and bbox[0] - 3.0 <= (left + right) / 2.0 <= bbox[2] + 3.0
+            inside
+            and thickness <= maximum_thickness
+            and interval[1] - interval[0] > 2.0
         ):
-            candidates.append(((left + right) / 2.0, overlap_y))
+            candidates.append((position, interval))
 
     if not candidates:
         return None
 
-    clusters: list[list[tuple[float, float]]] = []
-    for candidate in sorted(candidates):
-        if not clusters or candidate[0] - clusters[-1][-1][0] > 2.0:
+    clusters: list[list[tuple[float, tuple[float, float]]]] = []
+    for candidate in sorted(candidates, key=lambda value: value[0]):
+        if (
+            not clusters
+            or candidate[0] - clusters[-1][-1][0] > 2.0
+        ):
             clusters.append([candidate])
         else:
             clusters[-1].append(candidate)
 
-    clustered = [
-        (
-            sum(x * length for x, length in cluster)
-            / max(1.0, sum(length for _, length in cluster)),
-            max(length for _, length in cluster),
+    orthogonal_length = table_height if axis == "vertical" else table_width
+    clustered: list[tuple[float, float]] = []
+    for cluster in clusters:
+        intervals = [interval for _, interval in cluster]
+        coverage = _interval_union_length(intervals)
+        if coverage < orthogonal_length * 0.55:
+            continue
+        weighted_position = sum(
+            position * max(0.1, interval[1] - interval[0])
+            for position, interval in cluster
+        ) / sum(
+            max(0.1, interval[1] - interval[0])
+            for _, interval in cluster
         )
-        for cluster in clusters
-    ]
-    if len(clustered) < expected_columns + 1:
+        clustered.append((weighted_position, coverage))
+
+    required_boundaries = expected_segments + 1
+    if len(clustered) != required_boundaries:
         return None
 
-    # 若候选竖线略多，优先保留贯穿高度最长的边界，再按横坐标排序。
-    selected = sorted(
-        sorted(clustered, key=lambda item: item[1], reverse=True)[
-            :expected_columns + 1
-        ],
-        key=lambda item: item[0],
+    # 必须与 HTML 网格数量完全一致。出现额外边界也说明当前 bbox 或
+    # HTML 结构存在歧义，不能通过主观选择若干条边界继续修改。
+    selected = sorted(clustered, key=lambda value: value[0])
+    boundaries = [position for position, _ in selected]
+    minimum_segment = (
+        table_width * 0.015
+        if axis == "vertical"
+        else table_height * 0.005
     )
-    boundaries = [x for x, _ in selected]
-    minimum_width = table_width * 0.015
     if any(
-        right - left < minimum_width
+        right - left < minimum_segment
         for left, right in zip(boundaries, boundaries[1:])
     ):
         return None
     return boundaries
+
+
+def _page_object_bounds(page_object: Any) -> tuple[float, float, float, float] | None:
+    """兼容不同 pypdfium2 版本的页面对象边界接口。"""
+
+    for method_name in ("get_bounds", "get_pos"):
+        method = getattr(page_object, method_name, None)
+        if method is None:
+            continue
+        try:
+            left, bottom, right, top = [
+                float(value)
+                for value in method()
+            ]
+        except Exception:
+            continue
+        if right > left and top > bottom:
+            return left, bottom, right, top
+    return None
+
+
+def _interval_union_length(
+    intervals: list[tuple[float, float]],
+) -> float:
+    """计算同一边界上多个短线段的联合覆盖长度。"""
+
+    valid = sorted(
+        (start, end)
+        for start, end in intervals
+        if end > start
+    )
+    if not valid:
+        return 0.0
+
+    total = 0.0
+    current_start, current_end = valid[0]
+    for start, end in valid[1:]:
+        if start <= current_end + 1.0:
+            current_end = max(current_end, end)
+            continue
+        total += current_end - current_start
+        current_start, current_end = start, end
+    return total + current_end - current_start
 
 
 def _pdf_page_size(page: Any) -> tuple[float, float]:
