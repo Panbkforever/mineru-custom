@@ -8,12 +8,14 @@
 
 1. 从全文表格中宽松定位可能的封装总述表或包装信息表。
 2. 模型只判断表格角色、表头行和列角色，不返回任何 pkg 值。
-3. 代码按照模型给出的列索引逐行读取原表，先确定文档中有几个相互独立的
-   物理引脚映射空间，并把它们冻结为 slot:0、slot:1……。
+3. 代码按照模型给出的列索引逐行读取原表，并结合已经严格确认的表内分支，
+   确定文档中有几个相互独立的物理引脚映射空间，再冻结为
+   slot:0、slot:1……。
 4. ``package_identity``（器件型号）只作为跨表关联证据；公开 ``pkg`` 只取
    ``package_type``（SC-70、VSSOP、QFN 等物理封装名称）。
-5. 没有身份总述表时，包装信息表的 package_type/drawing/pin_count 组合或
-   严格确认的表内多封装列可以建立槽位；仍无证据时整篇文档只建立一个槽位。
+5. 严格确认的 N 个表内分支是 N 个独立输出槽位的下限。总述表即使只找到
+   一个公开封装名，也必须建立 N 个槽位并复用该名称；最终输出再追加数字
+   后缀。没有多分支证据时，包装信息表或单封装兜底才决定槽位数量。
 6. 目标引脚表只通过表题、章节标题、表头和多封装列标签绑定已有槽位；
    description 和数据行不能参与绑定。
 7. 槽位冻结后，任何未匹配表都不能创建新 pkg。真实名称缺失时按槽位顺序
@@ -36,7 +38,7 @@ from __future__ import annotations
 
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
@@ -922,14 +924,15 @@ def merge_plan_package_labels(
     target_tables: Sequence[PackageTargetTable],
     multi_package_plans: Mapping[int, MultiPackagePlanLike],
 ) -> list[PackageCatalogEntry]:
-    """目录为空时，用一张最完整的多封装表确定槽位数量。
+    """用最完整的多封装计划保证文档目录具有足够的独立槽位。
 
     不能累计每张表的标签，否则同一组封装在多个表中重复出现时会被重复计数。
+    如果总述阶段只识别到一个公开封装名称，而表内结构严格确认存在 N 个
+    分支，则复制该封装元数据建立 N 个独立槽位。复制的是名称和物理元数据，
+    不是数据桶；每个分支随后仍按自己的 ``package_key`` 独立提取。
     """
 
     result = list(entries)
-    if result:
-        return result
     target_ids = {table.table_id for table in target_tables}
     eligible_plans = [
         (table_id, plan)
@@ -948,6 +951,29 @@ def merge_plan_package_labels(
         eligible_plans,
         key=lambda item: (len(item[1].bindings), -item[0]),
     )
+
+    # 一个真实封装名称不能覆盖已经确认的多个表内分支。为每个分支复制一个
+    # 独立目录项，freeze_package_slots() 随后会为它们分配不同的 slot key。
+    # 公开名称允许相同，最终 JSON 的统一后缀逻辑负责生成 WQFN1/WQFN2……。
+    if len(result) == 1 and len(anchor_plan.bindings) > 1:
+        template = result[0]
+        evidence_table_ids = list(template.evidence_table_ids)
+        if table_id not in evidence_table_ids:
+            evidence_table_ids.append(table_id)
+        return [
+            replace(
+                template,
+                package_key="",
+                identity_aliases=list(template.identity_aliases),
+                evidence_table_ids=list(evidence_table_ids),
+            )
+            for _binding in anchor_plan.bindings
+        ]
+
+    # 总述已经确认两个或更多槽位时，不能再根据某一张表增删目录数量。
+    if result:
+        return result
+
     for binding in anchor_plan.bindings:
         package_type = clean_public_package_name(binding.package)
         result.append(
