@@ -133,10 +133,10 @@ from extract.table_header_structure import (
     NameColumnLayout,
     analyze_name_column_layout,
     build_header_paths,
-    extend_header_index_for_name_branches,
     header_paths_to_lists,
     name_layout_to_dict,
     parse_spanned_table,
+    resolve_header_boundary,
 )
 
 
@@ -331,12 +331,6 @@ def extract_pin_package_info_from_table_candidates(
         if header_index < 0:
             skip(debug, "no_candidate_header_after_span_expansion")
             continue
-        # 多个名称列共享同一 PIN/NAME 父表头时，下一行可能是各分支标签。
-        # 严格结构判断命中后才延伸表头，普通第一条数据不会被吞掉。
-        header_index = extend_header_index_for_name_branches(
-            rows,
-            header_index,
-        )
         header_paths = build_header_paths(rows, header_index)
         headers = [path.combined for path in header_paths]
         name_layout = analyze_name_column_layout(header_paths)
@@ -374,6 +368,8 @@ def extract_pin_package_info_from_table_candidates(
             }
         )
         debug["headers"] = headers
+        debug["header_end"] = header_index
+        debug["data_start"] = header_index + 1
         debug["header_paths"] = header_paths_to_lists(header_paths)
         debug["name_layout"] = name_layout_to_dict(name_layout)
         debug["rule_columns"] = decisions_to_debug(rule_columns)
@@ -1357,16 +1353,20 @@ def parse_html_table(html: str) -> list[list[str]]:
 
 
 def choose_header_row(rows: list[list[str]], title: str = "", semantic: bool = False) -> tuple[int, list[str]]:
-    """在表格前几行中选择最像字段表头的一行。"""
+    """先找字段语义种子行，再通过结构关系确定完整表头边界。"""
     best = (-1, -1, [])
-    for index in range(min(6, len(rows))):
+    # 十二行只是异常HTML的防护上限；最终边界仍由字段轴、分支标签和后续
+    # 数据一致性决定，不依赖某个PDF的固定表头层数。
+    for index in range(min(12, len(rows))):
         headers = build_combined_headers(rows, index)
         score = sum(classify_header(header)[1] for header in headers)
         if score > best[1]:
             best = (index, score, headers)
     if best[1] < (2 if semantic else 4):
         return -1, []
-    return best[0], best[2]
+    boundary = resolve_header_boundary(rows, best[0])
+    headers = build_combined_headers(rows, boundary.header_end)
+    return boundary.header_end, headers
 
 
 def build_combined_headers(rows: list[list[str]], header_index: int) -> list[str]:
