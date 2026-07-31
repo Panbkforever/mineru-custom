@@ -655,6 +655,13 @@ def _path_has_name_role(parts: Sequence[str]) -> bool:
         for term in ("引脚名称", "信号名称", "端子名称", "引脚名")
     ):
         return True
+    # 中文父字段和叶子字段经 rowspan/colspan 展开后通常位于不同层，
+    # 完整路径会表现为“引脚 名称”，不能只识别没有空格的合并字符串。
+    if "名称" in normalized_parts and any(
+        part in {"引脚", "端子", "信号", "球"}
+        for part in normalized_parts
+    ):
+        return True
     # ``Package A > NAME`` 这类表头把对象/封装标签放在 NAME 上方，
     # 路径本身已提供分支父节点，因此裸 NAME 也属于名称字段。
     if "name" in normalized_parts and len(normalized_parts) >= 2:

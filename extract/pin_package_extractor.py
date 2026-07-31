@@ -75,6 +75,9 @@
   定位封装总述候选，再结合已经确认的多封装结构和当前表题/表头完成绑定。
 * 封装目录判断不能修改表格是否提取、字段映射、行内容或 group；逐行提取
   不能反过来创造、合并或重命名 pkg。
+* 粗解析找不到表头时，如果原 HTML 同时具有 rowspan/colspan 和明确的
+  PIN/BALL/引脚结构锚点，必须先执行 span-aware 表头重试；不能在展开
+  多层表头之前直接以 ``no_candidate_header`` 丢弃整张表。
 * 封装槽位数量在行提取前冻结；未匹配表不能按 table_id 创建新的外层 pkg。
 * 已严格确认的 N 个表内分支是 N 个独立封装槽位的下限。封装目录即使只
   识别到一个真实 pkg 名称，也只能把该名称复用给 N 个独立槽位，不能把
@@ -290,15 +293,31 @@ def extract_pin_package_info_from_table_candidates(
             skip(debug, "pinout_matrix_table")
             continue
 
+        # 多层表头可能只有展开 rowspan/colspan 后才能组成“引脚 > 名称”或
+        # “PIN > Package A”字段路径。rough_rows 失败时只对具有明确结构
+        # 锚点的 HTML 重试，避免把普通无关表无条件送入后续昂贵流程。
+        span_rows: list[list[str]] | None = None
         rough_header_index, rough_headers = choose_header_row(
             rough_rows,
             table.title,
             semantic=use_semantic_classifier,
         )
         if rough_header_index < 0:
-            skip(debug, "no_candidate_header")
-            continue
-        rough_data_rows = rough_rows[rough_header_index + 1 :]
+            if not should_retry_spanned_header(table, rough_rows):
+                skip(debug, "no_candidate_header")
+                continue
+            span_rows = parse_spanned_table(table.html)
+            rough_header_index, rough_headers = choose_header_row(
+                span_rows,
+                table.title,
+                semantic=use_semantic_classifier,
+            )
+            if rough_header_index < 0:
+                skip(debug, "no_candidate_header_after_span_retry")
+                continue
+            debug["header_retry"] = "span_aware"
+        rough_source_rows = span_rows or rough_rows
+        rough_data_rows = rough_source_rows[rough_header_index + 1 :]
         if is_ordering_table(rough_headers):
             skip(debug, "ordering_table")
             continue
@@ -315,7 +334,7 @@ def extract_pin_package_info_from_table_candidates(
 
         # 只有已经通过宽松初筛的表才执行 span-aware 解析。展开后的 rows
         # 是后续字段判断、多封装分析和逐行提取共同使用的唯一二维表。
-        rows = parse_spanned_table(table.html) or rough_rows
+        rows = span_rows or parse_spanned_table(table.html) or rough_rows
         if len(rows) < 2:
             skip(debug, "too_few_rows_after_span_expansion")
             continue
@@ -1040,12 +1059,12 @@ def classify_header(header: str) -> tuple[str, int]:
     # 否则首行描述里的 package/pin/type 等普通词会污染字段评分。
     if is_description_header(h):
         return "", 0
-    if any(word in h for word in ("pin no", "pin number", "ball no", "ball number", "terminal no", "terminal number", "引脚编号", "端子编号")):
+    if any(word in h for word in ("pin no", "pin number", "ball no", "ball number", "terminal no", "terminal number", "引脚编号", "端子编号")) or re.search(r"(?:引脚|端子|球)\s+编号", h):
         return "pin_no", 5
     # Reserved/NC 表常把物理编号列简写为 PINS、BALLS 或 TERMINALS。
     if h in {"pins", "balls", "terminals"}:
         return "pin_no", 4
-    if any(word in h for word in ("pin name", "ball name", "signal name", "terminal name", "引脚名称", "信号名称", "引脚名")):
+    if any(word in h for word in ("pin name", "ball name", "signal name", "terminal name", "引脚名称", "信号名称", "引脚名")) or re.search(r"(?:引脚|信号|端子|球)\s+名称", h):
         return "pin_name", 5
     if any(word in h for word in ("signal type", "pin type", "terminal type", "io type", "i o type", "引脚类型", "信号类型")):
         return "type", 5
@@ -1053,7 +1072,7 @@ def classify_header(header: str) -> tuple[str, int]:
         return "pin_no", 4
     if h in {"signal", "name"}:
         return "pin_name", 3
-    if h in {"type", "io", "i o", "i/o"} or h.endswith(" type"):
+    if h in {"type", "io", "i o", "i/o", "类型"} or h.endswith(" type"):
         return "type", 3
     if "package" in h and "pin" not in h:
         return "package", 2
@@ -1367,6 +1386,40 @@ def choose_header_row(rows: list[list[str]], title: str = "", semantic: bool = F
     boundary = resolve_header_boundary(rows, best[0])
     headers = build_combined_headers(rows, boundary.header_end)
     return boundary.header_end, headers
+
+
+def should_retry_spanned_header(
+    table: TableCandidate,
+    rough_rows: list[list[str]],
+) -> bool:
+    """仅为确有多层表头证据的表启用 span-aware 表头重试。
+
+    该函数只决定是否值得重新解析表头，不认定表格有效，也不创建字段映射。
+    重试后的表仍须依次通过候选表、模型和字段完整性判断。
+    """
+
+    html = str(table.html or "")
+    if not re.search(r"\b(?:rowspan|colspan)\s*=", html, re.IGNORECASE):
+        return False
+
+    # 只读取标题和前四行作为结构锚点，禁止用数据区内容反向证明表头。
+    header_window = " ".join(
+        [table.title]
+        + [cell for row in rough_rows[:4] for cell in row]
+    )
+    normalized = normalize_header(header_window)
+    has_pin_axis = bool(
+        re.search(r"\b(?:pin|ball|terminal)\b", normalized)
+        or any(term in normalized for term in ("引脚", "端子", "球"))
+    )
+    has_field_leaf = bool(
+        re.search(r"\b(?:name|type|description|no|number)\b", normalized)
+        or any(
+            term in normalized
+            for term in ("名称", "类型", "说明", "描述", "编号")
+        )
+    )
+    return has_pin_axis and has_field_leaf
 
 
 def build_combined_headers(rows: list[list[str]], header_index: int) -> list[str]:

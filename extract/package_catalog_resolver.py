@@ -20,6 +20,9 @@
    description 和数据行不能参与绑定。
 7. 槽位冻结后，任何未匹配表都不能创建新 pkg。真实名称缺失时按槽位顺序
    使用 a、b、c……，但不能改变槽位数量。
+8. 多封装表的全部本地分支必须一次性执行一对一绑定；禁止每个分支独立
+   兜底后落入同一个 package_key。标签脚注、drawing 和 pin_count 只用于
+   内部消歧，不改变任何引脚行内容。
 
 特别重要的边界：
 
@@ -197,6 +200,20 @@ def resolve_document_package_catalog(
             classifier=classifier,
         )
         diagnostics.extend(semantic_diagnostics)
+
+    # 同一物理封装有时会被总述表和 Packaging Information 分别写成
+    # ``(TSSOP-14) - PW`` 与 ``TSSOP / PW / 14``。冻结槽位前只合并物理
+    # 元数据完全相同且身份不冲突的重复证据，不能合并不同器件身份。
+    before_deduplication = len(entries)
+    entries = deduplicate_redundant_catalog_entries(entries)
+    if len(entries) != before_deduplication:
+        diagnostics.append(
+            {
+                "stage": "package_catalog_deduplication",
+                "before": before_deduplication,
+                "after": len(entries),
+            }
+        )
 
     # 总述表没有建立槽位时，严格确认的表内多封装结构可以提供槽位数量。
     # 如果仍无多封装证据，但存在目标引脚表，则整篇文档只建立一个槽位；
@@ -918,6 +935,117 @@ def physical_metadata_key(entry: PackageCatalogEntry) -> tuple[str, str, str]:
     )
 
 
+def deduplicate_redundant_catalog_entries(
+    entries: Sequence[PackageCatalogEntry],
+) -> list[PackageCatalogEntry]:
+    """合并同一物理封装的重复表述，同时保留不同身份的独立槽位。
+
+    只有 family、drawing、pin_count 三项都能确定且完全一致时才允许合并；
+    两个非空器件身份不同则强制保留，避免把同封装类型的不同映射空间合并。
+    """
+
+    result: list[PackageCatalogEntry] = []
+    for incoming in entries:
+        incoming_signature = canonical_physical_metadata(incoming)
+        incoming_identity = normalize_compact(incoming.identity_name)
+        duplicate: PackageCatalogEntry | None = None
+
+        for existing in result:
+            existing_identity = normalize_compact(existing.identity_name)
+            identities_conflict = bool(
+                incoming_identity
+                and existing_identity
+                and incoming_identity != existing_identity
+            )
+            if identities_conflict:
+                continue
+            if (
+                incoming_signature[0]
+                and incoming_signature[1]
+                and incoming_signature[2]
+                and incoming_signature == canonical_physical_metadata(existing)
+            ):
+                duplicate = existing
+                break
+
+        if duplicate is None:
+            result.append(incoming)
+            continue
+        merge_redundant_catalog_evidence(duplicate, incoming)
+    return result
+
+
+def canonical_physical_metadata(
+    entry: PackageCatalogEntry,
+) -> tuple[str, str, str]:
+    """把组合写法转换为仅用于比较的 family/drawing/pin_count。"""
+
+    package_type = clean_metadata(entry.package_type)
+    drawing = clean_metadata(entry.package_drawing)
+    pin_count = clean_pin_count(entry.pin_count)
+
+    # 数据手册常用 ``(TSSOP-14) - PW`` 表示封装族、引脚数和 drawing。
+    # 该格式三项证据齐全，可以与分列元数据安全比较；SC-70 这类普通
+    # 封装名不会命中该规则，因此不会把 70 误当作引脚数。
+    combined_match = re.fullmatch(
+        r"\(\s*([A-Za-z][A-Za-z0-9]*)\s*-\s*(\d+)\s*\)"
+        r"\s*[-–—]\s*([A-Za-z0-9]+)",
+        package_type,
+    )
+    if combined_match:
+        package_type = combined_match.group(1)
+        pin_count = pin_count or combined_match.group(2)
+        drawing = drawing or combined_match.group(3)
+
+    # 只有显式包含 PIN 的写法才从普通文本中提取数量，避免把 SC-70、
+    # QFN-16 等名称内部数字在证据不足时直接解释成 pin_count。
+    explicit_pin_match = re.fullmatch(
+        r"(.+?)\s+(\d+)\s*[- ]?\s*pin(?:s)?",
+        package_type,
+        flags=re.IGNORECASE,
+    )
+    if explicit_pin_match:
+        package_type = clean_metadata(explicit_pin_match.group(1))
+        pin_count = pin_count or explicit_pin_match.group(2)
+
+    return (
+        normalize_compact(package_type),
+        normalize_compact(drawing),
+        clean_pin_count(pin_count),
+    )
+
+
+def merge_redundant_catalog_evidence(
+    target: PackageCatalogEntry,
+    incoming: PackageCatalogEntry,
+) -> None:
+    """把重复目录项的身份、别名和更结构化的物理元数据合入原槽位。"""
+
+    if not target.identity_name and incoming.identity_name:
+        target.identity_name = incoming.identity_name
+    for alias in [incoming.identity_name, *incoming.identity_aliases]:
+        if alias and alias != target.identity_name and alias not in target.identity_aliases:
+            target.identity_aliases.append(alias)
+    for table_id in incoming.evidence_table_ids:
+        if table_id not in target.evidence_table_ids:
+            target.evidence_table_ids.append(table_id)
+
+    # 分列字段比组合字符串更适合作为公开名称和后续匹配证据。
+    target_detail = bool(target.package_drawing) + bool(target.pin_count)
+    incoming_detail = bool(incoming.package_drawing) + bool(incoming.pin_count)
+    if incoming_detail > target_detail:
+        target.package_type = incoming.package_type or target.package_type
+        target.package_drawing = incoming.package_drawing or target.package_drawing
+        target.pin_count = incoming.pin_count or target.pin_count
+    else:
+        if not target.package_type:
+            target.package_type = incoming.package_type
+        if not target.package_drawing:
+            target.package_drawing = incoming.package_drawing
+        if not target.pin_count:
+            target.pin_count = incoming.pin_count
+
+
 def merge_plan_package_labels(
     entries: list[PackageCatalogEntry],
     *,
@@ -952,10 +1080,12 @@ def merge_plan_package_labels(
         key=lambda item: (len(item[1].bindings), -item[0]),
     )
 
+    required_slots = len(anchor_plan.bindings)
+
     # 一个真实封装名称不能覆盖已经确认的多个表内分支。为每个分支复制一个
     # 独立目录项，freeze_package_slots() 随后会为它们分配不同的 slot key。
     # 公开名称允许相同，最终 JSON 的统一后缀逻辑负责生成 WQFN1/WQFN2……。
-    if len(result) == 1 and len(anchor_plan.bindings) > 1:
+    if len(result) == 1 and required_slots > 1:
         template = result[0]
         evidence_table_ids = list(template.evidence_table_ids)
         if table_id not in evidence_table_ids:
@@ -970,7 +1100,19 @@ def merge_plan_package_labels(
             for _binding in anchor_plan.bindings
         ]
 
-    # 总述已经确认两个或更多槽位时，不能再根据某一张表增删目录数量。
+    # 总述可能只识别出部分封装。严格表头已经确认 N 个独立分支时，目录槽位
+    # 至少也必须有 N 个；缺失槽位保持匿名，不能拿分支标签冒充真实封装名。
+    if 1 < len(result) < required_slots:
+        for _slot_index in range(len(result), required_slots):
+            result.append(
+                PackageCatalogEntry(
+                    package_key="",
+                    evidence_table_ids=[table_id],
+                )
+            )
+        return result
+
+    # 总述已经确认足够的槽位时，不能再根据某一张表增删目录数量。
     if result:
         return result
 
@@ -1016,6 +1158,36 @@ def bind_target_tables(
 
         table_text = binding_evidence_text(table)
         explicit_matches = match_entries_in_text(entries, table_text)
+
+        # 多封装表必须把全部分支作为一个整体绑定。若逐个分支独立匹配，两个
+        # 模糊标签可能同时落入第一个槽位，导致本应分开的 pkg 再次合并。
+        if plan is not None and plan.is_multi_package and len(local_labels) >= 2:
+            bound_entries = bind_multi_package_entries(entries, local_labels)
+            for local_slot, (local_label, entry) in enumerate(
+                zip(local_labels, bound_entries)
+            ):
+                assignment = assignment_from_entry(
+                    entry,
+                    entries,
+                    reason="multi_package_global_unique_binding",
+                )
+                assignments[(table.table_id, local_slot)] = assignment
+                diagnostics.append(
+                    {
+                        "stage": "package_binding",
+                        "table_id": table.table_id,
+                        "local_slot": local_slot,
+                        "local_label": local_label,
+                        "package_key": assignment.package_key,
+                        "pkg": assignment.pkg,
+                        "reason": assignment.reason,
+                    }
+                )
+            # 多分支表不能成为单封装续表的继承来源。
+            if chapter_context_key(table) != previous_context:
+                previous_explicit = None
+                previous_context = ""
+            continue
 
         for local_slot, local_label in enumerate(local_labels):
             local_matches = match_entries_in_text(entries, local_label)
@@ -1105,6 +1277,166 @@ def bind_target_tables(
             previous_explicit = None
             previous_context = ""
     return assignments
+
+
+def bind_multi_package_entries(
+    entries: Sequence[PackageCatalogEntry],
+    local_labels: Sequence[str],
+) -> list[PackageCatalogEntry]:
+    """把一张表的全部本地分支一次性绑定到互不重复的文档槽位。
+
+    绑定是一个小规模最大权重匹配问题。分支标签与目录项之间的型号、封装族、
+    drawing 和显式 pin_count 共同计分；无证据时才用列顺序打破平局。无论
+    得分高低，同一张多封装表内都禁止两个分支复用同一个 ``package_key``。
+    """
+
+    if len(entries) < len(local_labels):
+        raise ValueError(
+            "package catalog has fewer slots than confirmed table branches"
+        )
+
+    score_matrix = [
+        [
+            multi_package_binding_score(label, entry, local_slot, entry_slot)
+            for entry_slot, entry in enumerate(entries)
+        ]
+        for local_slot, label in enumerate(local_labels)
+    ]
+    selected_slots = maximum_weight_unique_assignment(score_matrix)
+    return [entries[entry_slot] for entry_slot in selected_slots]
+
+
+def maximum_weight_unique_assignment(
+    score_matrix: Sequence[Sequence[int]],
+) -> list[int]:
+    """用矩形匈牙利算法求每个分支对应的唯一目录槽位。
+
+    行是表内分支，列是文档目录槽位，且行数不大于列数。算法复杂度为
+    ``O(分支数^2 * 槽位数)``，不会随着目录候选增加而进行组合枚举。
+    """
+
+    row_count = len(score_matrix)
+    if row_count == 0:
+        return []
+    column_count = len(score_matrix[0])
+    if column_count < row_count:
+        raise ValueError("unique assignment requires at least one slot per branch")
+    if any(len(row) != column_count for row in score_matrix):
+        raise ValueError("assignment score matrix must be rectangular")
+
+    # 标准算法求最小代价，因此把最大得分转换为相反数。下标 0 是哨兵位。
+    row_potential = [0] * (row_count + 1)
+    column_potential = [0] * (column_count + 1)
+    matched_row = [0] * (column_count + 1)
+    previous_column = [0] * (column_count + 1)
+
+    for row_number in range(1, row_count + 1):
+        matched_row[0] = row_number
+        current_column = 0
+        minimum_cost = [float("inf")] * (column_count + 1)
+        used_column = [False] * (column_count + 1)
+        while True:
+            used_column[current_column] = True
+            current_row = matched_row[current_column]
+            delta = float("inf")
+            next_column = 0
+            for column_number in range(1, column_count + 1):
+                if used_column[column_number]:
+                    continue
+                reduced_cost = (
+                    -score_matrix[current_row - 1][column_number - 1]
+                    - row_potential[current_row]
+                    - column_potential[column_number]
+                )
+                if reduced_cost < minimum_cost[column_number]:
+                    minimum_cost[column_number] = reduced_cost
+                    previous_column[column_number] = current_column
+                if minimum_cost[column_number] < delta:
+                    delta = minimum_cost[column_number]
+                    next_column = column_number
+            for column_number in range(column_count + 1):
+                if used_column[column_number]:
+                    row_potential[matched_row[column_number]] += delta
+                    column_potential[column_number] -= delta
+                else:
+                    minimum_cost[column_number] -= delta
+            current_column = next_column
+            if matched_row[current_column] == 0:
+                break
+
+        while True:
+            predecessor = previous_column[current_column]
+            matched_row[current_column] = matched_row[predecessor]
+            current_column = predecessor
+            if current_column == 0:
+                break
+
+    selected_slots = [-1] * row_count
+    for column_number in range(1, column_count + 1):
+        if matched_row[column_number]:
+            selected_slots[matched_row[column_number] - 1] = column_number - 1
+    if any(slot < 0 for slot in selected_slots):
+        raise RuntimeError("failed to bind every package branch to a unique slot")
+    return selected_slots
+
+
+def multi_package_binding_score(
+    local_label: str,
+    entry: PackageCatalogEntry,
+    local_slot: int,
+    entry_slot: int,
+) -> int:
+    """计算一个分支标签与一个目录槽位之间的确定性关联分数。"""
+
+    label_text = normalize_text(local_label)
+    label_compact = normalize_compact(local_label)
+    score = 0
+
+    identities = [entry.identity_name, *entry.identity_aliases]
+    for identity in identities:
+        identity_compact = normalize_compact(clean_identity_name(identity))
+        if not identity_compact:
+            continue
+        if identity_compact == label_compact:
+            score = max(score, 1200)
+        elif package_name_in_text(identity, label_text):
+            score = max(score, 950)
+
+    package_type = clean_public_package_name(entry.package_type)
+    package_type_compact = normalize_compact(package_type)
+    if package_type_compact:
+        if package_type_compact == label_compact:
+            score += 700
+        elif package_name_in_text(package_type, label_text):
+            score += 350
+
+    drawing = clean_metadata(entry.package_drawing)
+    drawing_compact = normalize_compact(drawing)
+    if drawing_compact:
+        if drawing_compact == label_compact:
+            score += 450
+        elif package_name_in_text(drawing, label_text):
+            score += 300
+
+    label_pin_count = explicit_pin_count_from_label(local_label)
+    entry_pin_count = clean_pin_count(entry.pin_count)
+    if label_pin_count and entry_pin_count:
+        score += 400 if label_pin_count == entry_pin_count else -500
+
+    # 结构证据完全相同时才依赖稳定列顺序。该分值远低于任何语义证据。
+    score += max(0, 20 - abs(local_slot - entry_slot))
+    return score
+
+
+def explicit_pin_count_from_label(value: str) -> str:
+    """只读取带 PIN 文字的显式引脚数，避免把型号内部数字当作数量。"""
+
+    match = re.search(
+        r"(?<![A-Za-z0-9])(\d+)\s*[- ]?\s*pin(?:s)?(?![A-Za-z0-9])",
+        str(value or ""),
+        flags=re.IGNORECASE,
+    )
+    return clean_pin_count(match.group(1)) if match else ""
 
 
 def match_entries_in_text(
@@ -1204,6 +1536,8 @@ def clean_identity_name(value: str) -> str:
 
     value = re.sub(r"<[^>]+>", " ", value)
     value = re.sub(r"\s+", " ", value).strip(" \t\r\n,;:")
+    # 表头脚注不是型号的一部分，例如 DRV8311S(2) 应与 DRV8311S 对应。
+    value = re.sub(r"\s*[\(（]\s*\d+\s*[\)）]\s*$", "", value)
     if not value or "|" in value or "\n" in value or len(value) > 15:
         return ""
     return value
