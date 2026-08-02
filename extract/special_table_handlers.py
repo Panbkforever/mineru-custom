@@ -1,4 +1,4 @@
-"""识别可以绕过模型、直接保留的特殊表格。
+"""识别可以绕过模型、直接保留或直接过滤的特殊表格。
 
 本模块只处理格式和语义都高度确定的特殊情况。每一种特殊表格必须使用一个
 独立函数，未完全满足该函数全部条件时必须返回 ``None``，继续交给模型判断。
@@ -8,6 +8,9 @@
 * ``reserved_pin_table_handler``：处理只有物理引脚/球号和连接要求的
   Reserved/NC 表。只保留明确要求悬空或禁止连接的行；明确说明封装中不存在
   的位置不作为物理引脚输出。
+* ``register_word_pin_affected_table_filter``：处理以 Word/位字段为主轴、
+  ``PIN AFFECTED`` 仅表示受寄存器影响引脚的特殊寄存器表；整表直接过滤，
+  禁止把辅助引用列当成物理引脚清单。
 """
 
 from __future__ import annotations
@@ -27,11 +30,16 @@ class SpecialColumnMapping:
 
 @dataclass(frozen=True)
 class SpecialTableMatch:
-    """特殊表的确定性判断结果，不包含最终 pin 记录。"""
+    """特殊表的确定性判断结果，不包含最终 pin 记录。
+
+    ``should_extract=False`` 表示该专用规则确认整张表必须过滤；此时
+    ``columns`` 和 ``included_row_indexes`` 都为空，也不会进入模型判断。
+    """
 
     handler_name: str
     columns: tuple[SpecialColumnMapping, ...]
     included_row_indexes: frozenset[int]
+    should_extract: bool = True
 
 
 def find_special_table_match(
@@ -41,12 +49,59 @@ def find_special_table_match(
 ) -> SpecialTableMatch | None:
     """依次调用每一种特殊处理函数，返回第一个完整命中的结果。"""
 
-    handlers = (reserved_pin_table_handler,)
+    handlers = (
+        register_word_pin_affected_table_filter,
+        reserved_pin_table_handler,
+    )
     for handler in handlers:
         match = handler(title, headers, data_rows)
         if match is not None:
             return match
     return None
+
+
+def register_word_pin_affected_table_filter(
+    title: str,
+    headers: list[str],
+    data_rows: list[list[str]],
+) -> SpecialTableMatch | None:
+    """过滤 ``Word`` 位字段表中的 ``PIN AFFECTED`` 辅助引用列。
+
+    该规则有意保持严格，必须同时满足：
+
+    1. 表题明确为 ``Table n. Word n`` 或等价的独立 ``Word n`` 表题；
+    2. 表头同时具有 ``BIT``、``BIT NAME``、``DESCRIPTION/FUNCTION``；
+    3. 表头具有 ``PIN AFFECTED``，但没有直接 ``PIN NO.``/``BALL NUMBER`` 轴；
+    4. 至少存在一行非空数据，避免只凭空表头作出决定。
+
+    命中后整表拒绝，不返回列映射，也不发送给字段判断模型。
+    """
+
+    normalized_title = normalize_text(title)
+    if not re.search(r"(?:^|\b)table\s+\d+(?:[.-]\d+)?\s*[.:]?\s*word\s+\d+\b", normalized_title):
+        if not re.fullmatch(r"word\s+\d+", normalized_title):
+            return None
+
+    normalized_headers = [normalize_header_text(header) for header in headers]
+    header_set = {header for header in normalized_headers if header}
+
+    required_headers = {"bit", "bit name", "description / function", "pin affected"}
+    if not required_headers.issubset(header_set):
+        return None
+
+    # 真正的物理编号主轴优先，防止误过滤同时描述寄存器控制信息的引脚表。
+    if any(is_direct_physical_number_header(header) for header in normalized_headers):
+        return None
+
+    if not any(any(cell_value(row, index) for index in range(len(row))) for row in data_rows):
+        return None
+
+    return SpecialTableMatch(
+        handler_name="register_word_pin_affected_table_filter",
+        columns=(),
+        included_row_indexes=frozenset(),
+        should_extract=False,
+    )
 
 
 def reserved_pin_table_handler(
@@ -158,6 +213,18 @@ def is_name_header(header: str) -> bool:
             "信号名称",
             "端子名称",
         )
+    )
+
+
+def is_direct_physical_number_header(header: str) -> bool:
+    """识别真正作为表格主轴的 Pin/Ball/Terminal 编号表头。"""
+
+    return bool(
+        re.fullmatch(
+            r"(?:pin|ball|terminal)\s*(?:no\.?|number|numbers|#)",
+            header,
+        )
+        or header in {"引脚编号", "球号", "焊球编号", "端子编号"}
     )
 
 

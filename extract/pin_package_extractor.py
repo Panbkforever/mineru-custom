@@ -65,7 +65,9 @@
 * 表内的 Power Pins、PCI INTERFACE 等结构标题行只负责划分原表内容；
   行提取时跳过这些标题行，但不得追加或覆盖最终 group。
 * 初筛后先调用 ``special_table_handlers.py``。特殊表只有完整命中专用规则才
-  绕过模型；当前 Reserved/NC 表会直接保留真实 Reserved 行并排除不存在位置。
+  绕过模型；Reserved/NC 表直接保留真实 Reserved 行并排除不存在位置；
+  Word 位字段表中的 ``PIN AFFECTED`` 只是寄存器辅助引用列，严格命中专用
+  规则后整表过滤，不能进入模型或行提取。
 * 横向重复的 ``Pin# | Pin Name | Type`` 字段块必须至少完整重复两次且字段
   顺序完全一致才命中；命中后整张表直接排除，不送模型、不进入行提取。
 * 通过表格/字段判断后调用 ``multi_package_extractor.py``。多个封装专属
@@ -632,7 +634,7 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
             remaining.append(item)
             continue
         results[item["table_id"]] = TableDecision(
-            should_extract=True,
+            should_extract=special_match.should_extract,
             table_role="special_table",
             reason=special_match.handler_name,
             columns=[
