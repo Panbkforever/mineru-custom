@@ -68,6 +68,10 @@
   绕过模型；当前 Reserved/NC 表会直接保留真实 Reserved 行并排除不存在位置。
 * 横向重复的 ``Pin# | Pin Name | Type`` 字段块必须至少完整重复两次且字段
   顺序完全一致才命中；命中后整张表直接排除，不送模型、不进入行提取。
+* 寄存器位/字段说明表即使具有 ``Relevant Pins``、``Associated Pins`` 等
+  辅助引脚引用列，也必须在模型调用前整表排除。只有同时具有寄存器结构、
+  辅助引用列且没有直接 Pin No./Ball Number 轴时才命中，不能依据 Description
+  中出现 register 一词过滤正常引脚表。
 * 通过表格/字段判断后调用 ``multi_package_extractor.py``。多个封装专属
   pin_no 列、package 控制列和 package 分段行走多封装分支；其中的 package
   文字是表内结构证据，但最终名称仍由文档级目录统一校验。
@@ -104,6 +108,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from extract.special_table_handlers import find_special_table_match
+from extract.register_reference_table_filter import is_register_pin_reference_table
 from extract.parallel_cell_splitter import (
     parse_html_cell_text,
     split_parallel_pin_names as split_parallel_pin_names_by_structure,
@@ -328,6 +333,9 @@ def extract_pin_package_info_from_table_candidates(
         ):
             skip(debug, "not_pin_table_candidate")
             continue
+        if is_register_pin_reference_table(table.title, rough_headers):
+            skip(debug, "register_pin_reference_table")
+            continue
         if is_non_physical_port_function_table(table.title, rough_headers):
             skip(debug, "non_physical_port_function_table")
             continue
@@ -366,6 +374,9 @@ def extract_pin_package_info_from_table_candidates(
             continue
         if not is_loose_candidate(table.title, headers, data_rows):
             skip(debug, "not_pin_table_candidate_after_span_expansion")
+            continue
+        if is_register_pin_reference_table(table.title, headers):
+            skip(debug, "register_pin_reference_table_after_span_expansion")
             continue
         if is_non_physical_port_function_table(table.title, headers):
             skip(debug, "non_physical_port_function_table_after_span_expansion")
