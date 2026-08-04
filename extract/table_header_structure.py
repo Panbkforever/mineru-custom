@@ -11,8 +11,8 @@
 4. 根据确定的最后一行表头，为每个数据列建立完整表头路径。
 5. 将 PIN NAME、BALL NAME、SIGNAL NAME、TERMINAL NAME 统一视为
    ``pin_name`` 语义。
-6. 多个等价名称字段仍属于普通单封装字段；只有名称列具有共同语义父节点，
-   并且存在互不相同的子分支标签时，才判定为多封装名称分支。
+6. 多个等价名称字段仍属于普通单封装字段；名称列具有共同语义父节点且存在
+   不同子分支时，还要继续区分“物理封装分支”和“运行模式分支”。
 
 特别重要的项目规则：
 
@@ -20,6 +20,8 @@
 * 普通等价名称列最终只能选择一列，禁止使用 ``|`` 合并。
 * ``NAME > Package A/Package B`` 和
   ``Package A/Package B > NAME`` 都属于封装分支结构。
+* ``MII Mode Pin Name``、``PHY Mode Pin Name`` 等列属于运行模式分支；这些列
+  可以分别提取名称，但绝不能据此增加 pkg 数量。
 * 本模块返回的 ``branch_label`` 只是表内分支证据，不是最终公开 pkg 名称。
 * ``-``、``--``、``—`` 和空单元格属于数据值；边界判断不能以占位符为由删行。
 * 表头边界必须由整行结构和后续数据一致性共同决定，不能仅依赖某个关键词。
@@ -596,6 +598,20 @@ def analyze_name_column_layout(
             )
             for label, column_indexes in grouped.items()
         )
+        # ``XXX Mode Pin Name`` 的横向分支描述的是同一物理封装在不同运行
+        # 模式下的信号名称，不是多个物理封装。结构层必须先把这条轴标明，
+        # 后续单表提取可以保留各分支，但文档级 pkg 目录不能把它们计数。
+        if _branches_are_operating_modes(branches):
+            return NameColumnLayout(
+                mode="parallel_name_branches",
+                name_column_indexes=indexes,
+                branches=branches,
+                evidence=(
+                    "多个名称列共享名称语义父节点",
+                    f"识别出 {len(branches)} 个运行模式名称分支",
+                    "运行模式分支不构成物理封装分支",
+                ),
+            )
         return NameColumnLayout(
             mode="package_branches",
             name_column_indexes=indexes,
@@ -612,6 +628,26 @@ def analyze_name_column_layout(
         mode="equivalent_names",
         name_column_indexes=indexes,
         evidence=("多个名称列没有形成完整且唯一的分支标签",),
+    )
+
+
+def _branches_are_operating_modes(
+    branches: Sequence[NameColumnBranch],
+) -> bool:
+    """确认全部分支标签都明确以 Mode/模式描述运行方式。
+
+    这里只接受显式 ``Mode`` 或 ``模式`` 文字，不根据 MAC、PHY、RGMII 等
+    协议名称猜测，避免把恰好含有协议缩写的真实封装标签错误降级。
+    """
+
+    if len(branches) < 2:
+        return False
+    return all(
+        bool(
+            re.search(r"(?:^|\s)mode(?:\s|$)", _normalize(branch.label))
+            or "模式" in _normalize(branch.label)
+        )
+        for branch in branches
     )
 
 

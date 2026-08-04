@@ -70,6 +70,7 @@ def classify_package_catalog_table(
         ),
         "rules": [
             "Read the complete table, title and chapter context.",
+            "Treat tables titled Device Information, Package Information, Packaging Information, Ordering Information, 器件信息, 封装信息, 包装信息 or 订购信息 as the strongest catalog candidates, but still classify their actual structure instead of accepting by title alone.",
             "Use target pin-table titles only as context for deciding which candidate column contains the device identity used for cross-table association.",
             "identity_summary means each data row describes one independent physical pinout slot. A row may contain a device identity such as INA290 and a physical package type such as SC-70.",
             "packaging_metadata means rows contain orderable SKUs, physical package type, package drawing, pin count or shipment variants.",
@@ -166,6 +167,7 @@ def build_schema_prompt_payload(
             "BALL NAME, SIGNAL NAME, PIN NAME and TERMINAL NAME are equivalent pin_name semantics in this project.",
             "Read table.name_layout before selecting name columns. When mode=equivalent_names, return only one complete pin_name column.",
             "When mode=package_branches, return one pin_name column for every listed branch; never collapse multiple branches into one column.",
+            "When mode=parallel_name_branches, also return one pin_name column for every listed operating-mode branch; these branches are not packages.",
             "Structural branch labels identify parallel object/package branches, but they are not final public package names.",
             "For multiple type-like columns, select only the type most directly describing the pin/signal, such as SIGNAL TYPE rather than BUFFER TYPE.",
             "Do not select description, conditions, min/typ/max, unit, reset state, power source, notes, ordering, or other auxiliary columns.",

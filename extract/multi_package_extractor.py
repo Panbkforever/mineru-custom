@@ -11,7 +11,9 @@
 之一时，才返回多封装绑定：
 
 * package_columns：多个封装各有独立 pin_no 列，共享 pin_name/type；
-* package_name_columns：共享一个 pin_no/type，多个分支各有独立 pin_name 列；
+* package_name_columns：共享一个 pin_no/type，多个封装分支各有独立 pin_name 列；
+* parallel_name_columns：共享一个 pin_no/type，多个运行模式分支各有独立
+  pin_name 列；该模式用于逐列提取，但不增加文档级 pkg 数量；
 * package_rows：一个 package 控制列把数据行划分给不同封装；
 * package_sections：表内用“XXX Package”分段行切换当前封装；
 * shared_packages：标题明确说明同一套引脚映射同时适用于多个封装。
@@ -162,7 +164,10 @@ def detect_package_specific_name_columns(
     为多封装。
     """
 
-    if name_layout is None or name_layout.mode != "package_branches":
+    if name_layout is None or name_layout.mode not in {
+        "package_branches",
+        "parallel_name_branches",
+    }:
         return None
 
     pin_columns = _selected_columns(columns, "pin_no")
@@ -207,14 +212,20 @@ def detect_package_specific_name_columns(
         )
         for branch_label, name_column in branch_columns
     )
+    is_parallel_mode = name_layout.mode == "parallel_name_branches"
     return MultiPackagePlan(
         True,
-        "package_name_columns",
+        "parallel_name_columns" if is_parallel_mode else "package_name_columns",
         bindings,
         evidence=(
             "表头结构只有一个共享 pin_no 列",
             f"完整多层表头识别出 {len(bindings)} 个名称分支",
             "每个分支都绑定一个独立 pin_name 列并共享 type",
+            (
+                "这些分支表示运行模式，不增加文档级 pkg 数量"
+                if is_parallel_mode
+                else "这些分支表示不同物理封装"
+            ),
         ),
     )
 

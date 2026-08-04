@@ -6,7 +6,8 @@
 
 固定处理流程：
 
-1. 从全文表格中宽松定位可能的封装总述表或包装信息表。
+1. 从全文表格中宽松定位可能的封装总述表或包装信息表；器件信息、封装信息、
+   订购信息及对应英文标题属于最高优先级证据，但仍需模型确认表格结构。
 2. 模型只判断表格角色、表头行和列角色，不返回任何 pkg 值。
 3. 代码按照模型给出的列索引逐行读取原表，并结合已经严格确认的表内分支，
    确定文档中有几个相互独立的物理引脚映射空间，再冻结为
@@ -23,6 +24,8 @@
 8. 多封装表的全部本地分支必须一次性执行一对一绑定；禁止每个分支独立
    兜底后落入同一个 package_key。标签脚注、drawing 和 pin_count 只用于
    内部消歧，不改变任何引脚行内容。
+9. ``XXX Mode Pin Name`` 形成的运行模式分支只控制名称列读取，不创建 pkg
+   槽位；这些分支必须共同绑定当前表所属的同一个物理封装。
 
 特别重要的边界：
 
@@ -317,6 +320,18 @@ def package_catalog_candidate_score(
             ]
         )
     )
+    # 当前表题和最近章节标题是最局部的定位证据。不能只检查累积章节文本，
+    # 否则位于“订购信息”之后的普通表也会继承关键词并获得同等优先级。
+    direct_title_text = normalize_text(
+        "\n".join(
+            [
+                table.title,
+                table.current_chapter_titles[-1]
+                if table.current_chapter_titles
+                else "",
+            ]
+        )
+    )
     header_text = normalize_text(" ".join(table.headers))
     score = 0
 
@@ -353,6 +368,23 @@ def package_catalog_candidate_score(
         "封装",
         "器件型号",
         "引脚数",
+    )
+    priority_title_terms = (
+        "device information",
+        "package information",
+        "packaging information",
+        "ordering information",
+        "器件信息",
+        "封装信息",
+        "包装信息",
+        "订购信息",
+    )
+    # 这些标题通常直接声明“文档有哪些封装/订购变体”，因此优先送入第二次
+    # 模型调用。高分只改变候选顺序，不绕过模型，也不直接生成 pkg。
+    score += (
+        12
+        if any(term in direct_title_text for term in priority_title_terms)
+        else 0
     )
     score += 3 if any(term in title_text for term in title_terms) else 0
     score += min(4, sum(term in header_text for term in header_terms))
@@ -469,7 +501,11 @@ def classify_package_catalog_candidates(
                 ],
             }
         )
-    entries = build_catalog_entries_from_decisions(decisions, diagnostics)
+    entries = build_catalog_entries_from_decisions(
+        decisions,
+        diagnostics,
+        target_tables=target_tables,
+    )
     return entries, diagnostics
 
 
@@ -559,6 +595,8 @@ def build_catalog_entries_from_decisions(
         tuple[int, PackageCatalogTable, PackageCatalogDecision]
     ],
     diagnostics: list[dict[str, Any]],
+    *,
+    target_tables: Sequence[PackageTargetTable] = (),
 ) -> list[PackageCatalogEntry]:
     """先建立身份槽位，再补元数据；必要时由包装结构建立物理槽位。"""
 
@@ -601,6 +639,37 @@ def build_catalog_entries_from_decisions(
             }
         )
 
+    # 没有独立身份总述表时，订购表中的 SKU 仍可与目标引脚表题/章节中已经
+    # 出现的器件身份做严格前缀关联。例如 SF2507BC 与 SF2507、SF2507EBC
+    # 与 SF2507E。代码只接受目标表真实出现过的最长身份前缀，不自行截 SKU。
+    for _, table, decision in decisions:
+        if decision.table_role != "packaging_metadata":
+            continue
+        derived = create_target_identity_entries_from_packaging_table(
+            table,
+            decision,
+            target_tables,
+        )
+        for entry in derived:
+            merge_catalog_entry(entries, entry)
+        if derived:
+            diagnostics.append(
+                {
+                    "stage": "package_catalog_rows",
+                    "table_id": table.table_id,
+                    "table_role": decision.table_role,
+                    "created_from_target_identity": [
+                        {
+                            "identity_name": entry.identity_name,
+                            "package_type": entry.package_type,
+                            "package_drawing": entry.package_drawing,
+                            "pin_count": entry.pin_count,
+                        }
+                        for entry in derived
+                    ],
+                }
+            )
+
     # 某些文档没有单独的器件身份总述表，只有 Packaging Information。
     # 此时 package_type + drawing + pin_count 的唯一组合足以确定物理槽位，
     # 但 orderable_sku 本身仍不能成为公开 pkg。
@@ -628,6 +697,116 @@ def build_catalog_entries_from_decisions(
                     }
                 )
     return entries
+
+
+def create_target_identity_entries_from_packaging_table(
+    table: PackageCatalogTable,
+    decision: PackageCatalogDecision,
+    target_tables: Sequence[PackageTargetTable],
+) -> list[PackageCatalogEntry]:
+    """用订购 SKU 与目标表中的器件身份建立独立封装槽位。
+
+    该函数不从 SKU 猜测型号。只有一个字母数字标识符已经出现在目标引脚表
+    的表题或章节标题中，并且它是 SKU 的完整前缀时才允许关联；多个候选
+    同时匹配时取最长者，避免 ``SF2507E`` 被较短的 ``SF2507`` 抢占。
+    """
+
+    identity_candidates = collect_target_identity_candidates(target_tables)
+    if not identity_candidates:
+        return []
+
+    sku_columns = columns_for_role(decision, "orderable_sku")
+    matched_rows: list[tuple[str, Sequence[str]]] = []
+    for row in table.rows[decision.header_row_index + 1 :]:
+        sku_values = [
+            cell_value(row, column)
+            for column in sku_columns
+            if cell_value(row, column)
+        ]
+        identity = longest_target_identity_prefix(
+            sku_values,
+            identity_candidates,
+        )
+        if identity:
+            matched_rows.append((identity, row))
+
+    # 只有一项身份时无法证明多个订购行是否代表独立 pinout。此时保留原有
+    # 物理元数据/表内分支逻辑，避免把同一器件的温度或包装后缀误拆成 pkg。
+    distinct_identities = {
+        normalize_compact(identity)
+        for identity, _ in matched_rows
+    }
+    if len(distinct_identities) < 2:
+        return []
+
+    result: list[PackageCatalogEntry] = []
+    for identity, row in matched_rows:
+        package_type = first_role_value(row, decision, "package_type")
+        pin_count = clean_pin_count(
+            first_role_value(row, decision, "pin_count")
+        )
+        package_type, type_pin_count = split_package_type_and_pin_count(
+            package_type
+        )
+        incoming = PackageCatalogEntry(
+            package_key="",
+            identity_name=identity,
+            package_type=clean_public_package_name(package_type),
+            package_drawing=first_role_value(
+                row,
+                decision,
+                "package_drawing",
+            ),
+            pin_count=pin_count or type_pin_count,
+            evidence_table_ids=[table.table_id],
+        )
+        merge_catalog_entry(result, incoming)
+    return result
+
+
+def collect_target_identity_candidates(
+    target_tables: Sequence[PackageTargetTable],
+) -> dict[str, str]:
+    """收集目标表局部标题中真实出现的短器件标识符。"""
+
+    candidates: dict[str, str] = {}
+    for table in target_tables:
+        texts = [table.title, *table.current_chapter_titles]
+        for text in texts:
+            for token in re.findall(
+                r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9-]{3,14})(?![A-Za-z0-9])",
+                str(text or ""),
+            ):
+                compact = normalize_compact(token)
+                # 器件标识符必须同时含字母和数字。Table、Package、LQFP 等
+                # 普通标题词不满足该条件，也不会进入 SKU 前缀匹配。
+                if (
+                    not re.search(r"[a-z]", compact)
+                    or not re.search(r"\d", compact)
+                ):
+                    continue
+                cleaned = clean_identity_name(token)
+                if cleaned:
+                    candidates.setdefault(compact, cleaned)
+    return candidates
+
+
+def longest_target_identity_prefix(
+    sku_values: Sequence[str],
+    identity_candidates: Mapping[str, str],
+) -> str:
+    """返回与任一订购 SKU 匹配的最长目标表身份前缀。"""
+
+    matches: list[tuple[int, str]] = []
+    for sku_value in sku_values:
+        sku = normalize_compact(sku_value)
+        for compact, display_name in identity_candidates.items():
+            if sku.startswith(compact):
+                matches.append((len(compact), display_name))
+    if not matches:
+        return ""
+    matches.sort(key=lambda item: (-item[0], item[1]))
+    return matches[0][1]
 
 
 def create_identity_entries_from_table(
@@ -1067,7 +1246,7 @@ def merge_plan_package_labels(
         for table_id, plan in multi_package_plans.items()
         if (
             table_id in target_ids
-            and plan.is_multi_package
+            and plan_creates_package_slots(plan)
             and len(plan.bindings) >= 2
         )
     ]
@@ -1128,6 +1307,20 @@ def merge_plan_package_labels(
     return result
 
 
+def plan_creates_package_slots(plan: MultiPackagePlanLike | None) -> bool:
+    """判断单表分支是否代表独立物理封装槽位。
+
+    ``parallel_name_columns`` 只是同一封装的运行模式名称列。它仍使用多分支
+    行读取器生成记录，但不能参与文档级 pkg 数量和一对一封装绑定。
+    """
+
+    return bool(
+        plan is not None
+        and plan.is_multi_package
+        and plan.mode != "parallel_name_columns"
+    )
+
+
 def freeze_package_slots(entries: Sequence[PackageCatalogEntry]) -> None:
     """按首次出现顺序冻结槽位 key；名称变化不能改变分组身份。"""
 
@@ -1156,12 +1349,79 @@ def bind_target_tables(
             else [""]
         )
 
-        table_text = binding_evidence_text(table)
-        explicit_matches = match_entries_in_text(entries, table_text)
+        explicit_matches, explicit_reason = match_target_table_context(
+            entries,
+            table,
+        )
+
+        # 运行模式名称列需要分别生成 pin 记录，但所有分支属于当前表的同一
+        # 物理封装。这里先按表题/最近章节确定一次槽位，再把同一绑定复制给
+        # 每个本地名称分支，禁止进入多封装一对一匹配。
+        if (
+            plan is not None
+            and plan.mode == "parallel_name_columns"
+            and len(local_labels) >= 2
+        ):
+            if len(explicit_matches) == 1:
+                assignment = assignment_from_entry(
+                    explicit_matches[0],
+                    entries,
+                    reason=explicit_reason,
+                )
+            elif len(entries) == 1:
+                assignment = assignment_from_entry(
+                    entries[0],
+                    entries,
+                    reason="single_document_package",
+                )
+            elif (
+                not explicit_matches
+                and previous_explicit is not None
+                and previous_context == chapter_context_key(table)
+            ):
+                assignment = PackageAssignment(
+                    previous_explicit.package_key,
+                    previous_explicit.pkg,
+                    "same_chapter_continuation",
+                )
+            else:
+                assignment = assignment_from_entry(
+                    entries[0],
+                    entries,
+                    reason=(
+                        "ambiguous_package_evidence"
+                        if len(explicit_matches) > 1
+                        else "no_package_evidence_fallback_first_slot"
+                    ),
+                )
+
+            for local_slot, local_label in enumerate(local_labels):
+                assignments[(table.table_id, local_slot)] = assignment
+                diagnostics.append(
+                    {
+                        "stage": "package_binding",
+                        "table_id": table.table_id,
+                        "local_slot": local_slot,
+                        "local_label": local_label,
+                        "package_key": assignment.package_key,
+                        "pkg": assignment.pkg,
+                        "reason": assignment.reason,
+                    }
+                )
+            if assignment.reason in {
+                "table_title_or_header",
+                "nearest_chapter_title",
+            }:
+                previous_explicit = assignment
+                previous_context = chapter_context_key(table)
+            elif chapter_context_key(table) != previous_context:
+                previous_explicit = None
+                previous_context = ""
+            continue
 
         # 多封装表必须把全部分支作为一个整体绑定。若逐个分支独立匹配，两个
         # 模糊标签可能同时落入第一个槽位，导致本应分开的 pkg 再次合并。
-        if plan is not None and plan.is_multi_package and len(local_labels) >= 2:
+        if plan_creates_package_slots(plan) and len(local_labels) >= 2:
             bound_entries = bind_multi_package_entries(entries, local_labels)
             for local_slot, (local_label, entry) in enumerate(
                 zip(local_labels, bound_entries)
@@ -1199,7 +1459,7 @@ def bind_target_tables(
                 reason = (
                     "multi_package_binding_label"
                     if local_matches
-                    else "table_title_or_header"
+                    else explicit_reason
                 )
                 assignment = assignment_from_entry(
                     entry,
@@ -1270,6 +1530,7 @@ def bind_target_tables(
         if first_assignment.reason in {
             "multi_package_binding_label",
             "table_title_or_header",
+            "nearest_chapter_title",
         }:
             previous_explicit = first_assignment
             previous_context = chapter_context_key(table)
@@ -1474,16 +1735,38 @@ def package_name_in_text(name: str, normalized_text: str) -> bool:
     )
 
 
-def binding_evidence_text(table: PackageTargetTable) -> str:
-    """只拼接允许参与绑定的局部元数据，明确排除数据行和 description。"""
+def match_target_table_context(
+    entries: Sequence[PackageCatalogEntry],
+    table: PackageTargetTable,
+) -> tuple[list[PackageCatalogEntry], str]:
+    """按局部证据强弱匹配目标表所属封装。
 
-    return "\n".join(
-        [
-            table.title,
-            *table.current_chapter_titles,
-            *table.headers,
-        ]
+    表题最强；表题没有身份时，从离当前表最近的章节标题向前查找；最后才
+    检查表头。不能把全部历史章节标题先拼接，因为其中可能同时包含前后两个
+    器件身份，导致本可确定的 SF2507/SF2507E 表被判成歧义。
+    """
+
+    checks: list[tuple[str, str]] = [("table_title_or_header", table.title)]
+    checks.extend(
+        ("nearest_chapter_title", title)
+        for title in reversed(table.current_chapter_titles)
     )
+    checks.append(("table_title_or_header", " ".join(table.headers)))
+
+    first_ambiguous: tuple[list[PackageCatalogEntry], str] | None = None
+    seen_texts: set[str] = set()
+    for reason, text in checks:
+        normalized = normalize_text(text)
+        if not normalized or normalized in seen_texts:
+            continue
+        seen_texts.add(normalized)
+        matches = match_entries_in_text(entries, text)
+        if len(matches) == 1:
+            return matches, reason
+        if len(matches) > 1 and first_ambiguous is None:
+            first_ambiguous = (matches, reason)
+
+    return first_ambiguous or ([], "")
 
 
 def chapter_context_key(table: PackageTargetTable) -> str:
@@ -1548,6 +1831,12 @@ def clean_public_package_name(value: str) -> str:
 
     value = re.sub(r"<[^>]+>", " ", str(value or ""))
     value = re.sub(r"\s+", " ", value).strip(" \t\r\n,;:")
+    # 订购表常把尺寸、物理封装和环保信息写在同一格，例如
+    # ``14 mm x 14 mm LQFP-128 E-PAD (Pb-Free)``。公开 pkg 只截取其中
+    # 明确的封装族片段，不能因为整格超过 15 字符就丢失真实封装名。
+    embedded_package = extract_public_package_name_from_metadata(value)
+    if embedded_package:
+        value = embedded_package
     # ``SSOP 28 Pin`` 中末尾 Pin 是列角色；保留 SSOP 28 作为封装名。
     value = re.sub(r"\s+\bpin\b\s*$", "", value, flags=re.IGNORECASE)
     if (
@@ -1559,6 +1848,28 @@ def clean_public_package_name(value: str) -> str:
     ):
         return ""
     return value
+
+
+def extract_public_package_name_from_metadata(value: str) -> str:
+    """从长包装描述中截取明确的物理封装族名称。
+
+    这里只识别数据手册常见封装族及其紧邻的编号/E-PAD 后缀。尺寸、器件型号、
+    Pb-Free 等其余文字都不会进入公开 pkg，也不会参与槽位数量判断。
+    """
+
+    family = (
+        r"(?:HTSSOP|TSSOP|VSSOP|SSOP|HTQFP|TQFP|LQFP|QFP|"
+        r"VQFN|WQFN|QFN|DFN|SON|X2SON|HSBGA|LFBGA|FBGA|PBGA|"
+        r"DSBGA|BGA|WCSP|CSP|SOIC|MSOP|SOT|SC)"
+    )
+    match = re.search(
+        rf"(?<![A-Za-z0-9])({family}(?:[- ]\d+)?(?:\s+E-?PAD)?)(?![A-Za-z0-9])",
+        str(value or ""),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    return re.sub(r"\s+", " ", match.group(1)).strip()
 
 
 def clean_package_name(value: str) -> str:

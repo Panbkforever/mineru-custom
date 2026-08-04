@@ -49,6 +49,8 @@
 * 多个名称列只有在多层表头中共享同一个名称父节点，并具有不同的子分支标签
   时，才属于“一个共享 pin_no + 多个分支 pin_name”的多封装结构。此时每个
   分支必须保留一个名称列，模型漏选的分支由确定性表头结构恢复。
+* ``XXX Mode Pin Name`` 属于同一物理封装的运行模式名称分支：各列分别读取，
+  但不能增加 pkg 数量，也不能参与不同物理封装之间的一对一绑定。
 * “多个封装各有 pin_no、共享一个 pin_name”和“共享一个 pin_no、多个封装
   各有 pin_name”是两条独立多封装分支，不能通过合并同名字段相互转换。
 * “Pin Configuration and Function” 这类坐标矩阵不是物理引脚表，表级直接排除。
@@ -75,6 +77,8 @@
   文字是表内结构证据，但最终名称仍由文档级目录统一校验。
 * ``package_catalog_resolver.py`` 是唯一的真实 pkg 判断模块。它先从全文表格
   定位封装总述候选，再结合已经确认的多封装结构和当前表题/表头完成绑定。
+  器件信息、封装信息、订购信息及对应英文标题优先送第二次模型判断；订购
+  型号只能与目标引脚表中已出现的器件身份建立最长前缀关联，不能直接当 pkg。
 * 封装目录判断不能修改表格是否提取、字段映射、行内容或 group；逐行提取
   不能反过来创造、合并或重命名 pkg。
 * 粗解析找不到表头时，如果原 HTML 同时具有 rowspan/colspan 和明确的
@@ -876,9 +880,13 @@ def reconcile_name_column_decisions(
         if normalize_field_name(column.field_name) != "pin_name"
     ]
 
-    if name_layout.mode == "package_branches":
+    if name_layout.mode in {
+        "package_branches",
+        "parallel_name_branches",
+    }:
         # 每个结构分支独立选择一列。优先采用模型在该分支内已经选中的列；
         # 模型漏选整个分支时，从该分支的候选列中按完整度确定性恢复。
+        # 运行模式分支也需要分别保留列，但它们不会在目录层创建 pkg。
         chosen_indexes = [
             choose_best_name_column(
                 branch,
