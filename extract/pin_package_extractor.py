@@ -22,7 +22,8 @@
   该行仍保留，并在最终清洗阶段统一填充为 ``Reserved``。
 * 已确定存在 pin_no 列后，某个数据行的 pin_no 单元格为空也保留为
   ``pin_no: ""``；完全空白的结构占位行不属于数据行，仍然跳过。
-* pin_no 按原文中的空格、逗号、斜杠等显式分隔符拆分。
+* pin_no 按原文中的空格、逗号、斜杠等显式分隔符拆分；固定语义占位值
+  ``N/A`` 必须整体保留，不能被斜杠规则拆成 ``N`` 和 ``A``。
 * 对同一字母前缀且数字递增的范围进行展开，例如 A1-A5 展开为 A1、A2、A3、A4、A5；
   前后字母不同的 A1-C3 不展开，数字倒序的 A5-A1 也不展开。
 * 对 BGA 行列编号的方括号范围进行展开，例如 L[7:12] 展开为 L7 至 L12；
@@ -1213,6 +1214,11 @@ def split_pin_numbers(value: str) -> list[str]:
     value = plain_text(str(value or "")).strip()
     if not value:
         return []
+
+    # N/A 在编号列中表示 Not Applicable，是一个完整占位值，不是两个
+    # 引脚编号的斜杠列表。必须在通用 ``/`` 分隔规则之前直接保留。
+    if re.fullmatch(r"N\s*/\s*A", value, flags=re.IGNORECASE):
+        return [value]
 
     # 先保护带空格的范围，避免普通空格分隔逻辑把
     # A1 - A5 或 L[7 : 12] 拆成多个无意义片段。
