@@ -5,6 +5,7 @@ from post_table.restore_cell_line_breaks import (
     _detect_table_row_boundaries,
     _logical_cell_layout,
     _logical_cell_columns,
+    _match_visual_lines_across_pages,
     _restore_table_cells,
     _scale_bbox_to_pdf,
 )
@@ -177,6 +178,86 @@ def test_related_continuation_page_single_line_prevents_wrong_split():
     assert corrected == html
     assert changed_cells == 0
     assert added_breaks == 0
+
+
+def test_related_page_can_restore_breaks_missing_from_merged_html_table():
+    html = (
+        "<table><tr>"
+        "<td>DMD_LS0_CLK_PDMD_LS0_CLK_N</td>"
+        "<td>B12A12</td>"
+        "<td>B10A10</td>"
+        "</tr></table>"
+    )
+    current_page_runs = [[_run("unrelated", 0, 40, 0)]]
+    continuation_page_runs = [
+        [
+            _run("DMD_LS0_CLK_P", 0, 90, 0),
+            _run("B12", 120, 145, 0),
+            _run("B10", 180, 205, 0),
+        ],
+        [
+            _run("DMD_LS0_CLK_N", 0, 90, 1),
+            _run("A12", 120, 145, 1),
+            _run("A10", 180, 205, 1),
+        ],
+    ]
+
+    corrected, changed_cells, added_breaks = _restore_table_cells(
+        html,
+        current_page_runs,
+        fallback_runs_by_page=[continuation_page_runs],
+    )
+
+    assert "<td>DMD_LS0_CLK_P<br>DMD_LS0_CLK_N</td>" in corrected
+    assert "<td>B12<br>A12</td>" in corrected
+    assert "<td>B10<br>A10</td>" in corrected
+    assert changed_cells == 3
+    assert added_breaks == 3
+
+
+def test_cross_page_last_and_first_lines_are_never_joined():
+    parts = _match_visual_lines_across_pages(
+        "DA5-DA6+",
+        [
+            [[_run("DA5-", 0, 30, 0)]],
+            [[_run("DA6+", 0, 30, 0)]],
+        ],
+    )
+
+    assert parts == []
+
+
+def test_ambiguous_related_page_matches_are_left_unchanged():
+    page_runs = [
+        [_run("B12", 0, 20, 0)],
+        [_run("A12", 0, 20, 1)],
+    ]
+
+    parts = _match_visual_lines_across_pages(
+        "B12A12",
+        [page_runs, page_runs],
+    )
+
+    assert parts == []
+
+
+def test_low_baseline_underscores_do_not_interrupt_visual_line_match():
+    runs = [
+        [_run("DMD LS0 CLK P", 0, 90, 0)],
+        [
+            _run("_", 18, 22, 1),
+            _run("_", 38, 42, 1),
+            _run("_", 58, 62, 1),
+        ],
+        [_run("DMD_LS0_CLK_N", 0, 90, 2)],
+    ]
+
+    parts = _match_visual_lines_across_pages(
+        "DMD_LS0_CLK_PDMD_LS0_CLK_N",
+        [runs],
+    )
+
+    assert parts == ["DMD LS0 CLK P", "DMD_LS0_CLK_N"]
 
 
 def test_multiple_possible_multiline_matches_are_left_unchanged():

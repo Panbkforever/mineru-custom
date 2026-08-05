@@ -10,8 +10,10 @@ MinerU/VLM 有时会把同一单元格内原本分开的多条视觉文本行直
 * 行列边界可靠时，只在当前物理单元格范围内寻找视觉行，禁止借用其他行。
 * 若当前文本在 PDF 中存在完整单行，保留原样，不再尝试拆成多个视觉行。
 * 无法恢复物理单元格范围时，仅接受位置唯一且中间没有跳行的多行匹配。
-* 一个 HTML 表跨 PDF 续表页时，同时检查相关页面的完整单行证据，避免
-  当前页中的零散字符把 ``35``、``57`` 等正常值错误拆开。
+* 一个 HTML 表跨 PDF 续表页时，各页独立参与换行恢复；绝不把上一页
+  末尾和下一页开头拼成同一个多行单元格。
+* 同时检查相关页面的完整单行证据，避免当前页中的零散字符把 ``35``、
+  ``57`` 等正常值错误拆开。
 
 MinerU 的 ``page_size`` 和表格 ``bbox`` 可能使用渲染像素坐标，而 PDFium
 字符坐标使用 PDF 点坐标。读取字符前必须先把表格范围换算到 PDF 坐标系。
@@ -141,9 +143,10 @@ def restore_cell_line_breaks_in_middle_json(
                 )
                 runs_by_line = _visual_runs_from_characters(table_characters)
                 # MinerU 可能把多个 PDF 续表页合并成一个 HTML <table>，
-                # 但只保留起始页的 page_idx/bbox。先收集相邻相关页面中
-                # 已经完整位于同一视觉行的文本，供宽范围回退匹配避错。
+                # 但只保留其中一页的 page_idx/bbox。每个相关页面独立保存
+                # 视觉行：既能恢复其他页的单元格换行，也不会跨页拼接文本。
                 known_single_line_texts = _single_line_texts(runs_by_line)
+                fallback_runs_by_page: list[list[list[TextRun]]] = []
                 for related_page_index in _related_pdf_page_indexes(
                     pdf_doc,
                     declared_page_index,
@@ -158,25 +161,27 @@ def restore_cell_line_breaks_in_middle_json(
                     )
                     if related_width <= 0 or related_height <= 0:
                         continue
-                    related_bbox = _scale_bbox_to_pdf(
-                        [float(value) for value in bbox],
-                        effective_source_width,
-                        effective_source_height,
+                    # 合并后的 HTML 只保留一个 bbox，不能把这个纵向范围
+                    # 直接套到另一页。相关页使用整页字符作为保守回退，
+                    # 后续仍要求文本完整、视觉行连续、横向位置一致且匹配唯一。
+                    related_bbox = [
+                        0.0,
+                        0.0,
                         related_width,
                         related_height,
-                    )
+                    ]
                     related_characters = _extract_pdf_characters(
                         related_page.get_textpage(),
                         related_bbox,
                         related_height,
                     )
-                    known_single_line_texts.update(
-                        _single_line_texts(
-                            _visual_runs_from_characters(
-                                related_characters
-                            )
-                        )
+                    related_runs = _visual_runs_from_characters(
+                        related_characters
                     )
+                    known_single_line_texts.update(
+                        _single_line_texts(related_runs)
+                    )
+                    fallback_runs_by_page.append(related_runs)
                 logical_cells, row_count, column_count = _logical_cell_layout(
                     table_html
                 )
@@ -236,6 +241,7 @@ def restore_cell_line_breaks_in_middle_json(
                     logical_cells=logical_cells,
                     runs_by_column=runs_by_column,
                     runs_by_cell=runs_by_cell,
+                    fallback_runs_by_page=fallback_runs_by_page,
                     known_single_line_texts=known_single_line_texts,
                 )
                 cache[cache_key] = cached
@@ -257,6 +263,7 @@ def _restore_table_cells(
     logical_cells: list[LogicalCell | tuple[int, int]] | None = None,
     runs_by_column: list[list[list[TextRun]]] | None = None,
     runs_by_cell: list[list[list[TextRun]]] | None = None,
+    fallback_runs_by_page: list[list[list[TextRun]]] | None = None,
     known_single_line_texts: set[str] | None = None,
 ) -> tuple[str, int, int]:
     changed_cells = 0
@@ -315,6 +322,14 @@ def _restore_table_cells(
                 else known_single_line_texts
             ),
         )
+        if len(parts) < 2 and fallback_runs_by_page:
+            # 当前页的表格 bbox 无法覆盖合并 HTML 中其他续表页的行。
+            # 逐页寻找唯一匹配，不允许跨页面连接视觉行。
+            parts = _match_visual_lines_across_pages(
+                plain,
+                fallback_runs_by_page,
+                known_single_line_texts=known_single_line_texts,
+            )
         if len(parts) < 2:
             return match.group(0)
 
@@ -332,6 +347,35 @@ def _restore_table_cells(
         return match.group(1) + corrected + match.group(3)
 
     return CELL_RE.sub(replace_cell, table_html), changed_cells, added_breaks
+
+
+def _match_visual_lines_across_pages(
+    cell_text: str,
+    runs_by_page: list[list[list[TextRun]]],
+    *,
+    known_single_line_texts: set[str] | None = None,
+) -> list[str]:
+    """在相关 PDF 页中查找唯一的页内多行匹配。
+
+    每一页分别调用 ``_match_visual_lines``，因此上一页末行不会与下一页
+    首行组成候选。若多个页面都能匹配同一文本，则证据存在歧义并保持原样。
+    """
+
+    target = _normalize(cell_text)
+    if not target:
+        return []
+    if known_single_line_texts and target in known_single_line_texts:
+        return []
+
+    page_matches = []
+    for page_runs in runs_by_page:
+        parts = _match_visual_lines(cell_text, page_runs)
+        if len(parts) >= 2:
+            page_matches.append(parts)
+
+    if len(page_matches) != 1:
+        return []
+    return page_matches[0]
 
 
 def _match_visual_lines(
@@ -370,32 +414,60 @@ def _match_visual_lines(
             if not target.startswith(first):
                 continue
 
-            candidates = [(first_run, [first_run.text], first)]
+            candidates = [(
+                first_run,
+                [first_run.text],
+                first,
+                [start_line],
+            )]
             for line_index in range(
                 start_line + 1,
                 len(runs_by_line),
             ):
                 next_candidates = []
                 line_variants = _line_run_variants(runs_by_line[line_index])
-                for previous_run, parts, combined in candidates:
+                for previous_run, parts, combined, used_lines in candidates:
+                    advanced = False
+                    has_transparent_punctuation = False
                     for run in line_variants:
                         if not _same_cell_column(previous_run, run):
                             continue
                         run_text = _normalize(run.text)
                         if not run_text:
+                            # PDF 字符框会把下划线等低位标点聚到相邻基线。
+                            # 这类同列、标准化后为空的视觉行不是数据行，
+                            # 允许匹配继续，但不能跳过任何可见文字。
+                            has_transparent_punctuation = True
                             continue
                         next_combined = combined + run_text
                         if not target.startswith(next_combined):
                             continue
+                        advanced = True
                         next_parts = [*parts, run.text]
+                        next_used_lines = [*used_lines, line_index]
                         if next_combined == target:
                             match_key = tuple(
-                                (start_line + offset, _normalize(part))
-                                for offset, part in enumerate(next_parts)
+                                (used_line, _normalize(part))
+                                for used_line, part in zip(
+                                    next_used_lines,
+                                    next_parts,
+                                )
                             )
                             multi_line_matches[match_key] = next_parts
                             continue
-                        next_candidates.append((run, next_parts, next_combined))
+                        next_candidates.append((
+                            run,
+                            next_parts,
+                            next_combined,
+                            next_used_lines,
+                        ))
+                    if has_transparent_punctuation and not advanced:
+                        next_candidates.append((
+                            previous_run,
+                            parts,
+                            combined,
+                            used_lines,
+                        ))
                 candidates = next_candidates
                 if not candidates:
                     break
