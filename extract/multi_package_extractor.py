@@ -16,7 +16,6 @@
   pin_name 列；该模式用于逐列提取，但不增加文档级 pkg 数量；
 * package_rows：一个 package 控制列把数据行划分给不同封装；
 * package_sections：表内用“XXX Package”分段行切换当前封装；
-* shared_packages：标题明确说明同一套引脚映射同时适用于多个封装。
 
 横向重复的 ``Pin# | Pin Name | Type`` 字段块由主流程在表格判断阶段直接
 过滤，因此不会进入本模块。
@@ -135,14 +134,6 @@ def analyze_multi_package_table(
     )
     if package_section_plan is not None:
         return package_section_plan
-
-    shared_plan = detect_explicit_shared_packages(
-        title=title,
-        data_rows=data_rows,
-        columns=columns,
-    )
-    if shared_plan is not None:
-        return shared_plan
 
     return MultiPackagePlan(
         False,
@@ -419,40 +410,6 @@ def detect_package_section_rows(
     )
 
 
-def detect_explicit_shared_packages(
-    *,
-    title: str,
-    data_rows: Sequence[Sequence[str]],
-    columns: Sequence[ColumnLike],
-) -> MultiPackagePlan | None:
-    """识别标题明确声明同一套引脚适用于多个 Packages 的情况。"""
-
-    common_columns = _single_mapping_columns(columns)
-    if common_columns is None:
-        return None
-    package_names = _explicit_package_list_from_title(title)
-    if len(package_names) < 2:
-        return None
-    pin_column, name_column, type_column = common_columns
-    all_rows = frozenset(range(len(data_rows)))
-    bindings = tuple(
-        PackageBinding(
-            package=package,
-            pin_no_column=pin_column.index,
-            pin_name_column=name_column.index,
-            type_column=type_column.index if type_column else None,
-            row_indexes=all_rows,
-        )
-        for package in package_names
-    )
-    return MultiPackagePlan(
-        True,
-        "shared_packages",
-        bindings,
-        evidence=("标题明确使用复数 Packages 声明同一套引脚映射的适用封装",),
-    )
-
-
 def iter_bound_package_rows(
     plan: MultiPackagePlan,
     data_rows: Sequence[Sequence[str]],
@@ -674,29 +631,6 @@ def _package_from_section_row(row: Sequence[str]) -> str:
     if not (re.search(r"\bpackage\b", value, re.IGNORECASE) or "封装" in value):
         return ""
     return clean_package_label(value)
-
-
-def _explicit_package_list_from_title(title: str) -> list[str]:
-    """从非常明确的“X and Y Packages”标题结构中读取共享封装列表。"""
-
-    text = _clean_header_text(title)
-    match = re.search(
-        r"(?:for|applicable\s+to)\s+([^:;]{1,120}?)\s+packages\b",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if not match:
-        return []
-    parts = [
-        clean_package_label(part)
-        for part in re.split(r"\s*(?:,|/|&|\band\b)\s*", match.group(1), flags=re.IGNORECASE)
-    ]
-    result = []
-    for part in parts:
-        normalized = _normalize_text(part)
-        if part and normalized not in {_normalize_text(item) for item in result}:
-            result.append(part)
-    return result if len(result) >= 2 else []
 
 
 def _column_header(headers: Sequence[str], column: ColumnLike) -> str:
