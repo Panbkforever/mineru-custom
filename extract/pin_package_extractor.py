@@ -85,6 +85,9 @@
 * 粗解析找不到表头时，如果原 HTML 同时具有 rowspan/colspan 和明确的
   PIN/BALL/引脚结构锚点，必须先执行 span-aware 表头重试；不能在展开
   多层表头之前直接以 ``no_candidate_header`` 丢弃整张表。
+* 字段表头中的纯数字圆括号脚注不属于字段语义，例如 ``PIN (1) NAME``
+  和 ``I/O(2)`` 应分别按 ``PIN NAME``、``I/O`` 判断。该清洗只用于表头
+  分类，不能修改数据单元格、描述正文或最终输出内容。
 * 封装槽位数量在行提取前冻结；未匹配表不能按 table_id 创建新的外层 pkg。
 * 已严格确认的 N 个表内分支是 N 个独立封装槽位的下限。封装目录即使只
   识别到一个真实 pkg 名称，也只能把该名称复用给 N 个独立槽位，不能把
@@ -1062,7 +1065,10 @@ def score_type_column(column: ColumnDecision, rows: list[list[str]]) -> tuple[in
 
 def classify_header(header: str) -> tuple[str, int]:
     """根据表头文字返回标准字段名和表头匹配分数。"""
-    h = normalize_header(header)
+    # PDF 表头常把脚注号放在字段词之间或字段词之后，例如
+    # ``PIN (1) NAME``、``I/O(2)``。脚注不属于字段语义，必须先去掉，
+    # 否则候选表会在调用模型之前被误判为没有可识别表头。
+    h = normalize_header(strip_numeric_header_footnotes(header))
     if not h:
         return "", 0
     # DESCRIPTION 只在核心字段判断结束后由
@@ -1088,6 +1094,20 @@ def classify_header(header: str) -> tuple[str, int]:
     if "package" in h and "pin" not in h:
         return "package", 2
     return "", 0
+
+
+def strip_numeric_header_footnotes(value: str) -> str:
+    """仅清除字段表头中的纯数字圆括号脚注。
+
+    支持 ``(1)``、``(1) (2)`` 和 ``(1, 2)``。括号中包含字母或其他
+    语义内容时保持原样，避免把型号、模式或普通说明误当成脚注删除。
+    """
+
+    return re.sub(
+        r"\(\s*\d+(?:\s*[,，]\s*\d+)*\s*\)",
+        " ",
+        str(value or ""),
+    )
 
 
 def classify_values(values: list[str]) -> tuple[str, int]:
