@@ -19,8 +19,9 @@
    后缀。没有多分支证据时，包装信息表或单封装兜底才决定槽位数量。
 6. 目标引脚表只通过表题、章节标题、表头和多封装列标签绑定已有槽位；
    description 和数据行不能参与绑定。
-7. 槽位冻结后，任何未匹配表都不能创建新 pkg。真实名称缺失时按槽位顺序
-   使用 a、b、c……，但不能改变槽位数量。
+7. 槽位冻结后，任何未匹配表都不能创建新 pkg。单封装文档可以绑定唯一
+   槽位；多封装文档中无法唯一归属的表必须标记为 unresolved，禁止默认
+   塞入第一个槽位。真实名称缺失时仅对已经确认的槽位使用 a、b、c……。
 8. 多封装表的全部本地分支必须一次性执行一对一绑定；禁止每个分支独立
    兜底后落入同一个 package_key。标签脚注、drawing 和 pin_count 只用于
    内部消歧，不改变任何引脚行内容。
@@ -140,24 +141,14 @@ class PackageCatalogResolution:
     assignments: dict[tuple[int, int], PackageAssignment]
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
-    def assignment_for(self, table_id: int, local_slot: int) -> PackageAssignment:
-        """读取表内槽位绑定；缺失时回到已冻结的第一个槽位。"""
+    def assignment_for(
+        self,
+        table_id: int,
+        local_slot: int,
+    ) -> PackageAssignment | None:
+        """读取表内槽位绑定；缺失就是 unresolved，禁止隐式回退。"""
 
-        assignment = self.assignments.get((table_id, local_slot))
-        if assignment is not None:
-            return assignment
-        if self.entries:
-            entry = self.entries[0]
-            return assignment_from_entry(
-                entry,
-                self.entries,
-                reason="package_assignment_missing_fallback",
-            )
-        return PackageAssignment(
-            package_key="slot:0",
-            pkg="a",
-            reason="package_assignment_missing_without_catalog",
-        )
+        return self.assignments.get((table_id, local_slot))
 
     def declared_assignments(self) -> list[PackageAssignment]:
         """按固定槽位顺序返回输出桶，未命名槽位使用 a/b/c。"""
@@ -1362,6 +1353,7 @@ def bind_target_tables(
             and plan.mode == "parallel_name_columns"
             and len(local_labels) >= 2
         ):
+            assignment: PackageAssignment | None
             if len(explicit_matches) == 1:
                 assignment = assignment_from_entry(
                     explicit_matches[0],
@@ -1385,31 +1377,29 @@ def bind_target_tables(
                     "same_chapter_continuation",
                 )
             else:
-                assignment = assignment_from_entry(
-                    entries[0],
-                    entries,
-                    reason=(
-                        "ambiguous_package_evidence"
-                        if len(explicit_matches) > 1
-                        else "no_package_evidence_fallback_first_slot"
-                    ),
-                )
+                assignment = None
 
+            unresolved_reason = (
+                "ambiguous_package_evidence"
+                if len(explicit_matches) > 1
+                else "package_unresolved"
+            )
             for local_slot, local_label in enumerate(local_labels):
-                assignments[(table.table_id, local_slot)] = assignment
-                diagnostics.append(
-                    {
-                        "stage": "package_binding",
-                        "table_id": table.table_id,
-                        "local_slot": local_slot,
-                        "local_label": local_label,
-                        "package_key": assignment.package_key,
-                        "pkg": assignment.pkg,
-                        "reason": assignment.reason,
-                    }
+                append_package_binding_diagnostic(
+                    diagnostics,
+                    table=table,
+                    local_slot=local_slot,
+                    local_label=local_label,
+                    assignment=assignment,
+                    reason=(assignment.reason if assignment else unresolved_reason),
+                    matched_entries=explicit_matches,
+                    entries=entries,
                 )
-            if assignment.reason in {
+                if assignment is not None:
+                    assignments[(table.table_id, local_slot)] = assignment
+            if assignment is not None and assignment.reason in {
                 "table_title_or_header",
+                "table_group_context",
                 "nearest_chapter_title",
             }:
                 previous_explicit = assignment
@@ -1500,36 +1490,34 @@ def bind_target_tables(
                     "same_chapter_continuation",
                 )
             else:
-                # 未匹配表只能落入一个已经存在的槽位。选择第一个槽位是可复现
-                # 的保守兜底，调试 reason 会明确标记，后续可以继续改善关联证据。
-                entry = entries[0]
-                assignment = assignment_from_entry(
-                    entry,
-                    entries,
-                    reason=(
-                        "ambiguous_package_evidence"
-                        if len(matches) > 1
-                        else "no_package_evidence_fallback_first_slot"
-                    ),
-                )
+                # 多封装文档中，没有唯一归属证据的表不能再默认绑定第一个
+                # pkg。这里故意不创建 assignment，让主提取器整表跳过。
+                assignment = None
 
-            assignments[(table.table_id, local_slot)] = assignment
-            diagnostics.append(
-                {
-                    "stage": "package_binding",
-                    "table_id": table.table_id,
-                    "local_slot": local_slot,
-                    "local_label": local_label,
-                    "pkg": assignment.pkg,
-                    "reason": assignment.reason,
-                }
+            unresolved_reason = (
+                "ambiguous_package_evidence"
+                if len(matches) > 1
+                else "package_unresolved"
             )
+            append_package_binding_diagnostic(
+                diagnostics,
+                table=table,
+                local_slot=local_slot,
+                local_label=local_label,
+                assignment=assignment,
+                reason=(assignment.reason if assignment else unresolved_reason),
+                matched_entries=matches,
+                entries=entries,
+            )
+            if assignment is not None:
+                assignments[(table.table_id, local_slot)] = assignment
 
         # 只有单一且基于当前表明确文字命中的结果，才允许成为后续续表来源。
-        first_assignment = assignments[(table.table_id, 0)]
-        if first_assignment.reason in {
+        first_assignment = assignments.get((table.table_id, 0))
+        if first_assignment is not None and first_assignment.reason in {
             "multi_package_binding_label",
             "table_title_or_header",
+            "table_group_context",
             "nearest_chapter_title",
         }:
             previous_explicit = first_assignment
@@ -1538,6 +1526,41 @@ def bind_target_tables(
             previous_explicit = None
             previous_context = ""
     return assignments
+
+
+def append_package_binding_diagnostic(
+    diagnostics: list[dict[str, Any]],
+    *,
+    table: PackageTargetTable,
+    local_slot: int,
+    local_label: str,
+    assignment: PackageAssignment | None,
+    reason: str,
+    matched_entries: Sequence[PackageCatalogEntry],
+    entries: Sequence[PackageCatalogEntry],
+) -> None:
+    """记录一次绑定结果；unresolved 只写诊断，不伪造 pkg assignment。"""
+
+    diagnostic = {
+        "stage": "package_binding",
+        "status": "resolved" if assignment is not None else "unresolved",
+        "table_id": table.table_id,
+        "local_slot": local_slot,
+        "local_label": local_label,
+        "reason": reason,
+        "matched_packages": [
+            assignment_from_entry(entry, entries, reason="diagnostic").pkg
+            for entry in matched_entries
+        ],
+        "document_packages": [
+            assignment_from_entry(entry, entries, reason="diagnostic").pkg
+            for entry in entries
+        ],
+    }
+    if assignment is not None:
+        diagnostic["package_key"] = assignment.package_key
+        diagnostic["pkg"] = assignment.pkg
+    diagnostics.append(diagnostic)
 
 
 def bind_multi_package_entries(
@@ -1741,12 +1764,13 @@ def match_target_table_context(
 ) -> tuple[list[PackageCatalogEntry], str]:
     """按局部证据强弱匹配目标表所属封装。
 
-    表题最强；表题没有身份时，从离当前表最近的章节标题向前查找；最后才
-    检查表头。不能把全部历史章节标题先拼接，因为其中可能同时包含前后两个
-    器件身份，导致本可确定的 SF2507/SF2507E 表被判成歧义。
+    表题最强；随后检查表格附近上下文，再从离当前表最近的章节标题向前
+    查找，最后检查表头。不能把全部历史章节标题先拼接，因为其中可能同时
+    包含前后两个器件身份，导致本可确定的 SF2507/SF2507E 表被判成歧义。
     """
 
     checks: list[tuple[str, str]] = [("table_title_or_header", table.title)]
+    checks.append(("table_group_context", table.group_context))
     checks.extend(
         ("nearest_chapter_title", title)
         for title in reversed(table.current_chapter_titles)

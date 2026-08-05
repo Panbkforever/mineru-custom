@@ -42,6 +42,20 @@ def target_table(table_id, title, headers):
     )
 
 
+def identity_catalog_classifier(table, source_name, target_tables):
+    """测试用目录分类器：只声明身份列和物理封装列。"""
+
+    return {
+        "is_package_summary": True,
+        "table_role": "identity_summary",
+        "header_row_index": 0,
+        "columns": [
+            {"column_index": 0, "role": "package_identity"},
+            {"column_index": 1, "role": "package_type"},
+        ],
+    }
+
+
 def test_summary_locator_uses_context_headers_and_document_edge():
     summary = catalog_table(
         0,
@@ -568,3 +582,206 @@ def test_full_pipeline_uses_catalog_name_without_changing_pin_mapping():
     assert result[0]["group_list"][0]["pin_list"] == [
         {"pin_no": "1", "pin_name": "VDD", "type": "P"}
     ]
+
+
+def test_single_package_without_local_evidence_binds_the_only_slot():
+    """单封装文档无需每张表重复写封装名，也能绑定唯一槽位。"""
+
+    summary = catalog_table(
+        0,
+        "Device Information",
+        ["DEVICE", "PACKAGE"],
+        [["DEVICE", "PACKAGE"], ["DEV-A", "QFN 32"]],
+    )
+    target = target_table(
+        1,
+        "GPIO Functions",
+        ["PIN NO", "PIN NAME", "TYPE"],
+    )
+    result = resolve_document_package_catalog(
+        all_tables=[summary],
+        target_tables=[target],
+        multi_package_plans={1: MultiPackagePlan(False, "single_package")},
+        use_semantic_classifier=True,
+        classifier=identity_catalog_classifier,
+    )
+
+    assignment = result.assignment_for(1, 0)
+    assert assignment is not None
+    assert assignment.pkg == "QFN 32"
+    assert assignment.reason == "single_document_package"
+
+
+def test_multi_package_without_unique_evidence_stays_unresolved():
+    """多封装文档的无归属表不能再默认塞入第一个 pkg。"""
+
+    summary = catalog_table(
+        0,
+        "Device Information",
+        ["DEVICE", "PACKAGE"],
+        [
+            ["DEVICE", "PACKAGE"],
+            ["DEV-A", "QFN 32"],
+            ["DEV-B", "BGA 64"],
+        ],
+    )
+    target = target_table(
+        1,
+        "GPIO Functions",
+        ["PIN NO", "PIN NAME", "TYPE"],
+    )
+    result = resolve_document_package_catalog(
+        all_tables=[summary],
+        target_tables=[target],
+        multi_package_plans={1: MultiPackagePlan(False, "single_package")},
+        use_semantic_classifier=True,
+        classifier=identity_catalog_classifier,
+    )
+
+    assert result.assignment_for(1, 0) is None
+    diagnostic = next(
+        item
+        for item in result.diagnostics
+        if item.get("stage") == "package_binding" and item.get("table_id") == 1
+    )
+    assert diagnostic["status"] == "unresolved"
+    assert diagnostic["reason"] == "package_unresolved"
+    assert diagnostic["document_packages"] == ["QFN 32", "BGA 64"]
+
+
+def test_multi_package_ambiguous_evidence_stays_unresolved():
+    """局部证据同时命中两个槽位时，不能按目录顺序选择第一个。"""
+
+    summary = catalog_table(
+        0,
+        "Device Information",
+        ["DEVICE", "PACKAGE"],
+        [
+            ["DEVICE", "PACKAGE"],
+            ["DEV-A", "BGA 64"],
+            ["DEV-B", "BGA 100"],
+        ],
+    )
+    target = target_table(
+        1,
+        "DEV-A and DEV-B Pin Functions",
+        ["BALL", "SIGNAL NAME", "TYPE"],
+    )
+    result = resolve_document_package_catalog(
+        all_tables=[summary],
+        target_tables=[target],
+        multi_package_plans={1: MultiPackagePlan(False, "single_package")},
+        use_semantic_classifier=True,
+        classifier=identity_catalog_classifier,
+    )
+
+    assert result.assignment_for(1, 0) is None
+    diagnostic = next(
+        item
+        for item in result.diagnostics
+        if item.get("stage") == "package_binding" and item.get("table_id") == 1
+    )
+    assert diagnostic["reason"] == "ambiguous_package_evidence"
+    assert diagnostic["matched_packages"] == ["BGA 64", "BGA 100"]
+
+
+def test_group_context_and_same_chapter_continuation_bind_existing_slots():
+    """局部上下文可唯一绑定；同章节无重复标题续表可继承该绑定。"""
+
+    summary = catalog_table(
+        0,
+        "Device Information",
+        ["DEVICE", "PACKAGE"],
+        [
+            ["DEVICE", "PACKAGE"],
+            ["DEV-A", "QFN 32"],
+            ["DEV-B", "BGA 64"],
+        ],
+    )
+    first = PackageTargetTable(
+        table_id=1,
+        page_idx=1,
+        title="Pin Functions",
+        group_context="DEV-B BGA 64 package section",
+        current_chapter_titles=("5 Pin Functions",),
+        headers=("BALL", "SIGNAL NAME", "TYPE"),
+    )
+    continued = PackageTargetTable(
+        table_id=2,
+        page_idx=2,
+        title="Pin Functions (continued)",
+        group_context="Pin Functions (continued)",
+        current_chapter_titles=("5 Pin Functions",),
+        headers=("BALL", "SIGNAL NAME", "TYPE"),
+    )
+    result = resolve_document_package_catalog(
+        all_tables=[summary],
+        target_tables=[first, continued],
+        multi_package_plans={
+            1: MultiPackagePlan(False, "single_package"),
+            2: MultiPackagePlan(False, "single_package"),
+        },
+        use_semantic_classifier=True,
+        classifier=identity_catalog_classifier,
+    )
+
+    assert result.assignment_for(1, 0).pkg == "BGA 64"
+    assert result.assignment_for(1, 0).reason == "table_group_context"
+    assert result.assignment_for(2, 0).pkg == "BGA 64"
+    assert result.assignment_for(2, 0).reason == "same_chapter_continuation"
+
+
+def test_full_pipeline_skips_unresolved_table_before_row_extraction():
+    """模型接受表格后，pkg 未唯一绑定时仍必须整表跳过。"""
+
+    summary = TableCandidate(
+        html=(
+            "<table><tr><td>DEVICE</td><td>PACKAGE</td></tr>"
+            "<tr><td>DEV-A</td><td>QFN 32</td></tr>"
+            "<tr><td>DEV-B</td><td>BGA 64</td></tr></table>"
+        ),
+        page_idx=0,
+        title="Device Information",
+        group_context="Device Information",
+        current_chapter_titles=("Device Information",),
+    )
+    pin_table = TableCandidate(
+        html=(
+            "<table><tr><td>PIN NO.</td><td>PIN NAME</td><td>TYPE</td></tr>"
+            "<tr><td>1</td><td>VDD</td><td>P</td></tr></table>"
+        ),
+        page_idx=1,
+        title="GPIO Functions",
+        group_context="GPIO Functions",
+        current_chapter_titles=("GPIO Functions",),
+    )
+    columns = [
+        ColumnDecision(0, "PIN NO.", "pin_no"),
+        ColumnDecision(1, "PIN NAME", "pin_name"),
+        ColumnDecision(2, "TYPE", "type"),
+    ]
+
+    with (
+        patch.object(
+            pin_extractor,
+            "decide_all_tables",
+            return_value={1: TableDecision(True, columns=columns)},
+        ),
+        patch(
+            "extract.semantic_classifier.classify_package_catalog_table",
+            side_effect=identity_catalog_classifier,
+        ),
+    ):
+        result = pin_extractor.extract_pin_package_info_from_table_candidates(
+            [summary, pin_table],
+            source_name="generic-document",
+            use_semantic_classifier=True,
+            include_debug=True,
+        )
+
+    assert all(not package["group_list"] for package in result)
+    debug = pin_extractor.get_last_extraction_debug()
+    skipped = next(item for item in debug if item.get("table_id") == 1)
+    assert skipped["status"] == "skipped"
+    assert skipped["skip_reason"] == "package_unresolved"
+    assert skipped["package_binding"]["unresolved_local_slots"] == [0]

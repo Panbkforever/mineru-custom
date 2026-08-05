@@ -82,6 +82,9 @@
   型号只能与目标引脚表中已出现的器件身份建立最长前缀关联，不能直接当 pkg。
 * 封装目录判断不能修改表格是否提取、字段映射、行内容或 group；逐行提取
   不能反过来创造、合并或重命名 pkg。
+* 单封装文档中，局部表格没有封装文字时可以绑定文档唯一 pkg。多封装文档
+  中，表题、表头、局部上下文、最近章节和明确续表关系都无法提供唯一归属，
+  或同时命中多个 pkg 时，必须在逐行提取前整表跳过；禁止默认放入第一个 pkg。
 * 粗解析找不到表头时，如果原 HTML 同时具有 rowspan/colspan 和明确的
   PIN/BALL/引脚结构锚点，必须先执行 span-aware 表头重试；不能在展开
   多层表头之前直接以 ``no_candidate_header`` 丢弃整张表。
@@ -516,6 +519,59 @@ def extract_pin_package_info_from_table_candidates(
             skip(debug, table_decision.reason or "table_rejected")
             continue
 
+        plan = multi_package_plans[item["table_id"]]
+        required_local_slots = list(
+            range(len(plan.bindings)) if plan.is_multi_package else range(1)
+        )
+        package_assignments = {
+            local_slot: package_resolution.assignment_for(
+                item["table_id"],
+                local_slot,
+            )
+            for local_slot in required_local_slots
+        }
+        unresolved_local_slots = [
+            local_slot
+            for local_slot, assignment in package_assignments.items()
+            if assignment is None
+        ]
+        if unresolved_local_slots:
+            # 表格和字段已经通过判断，也不能在 pkg 归属不明确时开始读取
+            # 数据行。整表跳过可以避免部分槽位先产出、随后才发现绑定缺失。
+            binding_diagnostics = [
+                diagnostic
+                for diagnostic in package_resolution.diagnostics
+                if (
+                    diagnostic.get("stage") == "package_binding"
+                    and diagnostic.get("table_id") == item["table_id"]
+                )
+            ]
+            debug["package_binding"] = {
+                "status": "unresolved",
+                "unresolved_local_slots": unresolved_local_slots,
+                "matched_packages": sorted(
+                    {
+                        package
+                        for diagnostic in binding_diagnostics
+                        for package in diagnostic.get("matched_packages", [])
+                        if package
+                    }
+                ),
+                "document_packages": [
+                    assignment.pkg
+                    for assignment in package_resolution.declared_assignments()
+                ],
+                "reasons": sorted(
+                    {
+                        str(diagnostic.get("reason", ""))
+                        for diagnostic in binding_diagnostics
+                        if diagnostic.get("reason")
+                    }
+                ),
+            }
+            skip(debug, "package_unresolved")
+            continue
+
         # 最终 group 只取当前表格表题。章节上下文仍保存在 TableCandidate
         # 中供语义判断和封装绑定使用，不能在这里写入最终 JSON。
         group_name = clean_group_name(
@@ -525,7 +581,6 @@ def extract_pin_package_info_from_table_candidates(
             or "Pin/Package Table"
         )
 
-        plan = multi_package_plans[item["table_id"]]
         extracted_count = 0
 
         # 真正的多封装表严格执行绑定计划。每个封装独立读取自己的 pin_no，
@@ -535,10 +590,7 @@ def extract_pin_package_info_from_table_candidates(
                 # 先确定绑定行在当前多封装计划中的本地槽位，再读取文档级
                 # 封装目录的唯一绑定。表内标签不能直接绕过目录写入输出。
                 local_slot = local_package_index_for_bound_row(plan, bound_row)
-                package_assignment = package_resolution.assignment_for(
-                    item["table_id"],
-                    local_slot,
-                )
+                package_assignment = package_assignments[local_slot]
                 for record in extract_records_from_bound_package_row(bound_row):
                     # 多封装绑定对象只保存 pin_no/pin_name/type。description
                     # 必须使用 row_index 回到同一原始数据行读取，不能从相邻
@@ -561,10 +613,7 @@ def extract_pin_package_info_from_table_candidates(
 
         # 单封装表保留原有逐行提取逻辑，不经过多封装绑定。
         else:
-            package_assignment = package_resolution.assignment_for(
-                item["table_id"],
-                0,
-            )
+            package_assignment = package_assignments[0]
             for row_index, row in enumerate(item["data_rows"]):
                 if (
                     table_decision.included_row_indexes is not None
@@ -596,14 +645,8 @@ def extract_pin_package_info_from_table_candidates(
                 "package_assignments": [
                     {
                         "local_slot": local_slot,
-                        "pkg": package_resolution.assignment_for(
-                            item["table_id"],
-                            local_slot,
-                        ).pkg,
-                        "reason": package_resolution.assignment_for(
-                            item["table_id"],
-                            local_slot,
-                        ).reason,
+                        "pkg": package_assignments[local_slot].pkg,
+                        "reason": package_assignments[local_slot].reason,
                     }
                     for local_slot in (
                         range(len(plan.bindings))
