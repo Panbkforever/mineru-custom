@@ -6,7 +6,8 @@
 固定处理流程：
 
 1. 展开 HTML 单元格的 ``rowspan`` 和 ``colspan``，形成列对齐的二维表格。
-2. 从字段语义种子行开始，结合当前行、后续分支行和首批数据行确定完整表头边界。
+2. 字段语义只负责提供一个候选种子行；表头是否继续向下延伸，只依据父子行
+   的跨列结构、重复父节点和子节点分裂关系判断。
 3. 同时处理一个名称对应多个编号、一个编号对应多个名称以及多层封装分支表头。
 4. 根据确定的最后一行表头，为每个数据列建立完整表头路径。
 5. 将 PIN NAME、BALL NAME、SIGNAL NAME、TERMINAL NAME 统一视为
@@ -24,7 +25,10 @@
   可以分别提取名称，但绝不能据此增加 pkg 数量。
 * 本模块返回的 ``branch_label`` 只是表内分支证据，不是最终公开 pkg 名称。
 * ``-``、``--``、``—`` 和空单元格属于数据值；边界判断不能以占位符为由删行。
-* 表头边界必须由整行结构和后续数据一致性共同决定，不能仅依赖某个关键词。
+* 表头边界不能根据 ``PIN``、``NAME`` 等固定文字，也不能根据单元格内容
+  “像不像引脚号”来判断；器件型号中的 ``Q1`` 等片段不是边界证据。
+* 只有“父行连续重复覆盖多列、子行把该区域拆成多个标签、区域外列保持原有
+  表头”同时成立时，才把下一行并入表头。
 """
 
 from __future__ import annotations
@@ -223,11 +227,15 @@ def build_header_paths(
         (len(row) for row in rows[: header_index + 1]),
         default=0,
     )
+    header_rows = _repair_structural_header_blanks(
+        rows[: header_index + 1],
+        width,
+    )
     result = []
     for column_index in range(width):
         parts: list[str] = []
         normalized_parts: set[str] = set()
-        for row in rows[: header_index + 1]:
+        for row in header_rows:
             value = (
                 _header_text(row[column_index])
                 if column_index < len(row)
@@ -242,29 +250,68 @@ def build_header_paths(
     return tuple(result)
 
 
+def _repair_structural_header_blanks(
+    rows: Sequence[Sequence[str]],
+    width: int,
+) -> list[list[str]]:
+    """用明确的父子分组关系补齐 span 展开后遗留的内部空父节点。
+
+    只在下一层同一标签同时覆盖当前列和相邻列时，才从相邻列继承父节点。
+    例如父行第 4 列为 ``PIN``、第 5 列异常为空，而子行第 4、5 列都属于
+    ``RGE``，此时可确认两列共享同一父节点。普通空单元格不会被左填充。
+    """
+
+    matrix = [
+        [_header_text(row[index]) if index < len(row) else "" for index in range(width)]
+        for row in rows
+    ]
+    for level in range(len(matrix) - 2, -1, -1):
+        child = matrix[level + 1]
+        parent = matrix[level]
+        for index in range(width):
+            if parent[index] or not child[index]:
+                continue
+            neighbors = []
+            if index > 0 and child[index - 1] == child[index]:
+                neighbors.append(index - 1)
+            if index + 1 < width and child[index + 1] == child[index]:
+                neighbors.append(index + 1)
+            inherited = {
+                parent[neighbor]
+                for neighbor in neighbors
+                if parent[neighbor]
+            }
+            if len(inherited) == 1:
+                parent[index] = inherited.pop()
+    return matrix
+
+
 def resolve_header_boundary(
     rows: Sequence[Sequence[str]],
     seed_header_index: int,
 ) -> HeaderBoundary:
-    """从字段种子行向下确定完整的多层表头边界。
+    """从候选种子行向下确定完整表头边界。
 
-    种子行只说明已经出现了 NAME/NO./TYPE 等字段语义，不能说明表头已经
-    结束。本函数继续检查后续行是否在重复的编号轴或名称轴上提供封装分支，
-    并用其后的稳定数据行反证。任何已经进入数据区的值，包括 ``-``，都不会
-    在这里被过滤或改写。
+    ``seed_header_index`` 来自后续字段识别阶段，只表示“到这一行已经能形成
+    可识别字段”。本函数不再读取字段名称，也不再判断单元格是否像引脚号；
+    它只识别多层表头中通用的“重复父节点 -> 子节点分裂”结构。
     """
 
     if seed_header_index < 0 or seed_header_index >= len(rows):
         return HeaderBoundary(0, -1, 0, ("没有可用的字段表头种子行",))
 
     boundary = seed_header_index
-    evidence = [f"字段语义种子行位于第 {seed_header_index + 1} 行"]
+    evidence = [f"候选种子行位于第 {seed_header_index + 1} 行"]
 
     # 每次只允许紧邻下一行通过完整结构校验；一旦命中真实数据立即停止。
     # 不限制表头层数，避免把合法的三层以上封装表头截断。
     while boundary + 1 < len(rows):
         candidate_index = boundary + 1
-        reason = _header_refinement_reason(rows, boundary, candidate_index)
+        reason = _structural_header_refinement_reason(
+            rows[boundary],
+            rows[candidate_index],
+            candidate_index,
+        )
         if not reason:
             break
         boundary = candidate_index
@@ -287,252 +334,65 @@ def extend_header_index_for_name_branches(
     return resolve_header_boundary(rows, header_index).header_end
 
 
-def _header_refinement_reason(
-    rows: Sequence[Sequence[str]],
-    header_index: int,
-    candidate_index: int,
+def _structural_header_refinement_reason(
+    parent: Sequence[str],
+    child: Sequence[str],
+    child_index: int,
 ) -> str:
-    """判断紧邻行是否细化现有字段轴，而不是首条真实数据。"""
+    """只依据相邻两行的列结构判断子行是否仍属于表头。
 
-    parent_paths = build_header_paths(rows, header_index)
-    roles = {
-        path.column_index: _structural_column_role(path.parts)
-        for path in parent_paths
-    }
-    candidate = rows[candidate_index]
+    父行中同一文字连续覆盖两个及以上列，代表一个由 colspan 或视觉合并
+    产生的父节点。子行只有把至少一个父节点拆成多个非空子标签，并且父节点
+    之外的非空列仍重复原值，才会被接受为下一层表头。
+    """
 
-    # 一行已经同时满足编号、名称/类型/描述的数据组合时必须立即停止。
-    # ``-``在编号列中也算数据占位符，绝不能因为它不是普通编号而吞入表头。
-    if _looks_like_complete_data_row(candidate, roles):
+    width = max(len(parent), len(child))
+    parent_values = [_normalize(_cell(parent, index)) for index in range(width)]
+    child_values = [_normalize(_cell(child, index)) for index in range(width)]
+    groups = _contiguous_repeated_groups(parent_values)
+    split_groups: list[tuple[int, ...]] = []
+    for group in groups:
+        labels = [child_values[index] for index in group]
+        if all(labels) and len(set(labels)) >= 2:
+            split_groups.append(group)
+    if not split_groups:
         return ""
 
-    branch_groups = _repeated_semantic_axes(roles)
-    if not branch_groups:
+    branch_indexes = {index for group in split_groups for index in group}
+    unchanged_outside = 0
+    for index in range(width):
+        if index in branch_indexes or not child_values[index]:
+            continue
+        if child_values[index] != parent_values[index]:
+            return ""
+        unchanged_outside += 1
+
+    # 纯两列表在没有外部稳定列时无法仅靠结构区分“子表头”和第一条数据。
+    # 多个独立父节点同时分裂本身是足够强的结构证据。
+    if unchanged_outside == 0 and len(split_groups) < 2:
         return ""
 
-    for role, column_indexes in branch_groups:
-        labels = [_cell(candidate, index) for index in column_indexes]
-        if not _labels_can_refine_axis(labels):
-            continue
-        if not _non_branch_cells_remain_headers(
-            candidate,
-            parent_paths,
-            set(column_indexes),
-        ):
-            continue
-
-        # 当前层可以是最终分支标签，也可以是多个子分支共享的中间父标签。
-        # 中间父标签必须由下一行产生更细分区，否则相同文字不能单独证明表头。
-        distinct_labels = {_normalize(label) for label in labels if _normalize(label)}
-        if len(distinct_labels) < 2 and not _next_row_splits_axis(
-            rows,
-            candidate_index,
-            column_indexes,
-        ):
-            continue
-
-        prospective_roles = {
-            path.column_index: _structural_column_role(path.parts)
-            for path in build_header_paths(rows, candidate_index)
-        }
-        if not _following_rows_support_data_or_deeper_header(
-            rows,
-            candidate_index,
-            prospective_roles,
-            column_indexes,
-        ):
-            continue
-        return f"第 {candidate_index + 1} 行继续细化 {role} 分支轴"
-    return ""
-
-
-def _repeated_semantic_axes(
-    roles: dict[int, str],
-) -> list[tuple[str, tuple[int, ...]]]:
-    """找出可由下一层标签继续细化的重复编号轴或名称轴。"""
-
-    grouped: dict[str, list[int]] = {}
-    for column_index, role in roles.items():
-        if role not in {"pin_no", "pin_axis", "pin_name"}:
-            continue
-        axis = "pin_no" if role in {"pin_no", "pin_axis"} else "pin_name"
-        grouped.setdefault(axis, []).append(column_index)
-    return [
-        (role, tuple(indexes))
-        for role, indexes in grouped.items()
-        if len(indexes) >= 2
-    ]
-
-
-def _labels_can_refine_axis(labels: Sequence[str]) -> bool:
-    """分支标签必须完整、较短，并且不能本身就是物理引脚数据。"""
-
-    cleaned = [_header_text(label) for label in labels]
-    if any(not label or len(label) > 80 for label in cleaned):
-        return False
-    normalized = [_normalize(label) for label in cleaned]
-    if any(not label or _is_generic_branch_label(label) for label in normalized):
-        return False
-    return not any(_looks_like_pin_data_value(label) for label in cleaned)
-
-
-def _next_row_splits_axis(
-    rows: Sequence[Sequence[str]],
-    candidate_index: int,
-    column_indexes: Sequence[int],
-) -> bool:
-    """允许“共同器件名 -> 多个封装名”这种两级分支表头。"""
-
-    next_index = candidate_index + 1
-    if next_index >= len(rows):
-        return False
-    labels = [_cell(rows[next_index], index) for index in column_indexes]
-    if not _labels_can_refine_axis(labels):
-        return False
-    return len({_normalize(label) for label in labels}) >= 2
-
-
-def _following_rows_support_data_or_deeper_header(
-    rows: Sequence[Sequence[str]],
-    candidate_index: int,
-    roles: dict[int, str],
-    column_indexes: Sequence[int],
-) -> bool:
-    """用后续三行确认当前行后面确实存在稳定数据或更深分支。"""
-
-    for row in rows[candidate_index + 1 : candidate_index + 4]:
-        if _looks_like_complete_data_row(row, roles):
-            return True
-    return _next_row_splits_axis(rows, candidate_index, column_indexes)
-
-
-def _non_branch_cells_remain_headers(
-    candidate: Sequence[str],
-    parent_paths: Sequence[HeaderColumnPath],
-    branch_indexes: set[int],
-) -> bool:
-    """分支轴之外的列只能为空、重复父表头或继续写通用字段名。"""
-
-    for path in parent_paths:
-        if path.column_index in branch_indexes:
-            continue
-        child = _normalize(_cell(candidate, path.column_index))
-        if not child:
-            continue
-        ancestors = {_normalize(part) for part in path.parts if _normalize(part)}
-        if child in ancestors or _is_generic_header_label(child):
-            continue
-        return False
-    return True
-
-
-def _looks_like_complete_data_row(
-    row: Sequence[str],
-    roles: dict[int, str],
-) -> bool:
-    """根据字段组合判断一行是否已经进入数据区。"""
-
-    number_indexes = [
-        index for index, role in roles.items() if role in {"pin_no", "pin_axis"}
-    ]
-    name_indexes = [index for index, role in roles.items() if role == "pin_name"]
-    type_indexes = [index for index, role in roles.items() if role == "type"]
-    description_indexes = [
-        index for index, role in roles.items() if role == "description"
-    ]
-
-    number_hits = sum(
-        _looks_like_pin_data_value(_cell(row, index)) for index in number_indexes
+    spans = ", ".join(
+        f"{group[0] + 1}-{group[-1] + 1}"
+        for group in split_groups
     )
-    if not number_hits:
-        return False
-    name_hits = sum(
-        _looks_like_name_data_value(_cell(row, index)) for index in name_indexes
-    )
-    type_hits = sum(
-        _looks_like_type_data_value(_cell(row, index)) for index in type_indexes
-    )
-    description_hits = sum(
-        len(_header_text(_cell(row, index))) >= 12
-        for index in description_indexes
-    )
-    return bool(name_hits or type_hits or description_hits)
+    return f"第 {child_index + 1} 行按重复父节点拆分列 {spans}"
 
 
-def _structural_column_role(parts: Sequence[str]) -> str:
-    """从完整表头路径识别边界判断所需的宽松字段角色。"""
+def _contiguous_repeated_groups(values: Sequence[str]) -> list[tuple[int, ...]]:
+    """返回同一非空值连续覆盖的列组，不合并相隔较远的同名数据。"""
 
-    combined = _normalize(" ".join(parts))
-    if not combined:
-        return ""
-    if _path_has_name_role(parts):
-        return "pin_name"
-    if re.search(
-        r"\b(?:pin|ball|terminal)\s*(?:no\.?|number)\b",
-        combined,
-    ) or any(term in combined for term in ("引脚编号", "端子编号", "球编号")):
-        return "pin_no"
-    if combined in {"no", "no.", "number", "pins", "balls", "terminals"}:
-        return "pin_no"
-    if "description" in combined or "说明" in combined or "描述" in combined:
-        return "description"
-    if re.search(r"\b(?:i/?o|io|signal type|pin type|terminal type|type)\b", combined):
-        return "type"
-    # 多封装表可能只在父层写 PIN，子层直接写 PWP/RGE/器件型号。
-    # 这些列属于编号轴，但尚未出现 NO. 文字，必须保留为可细化结构角色。
-    if re.search(r"\b(?:pin|ball|terminal)\b", combined) or any(
-        term in combined for term in ("引脚", "端子", "球")
-    ):
-        return "pin_axis"
-    return ""
-
-
-def _looks_like_pin_data_value(value: str) -> bool:
-    """识别编号列中的真实编号、列表、范围和必须保留的占位符。"""
-
-    text = _header_text(value)
-    if not text:
-        return False
-    if text in {"-", "--", "—", "–"}:
-        return True
-    if re.fullmatch(r"\d{1,4}", text):
-        return True
-    if re.fullmatch(r"[A-Za-z]+\d+\s*-\s*[A-Za-z]+\d+", text):
-        return True
-    if re.fullmatch(r"[A-Za-z]+\s*\[\s*\d+\s*:\s*\d+\s*\]", text):
-        return True
-    # BGA球号通常是一到两个字母加数字；三字母以上更常见于器件/封装型号，
-    # 例如 DRV8256E，不能在表头边界阶段把它误判成物理引脚数据。
-    tokens = re.findall(r"\b[A-Za-z]{1,2}\d{1,4}\b", text)
-    return bool(tokens)
-
-
-def _looks_like_name_data_value(value: str) -> bool:
-    """排除通用字段名后，非空短文本可以作为名称列的数据证据。"""
-
-    text = _header_text(value)
-    normalized = _normalize(text)
-    return bool(text) and not _is_generic_header_label(normalized)
-
-
-def _looks_like_type_data_value(value: str) -> bool:
-    """识别常见引脚类型值，仅用于证明数据区开始。"""
-
-    normalized = re.sub(r"\s+", "", _normalize(value))
-    return normalized in {
-        "i", "o", "io", "i/o", "i/o/z", "oz", "od", "odz", "p",
-        "power", "ground", "gnd", "analog", "digital", "input", "output",
-    }
-
-
-def _is_generic_header_label(value: str) -> bool:
-    """识别可以在多层表头中重复出现的字段角色文字。"""
-
-    return value in {
-        "pin", "ball", "signal", "terminal", "name", "no", "no.",
-        "number", "type", "io", "i/o", "description", "pins", "balls",
-        "terminals", "引脚", "端子", "信号", "名称", "编号", "类型", "说明", "描述",
-    } or _is_generic_branch_label(value)
+    groups: list[tuple[int, ...]] = []
+    start = 0
+    while start < len(values):
+        value = values[start]
+        end = start + 1
+        while end < len(values) and value and values[end] == value:
+            end += 1
+        if value and end - start >= 2:
+            groups.append(tuple(range(start, end)))
+        start = end
+    return groups
 
 
 def _cell(row: Sequence[str], column_index: int) -> str:

@@ -1453,8 +1453,9 @@ def parse_html_table(html: str) -> list[list[str]]:
 def choose_header_row(rows: list[list[str]], title: str = "", semantic: bool = False) -> tuple[int, list[str]]:
     """先找字段语义种子行，再通过结构关系确定完整表头边界。"""
     best = (-1, -1, [])
-    # 十二行只是异常HTML的防护上限；最终边界仍由字段轴、分支标签和后续
-    # 数据一致性决定，不依赖某个PDF的固定表头层数。
+    # 十二行只是异常 HTML 的防护上限。这里的字段词只用于确认候选表头中
+    # 已经出现可识别字段，不参与判断下一行是表头还是数据；最终边界统一交给
+    # table_header_structure.resolve_header_boundary() 按父子列结构确定。
     for index in range(min(12, len(rows))):
         headers = build_combined_headers(rows, index)
         score = sum(classify_header(header)[1] for header in headers)

@@ -16,6 +16,7 @@ from extract.table_header_structure import (
     build_header_paths,
     extend_header_index_for_name_branches,
     parse_spanned_table,
+    resolve_header_boundary,
 )
 
 
@@ -171,6 +172,110 @@ class TableHeaderStructureTest(unittest.TestCase):
             [branch.label for branch in layout.branches],
             ["Package A", "Package B"],
         )
+
+    def test_model_labels_below_repeated_parent_remain_in_header(self) -> None:
+        """型号中的数字或连字符不能被误判成正式引脚数据。"""
+
+        rows = [
+            ["PIN", "PIN", "PIN", "TYPE", "DESCRIPTION"],
+            ["NAME", "NO.", "NO.", "TYPE", "DESCRIPTION"],
+            ["NAME", "DEVICE-A-Q1", "DEVICE-B-Q1", "TYPE", "DESCRIPTION"],
+            ["SUPPLY", "14", "15", "P", "Analog supply"],
+        ]
+
+        boundary = resolve_header_boundary(rows, 1)
+        self.assertEqual(boundary.header_end, 2)
+        self.assertEqual(boundary.data_start, 3)
+
+        header_index, headers = choose_header_row(rows, semantic=True)
+        self.assertEqual(header_index, 2)
+        self.assertEqual(headers[1], "PIN NO. DEVICE-A-Q1")
+        self.assertEqual(headers[2], "PIN NO. DEVICE-B-Q1")
+
+    def test_blank_parent_is_repaired_only_by_shared_child_structure(self) -> None:
+        """父表头内部空位只由相邻列的共同子分组关系补齐。"""
+
+        html = (
+            "<table>"
+            "<tr><th colspan='4'>PIN</th><th></th>"
+            "<th rowspan='3'>TYPE</th><th rowspan='3'>DESCRIPTION</th></tr>"
+            "<tr><th rowspan='2'>NAME</th><th colspan='2'>PKG-A</th>"
+            "<th colspan='2'>PKG-B</th></tr>"
+            "<tr><th>DEVICE-A</th><th>DEVICE-B</th>"
+            "<th>DEVICE-A</th><th>DEVICE-B</th></tr>"
+            "<tr><td>SUPPLY</td><td>1</td><td>2</td><td>3</td><td>4</td>"
+            "<td>P</td><td>Analog supply</td></tr>"
+            "</table>"
+        )
+        rows = parse_spanned_table(html)
+        header_index, _ = choose_header_row(rows, semantic=True)
+        self.assertEqual(header_index, 2)
+
+        paths = build_header_paths(rows, header_index)
+        self.assertEqual(paths[4].parts[0], "PIN")
+        headers = [path.combined for path in paths]
+        # 字段语义由模型/规则在结构冻结后返回；结构层只需确保四个分支列
+        # 都拥有完整父路径，不能因第 5 列父节点曾为空而漏掉该分支。
+        decisions = [
+            ColumnDecision(0, headers[0], "pin_name"),
+            *[
+                ColumnDecision(index, headers[index], "pin_no")
+                for index in range(1, 5)
+            ],
+            ColumnDecision(5, headers[5], "type"),
+        ]
+        plan = analyze_multi_package_table(
+            title="",
+            header_rows=rows[: header_index + 1],
+            headers=headers,
+            data_rows=rows[header_index + 1 :],
+            columns=decisions,
+        )
+        self.assertTrue(plan.is_multi_package)
+        self.assertEqual(
+            [
+                binding.pin_no_column
+                for binding in plan.bindings
+            ],
+            [1, 2, 3, 4],
+        )
+
+    def test_first_body_row_does_not_extend_single_parent_group(self) -> None:
+        """缺少稳定外部列时，不把普通两列数据误认成子表头。"""
+
+        rows = [
+            ["AXIS", "AXIS"],
+            ["VALUE-A", "VALUE-B"],
+            ["VALUE-C", "VALUE-D"],
+        ]
+        boundary = resolve_header_boundary(rows, 0)
+        self.assertEqual(boundary.header_end, 0)
+        self.assertEqual(boundary.data_start, 1)
+
+    def test_multi_package_stage_never_recovers_header_from_body(self) -> None:
+        """结构阶段漏掉子表头时，多封装阶段不能删除数据首行补猜。"""
+
+        headers = ["PIN NAME", "PIN NO.", "PIN NO.", "TYPE"]
+        data_rows = [
+            ["PIN NAME", "PKG-A", "PKG-B", "TYPE"],
+            ["SUPPLY", "1", "2", "P"],
+        ]
+        decisions = [
+            ColumnDecision(0, headers[0], "pin_name"),
+            ColumnDecision(1, headers[1], "pin_no"),
+            ColumnDecision(2, headers[2], "pin_no"),
+            ColumnDecision(3, headers[3], "type"),
+        ]
+
+        plan = analyze_multi_package_table(
+            title="",
+            header_rows=[headers],
+            headers=headers,
+            data_rows=data_rows,
+            columns=decisions,
+        )
+        self.assertFalse(plan.is_multi_package)
+        self.assertEqual(data_rows[0], ["PIN NAME", "PKG-A", "PKG-B", "TYPE"])
 
 
 if __name__ == "__main__":

@@ -97,9 +97,9 @@ def analyze_multi_package_table(
     证据；按行和按分段判断只在表格只有一套 pin_no/pin_name 字段时执行。
     """
 
-    # 完整多行表头不能在进入本模块前丢失。headers 是主提取器当前选中的
-    # 逐列表头；某些 PDF 的最后一层子表头会暂时位于 data_rows 第一行，
-    # package_columns 分支会在严格确认后把该行补回列标题。
+    # 完整多行表头必须由 table_header_structure 在进入本模块前一次性确认。
+    # 本模块只消费已经冻结的 headers，禁止再把 data_rows 第一行猜成表头，
+    # 否则同一张表会在两个阶段得到不同的数据起点。
 
     package_column_plan = detect_package_specific_pin_columns(
         header_rows=header_rows,
@@ -240,14 +240,10 @@ def detect_package_specific_pin_columns(
     if any(not _column_has_values(data_rows, column.index) for column in pin_columns):
         return None
 
-    raw_headers, leading_header_rows = _resolve_package_column_headers(
-        header_rows=header_rows,
-        headers=headers,
-        data_rows=data_rows,
-        pin_columns=pin_columns,
-        name_column=name_columns[0],
-        type_column=type_columns[0] if len(type_columns) == 1 else None,
-    )
+    # header_rows 仅保留在公开函数签名中，便于调试完整表头；分支标签必须
+    # 直接来自主流程已经确认的逐列表头，不能从数据区补猜。
+    _ = header_rows
+    raw_headers = [_column_header(headers, column) for column in pin_columns]
     package_labels = derive_package_labels_from_headers(raw_headers)
     if len(package_labels) != len(pin_columns):
         return None
@@ -258,18 +254,13 @@ def detect_package_specific_pin_columns(
 
     pin_name_column = name_columns[0].index
     type_column = type_columns[0].index if len(type_columns) == 1 else None
-    usable_rows = (
-        frozenset(range(leading_header_rows, len(data_rows)))
-        if leading_header_rows
-        else None
-    )
     bindings = tuple(
         PackageBinding(
             package=package_label,
             pin_no_column=pin_column.index,
             pin_name_column=pin_name_column,
             type_column=type_column,
-            row_indexes=usable_rows,
+            row_indexes=None,
         )
         for package_label, pin_column in zip(package_labels, pin_columns)
     )
@@ -281,11 +272,6 @@ def detect_package_specific_pin_columns(
             f"模型选中 {len(pin_columns)} 个 pin_no 列",
             "这些编号列共享一个 pin_name 列",
             "各编号列的完整表头产生了不同封装标签",
-            *(
-                (f"从 data_rows 前 {leading_header_rows} 行补回多层子表头",)
-                if leading_header_rows
-                else ()
-            ),
         ),
     )
 
@@ -469,54 +455,6 @@ def plan_to_debug(plan: MultiPackagePlan) -> dict[str, Any]:
     }
 
 
-def _resolve_package_column_headers(
-    *,
-    header_rows: Sequence[Sequence[str]],
-    headers: Sequence[str],
-    data_rows: Sequence[Sequence[str]],
-    pin_columns: Sequence[ColumnLike],
-    name_column: ColumnLike,
-    type_column: ColumnLike | None,
-) -> tuple[list[str], int]:
-    """补齐被主表头选择暂时留在 data_rows 开头的 package 子表头。
-
-    只有当第一行同时满足以下条件时才当作子表头：共享名称列仍写着名称字段，
-    所有 package 编号列都非空且互不相同，并且这些值不像物理引脚编号。
-    因此正常的第一条数据行不会因为文本较短而被错误删除。
-    """
-
-    base_headers = [_column_header(headers, column) for column in pin_columns]
-    if not data_rows:
-        return base_headers, 0
-
-    candidate = data_rows[0]
-    name_header = _header_role(_cell(candidate, name_column.index)) == "pin_name"
-    type_header = (
-        type_column is None
-        or _header_role(_cell(candidate, type_column.index)) == "type"
-    )
-    package_cells = [_cell(candidate, column.index) for column in pin_columns]
-    normalized_cells = {_normalize_text(value) for value in package_cells if value}
-    package_cells_valid = (
-        all(package_cells)
-        and len(normalized_cells) == len(package_cells)
-        and all(not _looks_like_pin_value(value) for value in package_cells)
-    )
-    if not (name_header and type_header and package_cells_valid):
-        return base_headers, 0
-
-    # header_rows 作为已确认父表头存在性的证据；即使父表头为空，子表头本身
-    # 仍可形成完整列名，因此这里只保留调用参数而不强制其具体文字。
-    _ = header_rows
-    combined_headers = []
-    for base_header, child_header in zip(base_headers, package_cells):
-        if _normalize_text(child_header) in _normalize_text(base_header):
-            combined_headers.append(base_header)
-        else:
-            combined_headers.append(f"{base_header} {child_header}".strip())
-    return combined_headers, 1
-
-
 def derive_package_labels_from_headers(headers: Sequence[str]) -> list[str]:
     """从多个 package 专属编号列的完整表头中提取互不相同的封装标签。"""
 
@@ -582,26 +520,6 @@ def _normalize_field_name(value: str) -> str:
         "io_type": "type",
     }
     return aliases.get(normalized, normalized)
-
-
-def _header_role(value: str) -> str:
-    """识别多封装子表头中的共享名称列和类型列。
-
-    该函数仍被 ``_resolve_package_column_headers()`` 使用，用来确认
-    ``SSOP/QFN/LQFP`` 等封装列名所在行确实是第二层表头，而不是数据行。
-    横向重复表格的过滤已经迁移到独立模块，不再由本函数负责。
-    """
-
-    text = _normalize_text(value)
-    if re.search(r"\b(?:pin|ball|terminal)\s*(?:no|number)\b", text) or "pin#" in text:
-        return "pin_no"
-    if re.search(r"\b(?:pin|ball|signal|terminal)\s*name\b", text):
-        return "pin_name"
-    if text in {"type", "io", "i o", "i/o"} or re.search(
-        r"\b(?:pin|signal|io|i o)\s*type\b", text
-    ):
-        return "type"
-    return ""
 
 
 def _package_dimension_header_score(value: str) -> int:
