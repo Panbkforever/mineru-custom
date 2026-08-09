@@ -89,6 +89,47 @@ class SemanticBatchingTests(unittest.TestCase):
         self.assertEqual(set(result), set(range(9)))
         self.assertTrue(all(decision.should_extract for decision in result.values()))
 
+    def test_pin_table_batch_failure_retries_each_table_independently(self):
+        call_sizes = []
+
+        def fake_batch(tables):
+            call_sizes.append(len(tables))
+            if len(tables) > 1:
+                raise TimeoutError("batch timeout")
+            item = tables[0]
+            return {
+                item["request_id"]: {
+                    "should_extract": True,
+                    "columns": [{"column_index": 0, "field": "pin_no"}],
+                }
+            }
+
+        prepared = [
+            {
+                "table_id": index,
+                "table": SimpleNamespace(title=f"Table {index}"),
+                "headers": ["PIN"],
+                "rows": [["PIN"], [str(index)]],
+                "data_rows": [[str(index)]],
+                "header_paths": [],
+                "name_layout": NameColumnLayout(mode="single_name"),
+            }
+            for index in range(4)
+        ]
+        with patch(
+            "extract.pin_package_extractor.find_special_table_match",
+            return_value=None,
+        ), patch(
+            "extract.semantic_classifier.classify_table_schema_batch",
+            side_effect=fake_batch,
+        ):
+            result = decide_all_tables(prepared, True, False)
+
+        self.assertEqual(call_sizes.count(4), 1)
+        self.assertEqual(call_sizes.count(1), 4)
+        self.assertEqual(set(result), set(range(4)))
+        self.assertTrue(all(decision.should_extract for decision in result.values()))
+
     def test_package_catalog_orchestrator_chunks_nine_tables_as_four_four_one(self):
         batch_sizes = []
 

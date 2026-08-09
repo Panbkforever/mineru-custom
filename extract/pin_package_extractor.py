@@ -759,6 +759,8 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
 
     # 一个请求固定携带最多四张表。线程数只控制“批次请求”的并发数，
     # 不改变每张表仍然拥有独立 request_id 和独立字段判断结果的约束。
+    # 如果整个批次请求失败，必须立即把该批次降级成逐表请求，避免一张
+    # 超大表或一次网络超时导致同批次内其他正常表格被一起判为不提取。
     batch_size = 4
     workers = max(1, int(os.getenv("EXTRACT_SCHEMA_WORKERS", "4")))
     batches = [
@@ -773,21 +775,22 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
     )
     completed_tables = 0
     with ThreadPoolExecutor(max_workers=min(workers, len(batches))) as executor:
+        def build_semantic_request(item):
+            """构造单张表的模型输入；批量请求和降级请求共用同一份数据。"""
+            return {
+                "request_id": str(item["table_id"]),
+                "title": item["table"].title,
+                "headers": item["headers"],
+                # 每张表始终发送完整二维内容，降级为单表时也不截断。
+                "table_rows": item["rows"],
+                "header_paths": header_paths_to_lists(item["header_paths"]),
+                "name_layout": name_layout_to_dict(item["name_layout"]),
+            }
+
         futures = {
             executor.submit(
                 classify_table_schema_batch,
-                [
-                    {
-                        "request_id": str(item["table_id"]),
-                        "title": item["table"].title,
-                        "headers": item["headers"],
-                        # 每张表仍发送完整二维内容，批量化不截断单表。
-                        "table_rows": item["rows"],
-                        "header_paths": header_paths_to_lists(item["header_paths"]),
-                        "name_layout": name_layout_to_dict(item["name_layout"]),
-                    }
-                    for item in batch
-                ],
+                [build_semantic_request(item) for item in batch],
             ): batch
             for batch in batches
         }
@@ -798,18 +801,49 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
             except Exception as exc:
                 schemas = {}
                 batch_error = str(exc)
+                print(
+                    f"语义字段判断批次失败，改为逐表重试: {batch_error}",
+                    flush=True,
+                )
+                # 单表重试在当前批次的结果收集阶段依次执行。每张表独立捕获
+                # 异常，确保其中一张仍然失败时不会影响后续表格继续判断。
+                single_errors = {}
+                for item in batch:
+                    request_id = str(item["table_id"])
+                    try:
+                        single_result = classify_table_schema_batch(
+                            [build_semantic_request(item)]
+                        )
+                        schema = single_result.get(request_id)
+                        if schema is None:
+                            single_errors[request_id] = "semantic_single_missing_result"
+                        else:
+                            schemas[request_id] = schema
+                    except Exception as single_exc:
+                        single_errors[request_id] = str(single_exc)
             else:
                 batch_error = ""
+                single_errors = {}
 
             for item in batch:
                 request_id = str(item["table_id"])
                 schema = schemas.get(request_id)
                 if schema is not None:
                     decision = decision_from_schema(schema, item)
-                elif batch_error:
+                elif request_id in single_errors:
                     decision = TableDecision(
                         False,
-                        reason=f"semantic_classification_failed:{batch_error}",
+                        reason=(
+                            "semantic_classification_failed_after_single_retry:"
+                            f"{single_errors[request_id]}"
+                        ),
+                    )
+                elif batch_error:
+                    # 理论上批次异常后每张表都会得到结果或独立错误；保留此分支
+                    # 防止未来重构遗漏状态时静默接受不完整结果。
+                    decision = TableDecision(
+                        False,
+                        reason=f"semantic_batch_retry_state_missing:{batch_error}",
                     )
                 else:
                     decision = TableDecision(
