@@ -7,6 +7,7 @@ from extract.group_title_context import (
 )
 from extract.pin_package_extractor import (
     TableCandidate,
+    detect_table_of_contents_page_range,
     extract_pin_package_info_from_table_candidates,
     iter_table_candidates,
     iter_table_candidates_from_markdown,
@@ -200,6 +201,54 @@ Pin Functions
     assert candidates[1].group_context.endswith(
         "6 Pin Configuration and Functions\nPin Functions"
     )
+
+
+def test_detects_explicit_multi_page_table_of_contents_range():
+    middle_json = {
+        "pdf_info": [
+            {"page_idx": 0, "blocks": [{"content": "Product cover"}]},
+            {
+                "page_idx": 1,
+                "blocks": [
+                    {"content": "Table of Contents"},
+                    {"content": "1 Introduction ........ 1"},
+                    {"content": "2 Device Information ........ 3"},
+                ],
+            },
+            {
+                "page_idx": 2,
+                "blocks": [
+                    {"content": "3 Pin Functions ........ 8"},
+                    {"content": "4 Specifications ........ 20"},
+                ],
+            },
+            {
+                "page_idx": 3,
+                "blocks": [
+                    {"content": "1 Introduction"},
+                    {"content": "This device provides..."},
+                ],
+            },
+        ]
+    }
+
+    assert detect_table_of_contents_page_range(middle_json) == (1, 2)
+
+
+def test_does_not_infer_toc_from_body_text_containing_contents_word():
+    middle_json = {
+        "pdf_info": [
+            {
+                "page_idx": 0,
+                "blocks": [
+                    {"content": "Package contents depend on ordering code."},
+                    {"content": "1 Introduction"},
+                ],
+            }
+        ]
+    }
+
+    assert detect_table_of_contents_page_range(middle_json) is None
 
 
 def test_new_section_without_local_title_does_not_inherit_old_table_title():

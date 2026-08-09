@@ -217,11 +217,14 @@ def extract_pin_package_info_from_middle_json(
     use_semantic_classifier: bool = False,
 ) -> list[dict[str, Any]]:
     """从 MinerU 的 middle_json 找出表格，并交给统一提取流水线。"""
+    pdf_info = middle_json.get("pdf_info", [])
     return extract_pin_package_info_from_table_candidates(
         iter_table_candidates(middle_json),
         source_name=source_name,
         include_debug=include_debug,
         use_semantic_classifier=use_semantic_classifier,
+        document_page_count=len(pdf_info) if isinstance(pdf_info, list) else None,
+        toc_page_range=detect_table_of_contents_page_range(middle_json),
     )
 
 
@@ -252,11 +255,48 @@ def extract_pin_package_info_from_markdown_json_file(
     markdown = payload.get("markdown", "") if isinstance(payload, dict) else ""
     if not isinstance(markdown, str) or "<table" not in markdown.lower():
         return []
+    candidates = iter_table_candidates_from_markdown(markdown)
+    document_page_count: int | None = None
+    toc_page_range: tuple[int, int] | None = None
+
+    # 最终 JSON 中的 Markdown 已经过完整表格后处理，但自身没有页码。
+    # 同目录 middle_json 保留原始页面结构；按表格顺序/内容把最终表映射回
+    # 原页面，才能执行目录前后和末十页候选规则。
+    middle_json_path = path.with_name(f"{path.stem}_middle.json")
+    if middle_json_path.exists():
+        try:
+            middle_json = json.loads(middle_json_path.read_text(encoding="utf-8"))
+            source_tables = iter_table_candidates(middle_json)
+            # 局部导入避免 table_exporter 在模块初始化时反向导入本模块。
+            from table_exporter import match_final_tables_to_pages
+
+            matches = match_final_tables_to_pages(candidates, source_tables)
+            for candidate, match in zip(candidates, matches):
+                candidate.page_idx = next(
+                    (
+                        source.page_idx
+                        for source in match.source_tables
+                        if isinstance(source.page_idx, int)
+                    ),
+                    None,
+                )
+            pdf_info = middle_json.get("pdf_info", [])
+            if isinstance(pdf_info, list):
+                document_page_count = len(pdf_info)
+            toc_page_range = detect_table_of_contents_page_range(middle_json)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            # 页码恢复失败不能破坏已有提取入口；候选阶段会退化为只接受
+            # 当前表自身的高优先级表题，不再使用旧的表格顺序百分比猜测。
+            document_page_count = None
+            toc_page_range = None
+
     return extract_pin_package_info_from_table_candidates(
-        iter_table_candidates_from_markdown(markdown),
+        candidates,
         source_name=path.stem,
         include_debug=include_debug,
         use_semantic_classifier=use_semantic_classifier,
+        document_page_count=document_page_count,
+        toc_page_range=toc_page_range,
     )
 
 
@@ -265,6 +305,8 @@ def extract_pin_package_info_from_table_candidates(
     source_name: str = "",
     include_debug: bool = False,
     use_semantic_classifier: bool = False,
+    document_page_count: int | None = None,
+    toc_page_range: tuple[int, int] | None = None,
 ) -> list[dict[str, Any]]:
     """按“先判断、后提取”的顺序处理表格。
 
@@ -485,6 +527,8 @@ def extract_pin_package_info_from_table_candidates(
         multi_package_plans=multi_package_plans,
         source_name=source_name,
         use_semantic_classifier=use_semantic_classifier,
+        document_page_count=document_page_count,
+        toc_page_range=toc_page_range,
     )
     # 在读取任何引脚行之前建立全部外层封装桶。即使某个已确认槽位暂时
     # 没有关联到引脚表，最终 JSON 仍保留正确的封装数量。
@@ -1767,6 +1811,90 @@ def iter_spans_in_reading_order(value: Any):
     elif isinstance(value, list):
         for item in value:
             yield from iter_spans_in_reading_order(item)
+
+
+def detect_table_of_contents_page_range(
+    middle_json: dict[str, Any],
+) -> tuple[int, int] | None:
+    """从 middle_json 识别目录的起始页和结束页（均为 0 基页码）。
+
+    目录起点必须出现独立的 ``Contents``、``Table of Contents`` 或 ``目录``
+    标题，不能仅凭某行含有 contents 单词猜测。起点后的连续页面只有在呈现
+    密集“章节标题 + 页码”形态时才继续算作目录页；第一张不满足该形态的
+    页面立即结束目录。该结果只控制封装总述候选页，不参与表题、group、
+    字段判断或逐行提取。
+    """
+
+    pdf_info = middle_json.get("pdf_info", [])
+    if not isinstance(pdf_info, list) or not pdf_info:
+        return None
+
+    pages: list[tuple[int, list[str]]] = []
+    for order, page in enumerate(pdf_info):
+        page_idx = (
+            page.get("page_idx")
+            if isinstance(page, dict) and isinstance(page.get("page_idx"), int)
+            else order
+        )
+        lines: list[str] = []
+        for span in iter_spans_in_reading_order(page):
+            if not isinstance(span, dict):
+                continue
+            raw = span.get("content") or span.get("text") or ""
+            for line in str(raw).splitlines():
+                cleaned = plain_text(line).strip()
+                if cleaned:
+                    lines.append(cleaned)
+        pages.append((page_idx, lines))
+
+    start_position = next(
+        (
+            position
+            for position, (_, lines) in enumerate(pages)
+            if any(_is_explicit_toc_title(line) for line in lines)
+        ),
+        None,
+    )
+    if start_position is None:
+        return None
+
+    start_page = pages[start_position][0]
+    end_page = start_page
+    for page_idx, lines in pages[start_position + 1 :]:
+        if not _looks_like_toc_continuation_page(lines):
+            break
+        end_page = page_idx
+    return start_page, end_page
+
+
+def _is_explicit_toc_title(value: str) -> bool:
+    """严格识别独立目录标题，避免普通正文中的 contents 触发目录模式。"""
+
+    normalized = re.sub(r"\s+", " ", plain_text(value)).strip().lower()
+    return normalized in {"table of contents", "contents", "目录"}
+
+
+def _looks_like_toc_continuation_page(lines: list[str]) -> bool:
+    """判断目录标题之后的一页是否仍是目录条目页。"""
+
+    if any(_is_explicit_toc_title(line) for line in lines):
+        return True
+
+    trailing_page_entries = 0
+    numbered_entries = 0
+    for line in lines:
+        text = re.sub(r"\s+", " ", plain_text(line)).strip()
+        if not text:
+            continue
+        if re.match(r"^(?:chapter\s+)?\d{1,3}(?:\.\d{1,3}){0,5}\b", text, re.IGNORECASE):
+            numbered_entries += 1
+        if re.search(r"(?:\.{2,}|\s)\s*[ivxlcdm\d]+\s*$", text, re.IGNORECASE):
+            if re.match(r"^(?:chapter\s+)?\d{1,3}(?:\.\d{1,3}){0,5}\b", text, re.IGNORECASE):
+                trailing_page_entries += 1
+
+    # 最后一张目录页可能只有少量条目，因此两条带尾页码的条目即可确认；
+    # 页码被 MinerU 丢失时则要求至少四条连续编号标题，降低正文误判概率。
+    return trailing_page_entries >= 2 or numbered_entries >= 4
 
 
 # ---------------------------------------------------------------------------

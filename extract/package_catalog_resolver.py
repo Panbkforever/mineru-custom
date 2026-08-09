@@ -6,8 +6,10 @@
 
 固定处理流程：
 
-1. 从全文表格中宽松定位可能的封装总述表或包装信息表；器件信息、封装信息、
-   订购信息及对应英文标题属于最高优先级证据，但仍需模型确认表格结构。
+1. 从全文表格中定位可能的封装总述表或包装信息表。当前表自己的表题命中
+   器件信息、封装信息、订购信息及对应英文时属于最高优先级；否则只从
+   目录前、目录结束后三页或文档末十页等限定页面区域召回。章节标题不能
+   代替当前表题触发最高优先级。
 2. 模型只判断表格角色、表头行和列角色，不返回任何 pkg 值。
 3. 代码按照模型给出的列索引逐行读取原表，并结合已经严格确认的表内分支，
    确定文档中有几个相互独立的物理引脚映射空间，再冻结为
@@ -174,6 +176,8 @@ def resolve_document_package_catalog(
     source_name: str = "",
     use_semantic_classifier: bool = False,
     classifier: PackageCatalogClassifier | None = None,
+    document_page_count: int | None = None,
+    toc_page_range: tuple[int, int] | None = None,
 ) -> PackageCatalogResolution:
     """建立封装目录并为每张目标表生成唯一绑定结果。
 
@@ -185,7 +189,15 @@ def resolve_document_package_catalog(
     diagnostics: list[dict[str, Any]] = []
     entries: list[PackageCatalogEntry] = []
 
-    catalog_candidates = find_package_catalog_candidates(all_tables)
+    # 已经由第一次模型确认的引脚表不能再次作为封装总述候选送入第二次
+    # 模型。两个模型阶段职责独立，避免重复请求和相互污染。
+    target_table_ids = {table.table_id for table in target_tables}
+    catalog_candidates = find_package_catalog_candidates(
+        all_tables,
+        document_page_count=document_page_count,
+        toc_page_range=toc_page_range,
+        excluded_table_ids=target_table_ids,
+    )
     if use_semantic_classifier or classifier is not None:
         entries, semantic_diagnostics = classify_package_catalog_candidates(
             catalog_candidates,
@@ -239,127 +251,74 @@ def resolve_document_package_catalog(
 
 def find_package_catalog_candidates(
     tables: Sequence[PackageCatalogTable],
+    *,
+    document_page_count: int | None = None,
+    toc_page_range: tuple[int, int] | None = None,
+    excluded_table_ids: set[int] | frozenset[int] = frozenset(),
 ) -> list[PackageCatalogTable]:
     """定位可能记录封装总数和名称的总述表。
 
-    这是宽松召回，不是最终判断。表题/章节、表头以及文档前后区域共同计分，
-    防止把规则写死为某一种 ``Device Information`` 或 ``Ordering`` 表头。
+    该阶段只负责召回，不能直接认定 pkg。候选集合严格由以下来源并集组成：
+
+    * 当前表自己的表题命中高优先级名称；
+    * 有目录时：目录起始页之前，以及目录结束页之后的三页；
+    * 无目录时：文档前十页；
+    * 无论是否有目录：文档最后十页。
+
+    已由第一次模型确认的引脚表必须排除。候选按“高优先级表题优先，其余
+    保持文档顺序”返回，同一张表只出现一次。
     """
 
     if not tables:
         return []
+
     known_pages = [
         table.page_idx
         for table in tables
         if isinstance(table.page_idx, int) and table.page_idx >= 0
     ]
-    last_page = max(known_pages, default=0)
-    edge_span = max(2, int((last_page + 1) * 0.15))
-    # 最终 Markdown 通常没有页码。此时用全文表格顺序的前后 15% 作为区域
-    # 兜底；它只提供一分区域证据，不能让普通表单独成为总述候选。
-    table_edge_span = max(2, int(len(tables) * 0.15))
+    if document_page_count is None and known_pages:
+        document_page_count = max(known_pages) + 1
 
-    scored: list[tuple[int, int, PackageCatalogTable]] = []
-    for order, table in enumerate(tables):
-        has_page = isinstance(table.page_idx, int) and table.page_idx >= 0
-        is_order_edge = (
-            order < table_edge_span
-            or order >= len(tables) - table_edge_span
-        )
-        score = package_catalog_candidate_score(
-            table,
-            last_page=last_page,
-            edge_span=edge_span,
-            is_order_edge=is_order_edge and not has_page,
-        )
-        is_edge = is_order_edge if not has_page else (
-            (
-                table.page_idx < edge_span
-                or table.page_idx > last_page - edge_span
-            )
-        )
-        has_table_shape = (
-            len(table.rows) >= 1
-            and max((len(row) for row in table.rows), default=0) >= 2
-        )
-        # 文档中间的表需要明确标题/表头证据。前后区域只要具有正常二维
-        # 表格结构就宽松送模型，避免总述表因为标题和表头名称完全陌生而
-        # 在模型之前被规则漏掉；区域只负责召回，不直接认定 pkg。
-        if score >= 3 or (is_edge and has_table_shape):
-            scored.append((score, order, table))
+    priority: list[PackageCatalogTable] = []
+    regional: list[PackageCatalogTable] = []
+    for table in tables:
+        if table.table_id in excluded_table_ids:
+            continue
+        if not _has_catalog_table_shape(table):
+            continue
 
-    # 优先发送高分表，但同分时保持原文顺序，保证模型证据和调试稳定。
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    return [table for _, _, table in scored]
+        # 最高优先级只看当前表自己的 title。group_context 和章节标题仍会
+        # 传给模型作为语义上下文，但不能把整章普通表都提升为候选。
+        if _has_priority_catalog_title(table.title):
+            priority.append(table)
+            continue
+
+        if _is_catalog_candidate_page(
+            table.page_idx,
+            document_page_count=document_page_count,
+            toc_page_range=toc_page_range,
+        ):
+            regional.append(table)
+
+    # 最终 Markdown 缺少 middle_json 时没有可靠页码。此时不能恢复旧的
+    # “前后 15% 表格”猜测，只保留有自身表题证据的候选，避免请求量失控。
+    return [*priority, *regional]
 
 
-def package_catalog_candidate_score(
-    table: PackageCatalogTable,
-    *,
-    last_page: int,
-    edge_span: int,
-    is_order_edge: bool = False,
-) -> int:
-    """计算总述表召回分数；分数只用于减少模型请求数量。"""
+def _has_catalog_table_shape(table: PackageCatalogTable) -> bool:
+    """封装总述模型只接收至少一行、至少两列的二维表。"""
 
-    title_text = normalize_text(
-        "\n".join(
-            [
-                table.title,
-                table.group_context,
-                *table.current_chapter_titles,
-            ]
-        )
+    return (
+        len(table.rows) >= 1
+        and max((len(row) for row in table.rows), default=0) >= 2
     )
-    # 当前表题和最近章节标题是最局部的定位证据。不能只检查累积章节文本，
-    # 否则位于“订购信息”之后的普通表也会继承关键词并获得同等优先级。
-    direct_title_text = normalize_text(
-        "\n".join(
-            [
-                table.title,
-                table.current_chapter_titles[-1]
-                if table.current_chapter_titles
-                else "",
-            ]
-        )
-    )
-    header_text = normalize_text(" ".join(table.headers))
-    score = 0
 
-    title_terms = (
-        "device information",
-        "device comparison",
-        "device option",
-        "product variant",
-        "selection guide",
-        "ordering information",
-        "orderable",
-        "package option",
-        "package information",
-        "packaging information",
-        "package type",
-        "封装",
-        "订购",
-        "器件信息",
-    )
-    header_terms = (
-        "package",
-        "package type",
-        "package drawing",
-        "orderable device",
-        "part number",
-        "model",
-        "product",
-        "ordering code",
-        "marking",
-        "device",
-        "pins",
-        "pin count",
-        "body size",
-        "封装",
-        "器件型号",
-        "引脚数",
-    )
+
+def _has_priority_catalog_title(title: str) -> bool:
+    """只检查当前表题是否明确指向器件、封装或订购总述。"""
+
+    normalized = normalize_text(title)
     priority_title_terms = (
         "device information",
         "package information",
@@ -370,24 +329,33 @@ def package_catalog_candidate_score(
         "包装信息",
         "订购信息",
     )
-    # 这些标题通常直接声明“文档有哪些封装/订购变体”，因此优先送入第二次
-    # 模型调用。高分只改变候选顺序，不绕过模型，也不直接生成 pkg。
-    score += (
-        12
-        if any(term in direct_title_text for term in priority_title_terms)
-        else 0
-    )
-    score += 3 if any(term in title_text for term in title_terms) else 0
-    score += min(4, sum(term in header_text for term in header_terms))
+    return any(term in normalized for term in priority_title_terms)
 
-    # 总述表通常位于文档前部或订购/包装章节所在的后部。区域只能加分，
-    # 不能单独使一张普通表成为候选。
-    if isinstance(table.page_idx, int) and table.page_idx >= 0:
-        if table.page_idx < edge_span or table.page_idx > last_page - edge_span:
-            score += 1
-    elif is_order_edge:
-        score += 1
-    return score
+
+def _is_catalog_candidate_page(
+    page_idx: int | None,
+    *,
+    document_page_count: int | None,
+    toc_page_range: tuple[int, int] | None,
+) -> bool:
+    """按确认的目录和页码规则判断普通候选表所在页面。"""
+
+    if not isinstance(page_idx, int) or page_idx < 0:
+        return False
+    if not isinstance(document_page_count, int) or document_page_count <= 0:
+        return False
+
+    # 最后十页始终属于候选区域；短文档自然会覆盖整篇文档。
+    if page_idx >= max(0, document_page_count - 10):
+        return True
+
+    if toc_page_range is None:
+        return page_idx < min(10, document_page_count)
+
+    toc_start, toc_end = toc_page_range
+    if page_idx < toc_start:
+        return True
+    return toc_end < page_idx <= min(toc_end + 3, document_page_count - 1)
 
 
 def classify_package_catalog_candidates(

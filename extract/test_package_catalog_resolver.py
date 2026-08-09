@@ -74,11 +74,11 @@ def test_summary_locator_uses_context_headers_and_document_edge():
     assert summary in find_package_catalog_candidates([summary, timing])
 
 
-def test_summary_locator_uses_table_order_when_markdown_has_no_page_numbers():
+def test_summary_locator_without_page_numbers_only_uses_own_priority_title():
     tables = [
         catalog_table(
             0,
-            "Product Options",
+            "Package Information",
             ["DEVICE", "PACKAGE"],
             [["DEV100", "QFN 32"]],
             page_idx=None,
@@ -100,7 +100,7 @@ def test_summary_locator_uses_table_order_when_markdown_has_no_page_numbers():
     assert tables[len(tables) // 2] not in candidates
 
 
-def test_edge_table_with_unknown_vocabulary_is_sent_to_model():
+def test_unknown_table_without_page_metadata_is_not_guessed_by_table_order():
     unknown_summary = catalog_table(
         0,
         "Overview",
@@ -123,7 +123,77 @@ def test_edge_table_with_unknown_vocabulary_is_sent_to_model():
         [unknown_summary, *middle_tables]
     )
 
-    assert unknown_summary in candidates
+    assert unknown_summary not in candidates
+
+
+def test_catalog_candidates_follow_toc_page_windows_and_exclude_pin_tables():
+    tables = [
+        catalog_table(
+            table_id=page,
+            title=f"Table {page}. Any Data",
+            headers=["A", "B"],
+            rows=[["x", "y"]],
+            page_idx=page,
+        )
+        for page in (0, 1, 2, 3, 4, 5, 6, 7, 8, 50, 90, 99)
+    ]
+
+    candidates = find_package_catalog_candidates(
+        tables,
+        document_page_count=100,
+        toc_page_range=(2, 4),
+        excluded_table_ids={6},
+    )
+
+    assert [table.page_idx for table in candidates] == [0, 1, 5, 7, 90, 99]
+
+
+def test_catalog_candidates_without_toc_use_first_and_last_ten_pages():
+    tables = [
+        catalog_table(
+            table_id=page,
+            title=f"Table {page}. Any Data",
+            headers=["A", "B"],
+            rows=[["x", "y"]],
+            page_idx=page,
+        )
+        for page in (0, 9, 10, 49, 50, 89, 90, 99)
+    ]
+
+    candidates = find_package_catalog_candidates(
+        tables,
+        document_page_count=100,
+    )
+
+    assert [table.page_idx for table in candidates] == [0, 9, 90, 99]
+
+
+def test_priority_title_checks_own_table_title_not_inherited_chapter():
+    inherited_only = PackageCatalogTable(
+        table_id=1,
+        page_idx=50,
+        title="Table 20. Electrical Characteristics",
+        group_context="2 Device Information\nTable 20. Electrical Characteristics",
+        current_chapter_titles=("2 Device Information",),
+        headers=("PARAMETER", "VALUE"),
+        rows=(("Clock", "10"),),
+    )
+    own_title = catalog_table(
+        2,
+        "Table 21. Device Information",
+        ["DEVICE", "PACKAGE"],
+        [["DEV100", "QFN"]],
+        page_idx=50,
+    )
+
+    candidates = find_package_catalog_candidates(
+        [inherited_only, own_title],
+        document_page_count=100,
+        toc_page_range=(2, 4),
+    )
+
+    assert inherited_only not in candidates
+    assert own_title in candidates
 
 
 def test_catalog_filters_unrelated_summary_devices_by_target_evidence():
