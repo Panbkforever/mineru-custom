@@ -2,7 +2,7 @@
 
 本文件只做一件事：把表格转换为项目约定的 JSON 结构。
 
-处理流程固定为八个阶段，阶段之间不互相调用：
+处理流程固定为九个阶段，阶段之间不互相调用：
 
 1. 表格判断：判断当前表是不是“物理引脚/封装关系表”。
 2. 表头结构：仅对候选表展开 rowspan/colspan，建立每列的完整表头路径。
@@ -11,7 +11,8 @@
 5. 多封装分析：只按表格结构生成多个编号列/行的绑定计划。
 6. 封装槽位：先冻结物理封装数量，再绑定每张引脚表；器件型号只用于关联。
 7. 行提取：单封装和多封装走各自独立逻辑，完整读取已经绑定的数据行。
-8. 结果整理：按固定槽位分组；pkg 使用物理封装名，未知时按 a/b/c 回退。
+8. pkg 内去重：只按完全相同的 pin_no、pin_name、type 合并重复记录，并汇总描述。
+9. 结果整理：按固定槽位分组；pkg 使用物理封装名，未知时按 a/b/c 回退。
 
 特别重要的项目规则：
 
@@ -42,7 +43,9 @@
   或多封装结构判断。即使描述中出现 package、pin、ball 等词，也不能
   改变表头边界或触发多封装分支。
 * pin_name 为空填 ``Reserved``；去掉末尾的 ``(数字)`` 和 ``(continued)``。
-* 同一个 pin_no 出现多次时不合并记录；不同 type 也不合并。
+* 逐行提取阶段不按 pin_no 合并记录；不同 pin_name 或不同 type 始终属于
+  不同记录。全部表格提取完成后，同一个 pkg 内只有 pin_no、pin_name、type
+  三项完全一致的记录才去重；保留首次出现位置，并合并不同的非空 description。
 * 多个 type 列同时存在时，只保留最接近 signal/pin 语义的一个，优先 SIGNAL TYPE、PIN TYPE、I/O TYPE。
 * BALL NAME、SIGNAL NAME、PIN NAME、TERMINAL NAME 在项目中属于等价
   的 pin_name 语义。普通表同时出现多个等价名称列时，只固定选择完整度最高
@@ -703,7 +706,11 @@ def extract_pin_package_info_from_table_candidates(
         else:
             skip(debug, "no_pin_records_after_mapping")
 
-    return build_public_result(packages, include_debug)
+    # 所有表格和所有 group 都已读取完毕后，再在最终公开结构中执行 pkg 内
+    # 精确去重。此处位于写 JSON 之前，因此后出现表格中的 description 已经
+    # 全部可用，同时不会反向影响表格判断、字段映射或 package 绑定。
+    result = build_public_result(packages, include_debug)
+    return deduplicate_pins_within_packages(result)
 
 
 def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, include_debug: bool) -> dict[int, TableDecision]:
@@ -1693,6 +1700,57 @@ def build_public_result(
             item["package_key"] = bucket["package_key"]
         result.append(item)
     return append_duplicate_pkg_suffixes(result)
+
+
+def deduplicate_pins_within_packages(
+    result: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """在每个 pkg 内按 ``pin_no + pin_name + type`` 精确去重。
+
+    去重范围不跨 pkg。重复记录保留第一次出现的 group 和顺序；后续记录
+    只提供 description 补充。不同的非空 description 按首次出现顺序使用
+    换行连接，相同 description 不重复追加。去重后没有记录的 group 删除。
+    """
+
+    for package in result:
+        # 每个 pkg 使用独立索引，确保两个封装中的相同引脚互不影响。
+        first_record_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        descriptions_by_key: dict[tuple[str, str, str], list[str]] = {}
+        retained_groups: list[dict[str, Any]] = []
+
+        for group in package.get("group_list", []):
+            retained_pins: list[dict[str, Any]] = []
+            for pin in group.get("pin_list", []):
+                # 使用最终清洗后的公开字段原值比较，不做模糊匹配、大小写
+                # 归一或符号替换，避免把实际含义不同的引脚错误合并。
+                key = (
+                    str(pin.get("pin_no", "")),
+                    str(pin.get("pin_name", "")),
+                    str(pin.get("type", "")),
+                )
+                description = str(pin.get("description", "")).strip()
+
+                if key not in first_record_by_key:
+                    first_record_by_key[key] = pin
+                    descriptions_by_key[key] = [description] if description else []
+                    retained_pins.append(pin)
+                    continue
+
+                # 后续完全相同的引脚记录不再输出，只把尚未出现的非空描述
+                # 合并到第一次出现的记录，避免丢失来自其他表格的补充语义。
+                descriptions = descriptions_by_key[key]
+                if description and description not in descriptions:
+                    descriptions.append(description)
+                    first_record_by_key[key]["description"] = "\n".join(descriptions)
+
+            if retained_pins:
+                retained_group = dict(group)
+                retained_group["pin_list"] = retained_pins
+                retained_groups.append(retained_group)
+
+        package["group_list"] = retained_groups
+
+    return result
 
 
 def append_duplicate_pkg_suffixes(
