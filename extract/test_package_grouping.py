@@ -126,6 +126,16 @@ class PackageGroupingTest(unittest.TestCase):
                 ],
             }
 
+        def package_batch_classifier(tables, source_name, target_tables):
+            return {
+                request_id: package_classifier(
+                    table,
+                    source_name,
+                    target_tables,
+                )
+                for request_id, table in tables
+            }
+
         with (
             patch.object(
                 extractor,
@@ -133,8 +143,8 @@ class PackageGroupingTest(unittest.TestCase):
                 return_value={1: TableDecision(True, columns=columns)},
             ),
             patch(
-                "extract.semantic_classifier.classify_package_catalog_table",
-                side_effect=package_classifier,
+                "extract.semantic_classifier.classify_package_catalog_tables",
+                side_effect=package_batch_classifier,
             ),
         ):
             result = extract_pin_package_info_from_table_candidates(

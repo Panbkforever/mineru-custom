@@ -704,37 +704,73 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
         })
         return results
 
-    from extract.semantic_classifier import classify_table_schema
+    from extract.semantic_classifier import classify_table_schema_batch
 
-    # 默认 4 个模型请求并发；环境变量可在限流时把它调小。
+    # 一个请求固定携带最多四张表。线程数只控制“批次请求”的并发数，
+    # 不改变每张表仍然拥有独立 request_id 和独立字段判断结果的约束。
+    batch_size = 4
     workers = max(1, int(os.getenv("EXTRACT_SCHEMA_WORKERS", "4")))
+    batches = [
+        remaining[start:start + batch_size]
+        for start in range(0, len(remaining), batch_size)
+    ]
     print(
         f"语义字段判断: 候选表 {len(remaining)} 张, "
-        f"特殊表直通 {len(prepared) - len(remaining)} 张, 并发 {workers}",
+        f"特殊表直通 {len(prepared) - len(remaining)} 张, "
+        f"每批最多 {batch_size} 张, 批次 {len(batches)}, 并发 {min(workers, len(batches))}",
         flush=True,
     )
-    with ThreadPoolExecutor(max_workers=workers) as executor:
+    completed_tables = 0
+    with ThreadPoolExecutor(max_workers=min(workers, len(batches))) as executor:
         futures = {
             executor.submit(
-                classify_table_schema,
-                item["table"].title,
-                item["headers"],
-                # 把初筛后的完整二维表格交给模型，不能只发送样例行。
-                item["rows"],
-                header_paths_to_lists(item["header_paths"]),
-                name_layout_to_dict(item["name_layout"]),
-            ): item
-            for item in remaining
+                classify_table_schema_batch,
+                [
+                    {
+                        "request_id": str(item["table_id"]),
+                        "title": item["table"].title,
+                        "headers": item["headers"],
+                        # 每张表仍发送完整二维内容，批量化不截断单表。
+                        "table_rows": item["rows"],
+                        "header_paths": header_paths_to_lists(item["header_paths"]),
+                        "name_layout": name_layout_to_dict(item["name_layout"]),
+                    }
+                    for item in batch
+                ],
+            ): batch
+            for batch in batches
         }
-        for index, future in enumerate(as_completed(futures), 1):
-            item = futures[future]
+        for future in as_completed(futures):
+            batch = futures[future]
             try:
-                schema = future.result()
-                decision = decision_from_schema(schema, item)
+                schemas = future.result()
             except Exception as exc:
-                decision = TableDecision(False, reason=f"semantic_classification_failed:{exc}")
-            results[item["table_id"]] = decision
-            print(f"语义字段判断进度: {index}/{len(remaining)}", flush=True)
+                schemas = {}
+                batch_error = str(exc)
+            else:
+                batch_error = ""
+
+            for item in batch:
+                request_id = str(item["table_id"])
+                schema = schemas.get(request_id)
+                if schema is not None:
+                    decision = decision_from_schema(schema, item)
+                elif batch_error:
+                    decision = TableDecision(
+                        False,
+                        reason=f"semantic_classification_failed:{batch_error}",
+                    )
+                else:
+                    decision = TableDecision(
+                        False,
+                        reason="semantic_batch_missing_result",
+                    )
+                results[item["table_id"]] = decision
+                completed_tables += 1
+            print(
+                f"语义字段判断进度: {completed_tables}/{len(remaining)}",
+                flush=True,
+            )
     return results
 
 

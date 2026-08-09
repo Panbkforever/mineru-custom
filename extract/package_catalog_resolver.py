@@ -406,10 +406,11 @@ def classify_package_catalog_candidates(
 
     if not tables:
         return [], []
-    if classifier is None:
-        from extract.semantic_classifier import classify_package_catalog_table
-
-        classifier = classify_package_catalog_table
+    # 生产路径使用四表批量协议。保留 classifier 注入仅供无网络单元测试，
+    # 注入的旧式函数仍按单表调用，不改变既有测试接口。
+    use_batch_classifier = classifier is None
+    if use_batch_classifier:
+        from extract.semantic_classifier import classify_package_catalog_tables
 
     import os
 
@@ -422,41 +423,94 @@ def classify_package_catalog_candidates(
             )
         ),
     )
+    batch_size = 4
+    ordered_tables = list(enumerate(tables))
+    batches = [
+        ordered_tables[start:start + batch_size]
+        for start in range(0, len(tables), batch_size)
+    ]
     print(
         f"封装目录判断: 候选总述表 {len(tables)} 张, "
-        f"并发 {min(workers, len(tables))}",
+        f"每批最多 {batch_size} 张, 批次 {len(batches)}, "
+        f"并发 {min(workers, len(batches))}",
         flush=True,
     )
 
     responses: list[tuple[int, PackageCatalogTable, Mapping[str, Any]]] = []
     diagnostics: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=min(workers, len(tables))) as executor:
-        futures = {
-            executor.submit(
-                classifier,
-                table,
-                source_name,
-                target_tables,
-            ): (order, table)
-            for order, table in enumerate(tables)
-        }
-        for completed, future in enumerate(as_completed(futures), 1):
-            order, table = futures[future]
-            try:
-                responses.append((order, table, future.result()))
-            except Exception as exc:
-                diagnostics.append(
-                    {
-                        "stage": "package_catalog",
-                        "table_id": table.table_id,
-                        "status": "error",
-                        "reason": str(exc),
-                    }
+    completed_tables = 0
+    with ThreadPoolExecutor(max_workers=min(workers, len(batches))) as executor:
+        if use_batch_classifier:
+            futures = {
+                executor.submit(
+                    classify_package_catalog_tables,
+                    [
+                        (str(table.table_id), table)
+                        for _, table in batch
+                    ],
+                    source_name=source_name,
+                    target_tables=target_tables,
+                ): batch
+                for batch in batches
+            }
+            for future in as_completed(futures):
+                batch = futures[future]
+                try:
+                    batch_responses = future.result()
+                except Exception as exc:
+                    batch_responses = {}
+                    batch_error = str(exc)
+                else:
+                    batch_error = ""
+                for order, table in batch:
+                    response = batch_responses.get(str(table.table_id))
+                    if response is not None:
+                        responses.append((order, table, response))
+                    else:
+                        diagnostics.append(
+                            {
+                                "stage": "package_catalog",
+                                "table_id": table.table_id,
+                                "status": "error",
+                                "reason": (
+                                    batch_error
+                                    or "package_catalog_batch_missing_result"
+                                ),
+                            }
+                        )
+                    completed_tables += 1
+                print(
+                    f"封装目录判断进度: {completed_tables}/{len(tables)}",
+                    flush=True,
                 )
-            print(
-                f"封装目录判断进度: {completed}/{len(tables)}",
-                flush=True,
-            )
+        else:
+            futures = {
+                executor.submit(
+                    classifier,
+                    table,
+                    source_name,
+                    target_tables,
+                ): (order, table)
+                for order, table in enumerate(tables)
+            }
+            for future in as_completed(futures):
+                order, table = futures[future]
+                try:
+                    responses.append((order, table, future.result()))
+                except Exception as exc:
+                    diagnostics.append(
+                        {
+                            "stage": "package_catalog",
+                            "table_id": table.table_id,
+                            "status": "error",
+                            "reason": str(exc),
+                        }
+                    )
+                completed_tables += 1
+                print(
+                    f"封装目录判断进度: {completed_tables}/{len(tables)}",
+                    flush=True,
+                )
 
     decisions: list[tuple[int, PackageCatalogTable, PackageCatalogDecision]] = []
     # 模型并发完成顺序不可控；按 table_id 恢复全文原始表格顺序。
