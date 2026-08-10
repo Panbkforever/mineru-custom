@@ -2,7 +2,8 @@
 
 模型层的职责严格限制为两项：
 
-1. 每个请求接收最多四张初筛表的标题、表头和完整内容，逐表判断是否提取。
+1. 每个请求接收最多四张初筛表的标题、完整表头和代表性数据行，逐表判断
+   是否提取；小表的数据行保持完整。
 2. 表格需要提取时，把目标列映射为 ``pin_no``、``pin_name`` 或 ``type``。
 3. 每张表使用独立 ``request_id``；批内表格禁止相互合并或共享判断结果。
 
@@ -75,6 +76,7 @@ def classify_table_schema_batch(
             table_rows=list(table.get("table_rows") or []),
             header_paths=table.get("header_paths"),
             name_layout=table.get("name_layout"),
+            sampling=table.get("sampling"),
         )
         requests.append(
             {
@@ -245,8 +247,9 @@ def build_schema_prompt_payload(
     table_rows: list[list[str]],
     header_paths: list[list[str]] | None = None,
     name_layout: dict[str, Any] | None = None,
+    sampling: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """构造最小模型请求；``table_rows`` 不截断，必须包含完整表格。"""
+    """构造第一次模型调用请求；表头完整，超长数据区由上游采样。"""
 
     return {
         "task": (
@@ -264,6 +267,7 @@ def build_schema_prompt_payload(
             "Read table.name_layout before selecting name columns. When mode=equivalent_names, return only one complete pin_name column.",
             "When mode=package_branches, return one pin_name column for every listed branch; never collapse multiple branches into one column.",
             "When mode=parallel_name_branches, also return one pin_name column for every listed operating-mode branch; these branches are not packages.",
+            "Rows may be a deterministic sample from a large table. Use them only to validate column semantics; never assume omitted rows or packages do not exist.",
             "Structural branch labels identify parallel object/package branches, but they are not final public package names.",
             "For multiple type-like columns, select only the type most directly describing the pin/signal, such as SIGNAL TYPE rather than BUFFER TYPE.",
             "Do not select description, conditions, min/typ/max, unit, reset state, power source, notes, ordering, or other auxiliary columns.",
@@ -277,7 +281,12 @@ def build_schema_prompt_payload(
             "header_paths": header_paths or [],
             # name_layout 只提示名称列结构；模型仍只返回是否提取和列映射。
             "name_layout": name_layout or {},
-            # 不使用 sample_rows，也不截断。模型看到的是初筛后的完整表格。
+            # 上游保证完整保留全部多层表头；超长表只压缩正式数据区。
+            "sampling": sampling or {
+                "strategy": "caller_provided",
+                "total_data_rows": len(table_rows),
+                "sampled_data_rows": len(table_rows),
+            },
             "rows": table_rows,
         },
         "output_schema": {

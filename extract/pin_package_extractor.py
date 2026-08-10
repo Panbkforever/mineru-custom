@@ -58,8 +58,12 @@
 * “多个封装各有 pin_no、共享一个 pin_name”和“共享一个 pin_no、多个封装
   各有 pin_name”是两条独立多封装分支，不能通过合并同名字段相互转换。
 * “Pin Configuration and Function” 这类坐标矩阵不是物理引脚表，表级直接排除。
-* 开启语义判断时，模型接收初筛后的表格标题、表头和完整表格；模型只返回
-  ``should_extract`` 以及 ``pin_no``、``pin_name``、``type`` 的列映射。
+* 开启语义判断时，第一次模型调用始终接收完整多层表头；数据行不超过 30 行
+  时完整发送，31 至 200 行发送前 8 行、中间 4 行、后 8 行，超过 200 行
+  发送前 6 行、正文均匀分层抽取 8 行、后 6 行。采样只用于表级/字段级
+  判断，最终行提取始终读取原始完整表格。
+* 第二次封装总述模型调用不使用上述代表性采样。封装数量和实体关系可能出现
+  在任意数据行，仍由 ``package_catalog_resolver.py`` 的独立候选流程处理。
 * 表格分组标题在“上一张表结束到当前表开始”的局部文本窗口中识别：
   优先使用 ``Table xxx``/``表 xxx`` 明确表题；没有表号时允许使用紧邻
   表格的独立短标题，例如 ``Pin Functions``，不要求包含 Pin、Signal 等
@@ -757,6 +761,19 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
 
     from extract.semantic_classifier import classify_table_schema_batch
 
+    # 第一次模型调用只判断表格用途和列语义。在批次拆分前生成采样视图；
+    # item["rows"] 保持完整，后续多封装分析、pkg 绑定和逐行提取仍使用原表。
+    for item in remaining:
+        semantic_rows, sampling = build_semantic_table_sample(
+            item["rows"],
+            item.get("header_index", 0),
+        )
+        item["semantic_rows"] = semantic_rows
+        item["semantic_sampling"] = sampling
+        debug = item.get("debug")
+        if isinstance(debug, dict):
+            debug["semantic_sampling"] = sampling
+
     # 一个请求固定携带最多四张表。线程数只控制“批次请求”的并发数，
     # 不改变每张表仍然拥有独立 request_id 和独立字段判断结果的约束。
     # 如果整个批次请求失败，必须立即把该批次降级成逐表请求，避免一张
@@ -781,8 +798,10 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
                 "request_id": str(item["table_id"]),
                 "title": item["table"].title,
                 "headers": item["headers"],
-                # 每张表始终发送完整二维内容，降级为单表时也不截断。
-                "table_rows": item["rows"],
+                # 批量失败后的单表重试复用同一采样结果，不能在重试时又把
+                # 完整超长表发送给模型。
+                "table_rows": item["semantic_rows"],
+                "sampling": item["semantic_sampling"],
                 "header_paths": header_paths_to_lists(item["header_paths"]),
                 "name_layout": name_layout_to_dict(item["name_layout"]),
             }
@@ -857,6 +876,82 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
                 flush=True,
             )
     return results
+
+
+def build_semantic_table_sample(
+    rows: list[list[str]],
+    header_index: int,
+) -> tuple[list[list[str]], dict[str, Any]]:
+    """为第一次模型调用生成保留完整表头的代表性表格视图。
+
+    返回的新列表只用于语义判断，不修改 ``rows``。采样索引保持原始顺序，
+    因此模型返回的 column_index 可以直接映射回完整表格。
+    """
+
+    if not rows:
+        return [], {
+            "strategy": "full",
+            "total_data_rows": 0,
+            "sampled_data_rows": 0,
+            "sampled_data_indexes": [],
+            "header_rows": 0,
+        }
+
+    # header_index 是完整多层表头的最后一行。其上所有父表头必须原样保留，
+    # 只允许对后面的正式数据区采样。
+    safe_header_index = min(max(int(header_index), 0), len(rows) - 1)
+    header_rows = rows[: safe_header_index + 1]
+    data_rows = rows[safe_header_index + 1 :]
+    total = len(data_rows)
+
+    if total <= 30:
+        indexes = list(range(total))
+        strategy = "full"
+    elif total <= 200:
+        # 中型表保留两端各 8 行，并从正文中心连续取 4 行。
+        middle_start = max(8, (total - 4) // 2)
+        middle_start = min(middle_start, total - 12)
+        indexes = sorted(set(
+            list(range(8))
+            + list(range(middle_start, middle_start + 4))
+            + list(range(total - 8, total))
+        ))
+        strategy = "head8_middle4_tail8"
+    else:
+        # 大型表两端各保留 6 行；中间区均匀选择 8 个位置，覆盖整张表，
+        # 避免只取单一中点而漏掉后半段出现的其他数据形态。
+        middle_indexes = evenly_spaced_indexes(6, total - 7, 8)
+        indexes = sorted(set(
+            list(range(6))
+            + middle_indexes
+            + list(range(total - 6, total))
+        ))
+        strategy = "head6_stratified8_tail6"
+
+    sampled_rows = header_rows + [data_rows[index] for index in indexes]
+    return sampled_rows, {
+        "strategy": strategy,
+        "total_data_rows": total,
+        "sampled_data_rows": len(indexes),
+        "sampled_data_indexes": indexes,
+        "header_rows": len(header_rows),
+    }
+
+
+def evenly_spaced_indexes(start: int, end: int, count: int) -> list[int]:
+    """在闭区间内按顺序返回指定数量的均匀索引。"""
+
+    if count <= 0 or end < start:
+        return []
+    available = end - start + 1
+    if available <= count:
+        return list(range(start, end + 1))
+    if count == 1:
+        return [(start + end) // 2]
+    return [
+        round(start + offset * (end - start) / (count - 1))
+        for offset in range(count)
+    ]
 
 
 def decide_table_by_rules(item: dict[str, Any]) -> TableDecision:

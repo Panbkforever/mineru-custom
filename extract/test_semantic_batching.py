@@ -11,12 +11,86 @@ from extract.package_catalog_resolver import (
     PackageCatalogTable,
     classify_package_catalog_candidates,
 )
-from extract.pin_package_extractor import decide_all_tables
+from extract.pin_package_extractor import (
+    build_semantic_table_sample,
+    decide_all_tables,
+)
 from extract.semantic_classifier import classify_table_schema_batch
 from extract.table_header_structure import NameColumnLayout
 
 
 class SemanticBatchingTests(unittest.TestCase):
+    def test_small_pin_table_sends_all_data_rows(self):
+        rows = [["PARENT"], ["PIN"]] + [[str(index)] for index in range(30)]
+
+        sampled, metadata = build_semantic_table_sample(rows, header_index=1)
+
+        self.assertEqual(sampled, rows)
+        self.assertEqual(metadata["strategy"], "full")
+        self.assertEqual(metadata["sampled_data_rows"], 30)
+
+    def test_medium_pin_table_keeps_headers_and_head_middle_tail_rows(self):
+        rows = [["PARENT"], ["PIN"]] + [[str(index)] for index in range(100)]
+
+        sampled, metadata = build_semantic_table_sample(rows, header_index=1)
+
+        self.assertEqual(sampled[:2], rows[:2])
+        self.assertEqual(metadata["strategy"], "head8_middle4_tail8")
+        self.assertEqual(metadata["sampled_data_rows"], 20)
+        self.assertEqual(metadata["sampled_data_indexes"][:8], list(range(8)))
+        self.assertEqual(metadata["sampled_data_indexes"][-8:], list(range(92, 100)))
+
+    def test_large_pin_table_uses_stratified_middle_without_mutating_source(self):
+        rows = [["PARENT"], ["PIN"]] + [[str(index)] for index in range(880)]
+        original = [list(row) for row in rows]
+
+        sampled, metadata = build_semantic_table_sample(rows, header_index=1)
+
+        self.assertEqual(rows, original)
+        self.assertEqual(sampled[:2], rows[:2])
+        self.assertEqual(metadata["strategy"], "head6_stratified8_tail6")
+        self.assertEqual(metadata["sampled_data_rows"], 20)
+        self.assertEqual(metadata["sampled_data_indexes"][:6], list(range(6)))
+        self.assertEqual(metadata["sampled_data_indexes"][-6:], list(range(874, 880)))
+        self.assertEqual(len(metadata["sampled_data_indexes"][6:-6]), 8)
+
+    def test_orchestrator_sends_sample_but_keeps_complete_rows_for_extraction(self):
+        captured = []
+        complete_rows = [["PIN"]] + [[str(index)] for index in range(300)]
+        prepared = [{
+            "table_id": 0,
+            "table": SimpleNamespace(title="Large pin table"),
+            "headers": ["PIN"],
+            "rows": complete_rows,
+            "header_index": 0,
+            "data_rows": complete_rows[1:],
+            "header_paths": [],
+            "name_layout": NameColumnLayout(mode="single_name"),
+        }]
+
+        def fake_batch(tables):
+            captured.extend(tables)
+            return {
+                "0": {
+                    "should_extract": True,
+                    "columns": [{"column_index": 0, "field": "pin_no"}],
+                }
+            }
+
+        with patch(
+            "extract.pin_package_extractor.find_special_table_match",
+            return_value=None,
+        ), patch(
+            "extract.semantic_classifier.classify_table_schema_batch",
+            side_effect=fake_batch,
+        ):
+            result = decide_all_tables(prepared, True, False)
+
+        self.assertTrue(result[0].should_extract)
+        self.assertEqual(len(captured[0]["table_rows"]), 21)
+        self.assertEqual(captured[0]["sampling"]["total_data_rows"], 300)
+        self.assertEqual(len(prepared[0]["rows"]), 301)
+
     def test_schema_batch_preserves_request_ids_when_model_reorders_results(self):
         captured = {}
 
