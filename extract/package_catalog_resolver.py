@@ -10,24 +10,27 @@
    器件信息、封装信息、订购信息及对应英文时属于最高优先级；否则只从
    目录前、目录结束后三页或文档末十页等限定页面区域召回。章节标题不能
    代替当前表题触发最高优先级。
-2. 模型只判断表格角色、表头行和列角色，不返回任何 pkg 值。
-3. 代码按照模型给出的列索引逐行读取原表，并结合已经严格确认的表内分支，
-   确定文档中有几个相互独立的物理引脚映射空间，再冻结为
-   slot:0、slot:1……。
-4. ``package_identity``（器件型号）只作为跨表关联证据；公开 ``pkg`` 只取
-   ``package_type``（SC-70、VSSOP、QFN 等物理封装名称）。
-5. 严格确认的 N 个表内分支是 N 个独立输出槽位的下限。总述表即使只找到
+2. 第二次模型只判断总述表结构、表头行和 device/pkg 相关列角色；代码随后
+   从原始单元格完整读取 device-pkg 关系，不改写源值。
+3. 第三次模型每篇 PDF 只调用一次。输入完整 device-pkg 关系，以及第一次
+   已确认引脚表的完整表题和表头；输出只包含类别数量、完整 pkg 名称和组成
+   该类别的关系编号，不返回任何表格绑定。
+4. 代码校验第三次返回：pkg 必须逐字来自第二阶段关系，关系编号不能越界或
+   跨类别重复。校验通过后冻结为 slot:0、slot:1……。
+5. 第三次类别调用失败或没有形成有效类别时，才使用既有物理元数据和严格
+   表内分支作为兼容兜底，不能让临时模型错误直接清空整篇结果。
+6. 严格确认的 N 个表内分支是 N 个独立输出槽位的下限。总述表即使只找到
    一个公开封装名，也必须建立 N 个槽位并复用该名称；最终输出再追加数字
    后缀。没有多分支证据时，包装信息表或单封装兜底才决定槽位数量。
-6. 目标引脚表只通过表题、章节标题、表头和多封装列标签绑定已有槽位；
+7. 目标引脚表只通过表题、章节标题、表头和多封装列标签绑定已有槽位；
    description 和数据行不能参与绑定。
-7. 槽位冻结后，任何未匹配表都不能创建新 pkg。单封装文档可以绑定唯一
+8. 槽位冻结后，任何未匹配表都不能创建新 pkg。单封装文档可以绑定唯一
    槽位；多封装文档中无法唯一归属的表必须标记为 unresolved，禁止默认
    塞入第一个槽位。真实名称缺失时仅对已经确认的槽位使用 a、b、c……。
-8. 多封装表的全部本地分支必须一次性执行一对一绑定；禁止每个分支独立
+9. 多封装表的全部本地分支必须一次性执行一对一绑定；禁止每个分支独立
    兜底后落入同一个 package_key。标签脚注、drawing 和 pin_count 只用于
    内部消歧，不改变任何引脚行内容。
-9. ``XXX Mode Pin Name`` 形成的运行模式分支只控制名称列读取，不创建 pkg
+10. ``XXX Mode Pin Name`` 形成的运行模式分支只控制名称列读取，不创建 pkg
    槽位；这些分支必须共同绑定当前表所属的同一个物理封装。
 
 特别重要的边界：
@@ -36,8 +39,8 @@
 * ``multi_package_extractor.py`` 仍只负责单张表内部的多封装结构。
 * description 和普通正文不能参与封装绑定。
 * 一个 pkg 只能是一个字符串，禁止使用 ``|`` 拼接多个候选名称。
-* pkg 名称最长 15 个字符；超过长度的标题、描述或多个名称拼接结果直接拒绝。
-* 器件型号、订购型号和 Drawing 不能写入公开 pkg；Drawing 只用于消歧。
+* 第三阶段公开 pkg 保留源关系中的完整封装名，包括 drawing/code 和 pin 数；
+  器件型号、订购型号不能写入公开 pkg。
 * 不能为每张未匹配表生成 ``unresolved:table_id``，否则表数会被误当成封装数。
 * 两个槽位即使公开封装名相同也保持独立；只有建立槽位时的同一行/同一结构
   证据才能决定它们是不是同一个物理映射空间。
@@ -94,11 +97,15 @@ class PackageTargetTable:
 class PackageCatalogEntry:
     """一个已经冻结的物理封装槽位。
 
-    ``identity_name`` 是器件型号，只参与表格关联；``package_type`` 才是
-    最终 JSON 中允许公开的物理封装名称。
+    ``identity_name`` 是器件型号，只参与表格关联；``display_name`` 是第三
+    阶段确认的完整公开封装名。旧兼容路径没有该值时才使用
+    ``package_type``。
     """
 
     package_key: str
+    # 第三阶段确认的完整公开名称。内部 family/drawing/pin_count 字段继续
+    # 独立保留，供现有绑定逻辑匹配表题和表头。
+    display_name: str = ""
     identity_name: str = ""
     identity_aliases: list[str] = field(default_factory=list)
     package_type: str = ""
@@ -166,6 +173,7 @@ class PackageCatalogResolution:
 
 
 PackageCatalogClassifier = Callable[..., Mapping[str, Any]]
+PackageCategoryClassifier = Callable[..., Mapping[str, Any]]
 
 
 def resolve_document_package_catalog(
@@ -176,6 +184,7 @@ def resolve_document_package_catalog(
     source_name: str = "",
     use_semantic_classifier: bool = False,
     classifier: PackageCatalogClassifier | None = None,
+    category_classifier: PackageCategoryClassifier | None = None,
     document_page_count: int | None = None,
     toc_page_range: tuple[int, int] | None = None,
 ) -> PackageCatalogResolution:
@@ -198,6 +207,7 @@ def resolve_document_package_catalog(
         toc_page_range=toc_page_range,
         excluded_table_ids=target_table_ids,
     )
+    categories_resolved = False
     if use_semantic_classifier or classifier is not None:
         entries, semantic_diagnostics = classify_package_catalog_candidates(
             catalog_candidates,
@@ -207,28 +217,45 @@ def resolve_document_package_catalog(
         )
         diagnostics.extend(semantic_diagnostics)
 
+        # 第二阶段已经从原表读取完整 device-pkg 关系。第三阶段只综合这些
+        # 关系和已确认引脚表的表题/表头，确定文档类别；不生成表格绑定。
+        categorized_entries, category_diagnostics = resolve_package_categories(
+            entries,
+            target_tables=target_tables,
+            source_name=source_name,
+            classifier=category_classifier,
+        )
+        diagnostics.extend(category_diagnostics)
+        if categorized_entries:
+            entries = categorized_entries
+            categories_resolved = True
+
+    # 第三阶段成功后，类别数量已经冻结，旧的身份敏感去重不能再次改动。
+    # 只有第三阶段没有有效结果时，才执行原有兼容去重和表内分支补位。
     # 同一物理封装有时会被总述表和 Packaging Information 分别写成
     # ``(TSSOP-14) - PW`` 与 ``TSSOP / PW / 14``。冻结槽位前只合并物理
     # 元数据完全相同且身份不冲突的重复证据，不能合并不同器件身份。
-    before_deduplication = len(entries)
-    entries = deduplicate_redundant_catalog_entries(entries)
-    if len(entries) != before_deduplication:
-        diagnostics.append(
-            {
-                "stage": "package_catalog_deduplication",
-                "before": before_deduplication,
-                "after": len(entries),
-            }
-        )
+    if not categories_resolved:
+        before_deduplication = len(entries)
+        entries = deduplicate_redundant_catalog_entries(entries)
+        if len(entries) != before_deduplication:
+            diagnostics.append(
+                {
+                    "stage": "package_catalog_deduplication",
+                    "before": before_deduplication,
+                    "after": len(entries),
+                }
+            )
 
     # 总述表没有建立槽位时，严格确认的表内多封装结构可以提供槽位数量。
     # 如果仍无多封装证据，但存在目标引脚表，则整篇文档只建立一个槽位；
     # 绝不能按目标表数量建立槽位。
-    entries = merge_plan_package_labels(
-        entries,
-        target_tables=target_tables,
-        multi_package_plans=multi_package_plans,
-    )
+    if not categories_resolved:
+        entries = merge_plan_package_labels(
+            entries,
+            target_tables=target_tables,
+            multi_package_plans=multi_package_plans,
+        )
     if not entries and target_tables:
         entries = [
             PackageCatalogEntry(
@@ -520,6 +547,251 @@ def classify_package_catalog_candidates(
         target_tables=target_tables,
     )
     return entries, diagnostics
+
+
+def resolve_package_categories(
+    entries: Sequence[PackageCatalogEntry],
+    *,
+    target_tables: Sequence[PackageTargetTable],
+    source_name: str,
+    classifier: PackageCategoryClassifier | None = None,
+) -> tuple[list[PackageCatalogEntry], list[dict[str, Any]]]:
+    """综合总述关系和目标表表题/表头，确定文档级 pkg 类别。
+
+    本函数是第三次模型调用的唯一入口。它不调用 ``bind_target_tables``，也
+    不产生任何 ``PackageAssignment``。模型只负责把源关系划分类别；完整
+    pkg 名称、器件身份和物理元数据都由代码从第二阶段结果中回填。
+    """
+
+    relations = build_device_package_relations(entries)
+    if not relations or not target_tables:
+        return [], [
+            {
+                "stage": "package_category",
+                "status": "skipped",
+                "reason": (
+                    "no_device_package_relations"
+                    if not relations
+                    else "no_confirmed_pin_tables"
+                ),
+            }
+        ]
+
+    try:
+        if classifier is None:
+            from extract.semantic_classifier import (
+                classify_document_package_categories,
+            )
+
+            response = classify_document_package_categories(
+                [public_category_relation(relation) for relation in relations],
+                target_tables,
+                source_name=source_name,
+            )
+        else:
+            response = classifier(
+                [public_category_relation(relation) for relation in relations],
+                target_tables,
+                source_name,
+            )
+    except Exception as exc:
+        # 类别调用是增强阶段。瞬时 API 错误时保留第二阶段关系进入既有兼容
+        # 路径，不能因为一次额外请求失败而清空整个 PDF。
+        return [], [
+            {
+                "stage": "package_category",
+                "status": "error",
+                "reason": str(exc),
+                "relation_count": len(relations),
+            }
+        ]
+
+    categorized = build_entries_from_category_response(
+        entries,
+        relations,
+        response,
+    )
+    diagnostics = [
+        {
+            "stage": "package_category",
+            "status": "accepted" if categorized else "invalid_or_empty",
+            "relation_count": len(relations),
+            "target_table_count": len(target_tables),
+            "category_count": len(categorized),
+            "categories": [
+                {
+                    "pkg": entry.display_name,
+                    "identity_name": entry.identity_name,
+                    "identity_aliases": list(entry.identity_aliases),
+                    "package_type": entry.package_type,
+                    "package_drawing": entry.package_drawing,
+                    "pin_count": entry.pin_count,
+                }
+                for entry in categorized
+            ],
+        }
+    ]
+    return categorized, diagnostics
+
+
+def build_device_package_relations(
+    entries: Sequence[PackageCatalogEntry],
+) -> list[dict[str, Any]]:
+    """把第二阶段目录条目展开成完整 device-pkg 关系。
+
+    同一目录项中的身份别名分别形成关系，但都指回同一个源条目。匿名包装
+    元数据也保留为空 device 的关系，使只有 Packaging Information 的文档
+    仍可参与类别判断。
+    """
+
+    relations: list[dict[str, Any]] = []
+    for entry_index, entry in enumerate(entries):
+        pkg = complete_package_name(entry)
+        if not pkg:
+            continue
+        devices = [entry.identity_name, *entry.identity_aliases]
+        devices = [device for device in devices if device] or [""]
+        seen_devices: set[str] = set()
+        for device_index, device in enumerate(devices):
+            normalized_device = normalize_compact(device)
+            if normalized_device in seen_devices:
+                continue
+            seen_devices.add(normalized_device)
+            relations.append(
+                {
+                    "relation_id": f"rel:{entry_index}:{device_index}",
+                    "device": device,
+                    "pkg": pkg,
+                    "entry_index": entry_index,
+                }
+            )
+    return relations
+
+
+def public_category_relation(relation: Mapping[str, Any]) -> dict[str, str]:
+    """移除内部 entry_index，只把项目约定的三项发送给类别模型。"""
+
+    return {
+        "relation_id": str(relation.get("relation_id", "")),
+        "device": str(relation.get("device", "")),
+        "pkg": str(relation.get("pkg", "")),
+    }
+
+
+def complete_package_name(entry: PackageCatalogEntry) -> str:
+    """组合完整 pkg 展示名，保留 drawing/code 和 pin/ball 数量。"""
+
+    package_type = clean_metadata(entry.package_type)
+    drawing = clean_metadata(entry.package_drawing)
+    pin_count = clean_pin_count(entry.pin_count)
+    if not package_type:
+        package_type = drawing
+        drawing = ""
+    if not package_type:
+        return ""
+
+    parts = [package_type]
+    if drawing and normalize_compact(drawing) not in normalize_compact(package_type):
+        parts.append(f"({drawing})")
+    result = " ".join(parts)
+    if pin_count and not re.search(
+        rf"(?<!\d){re.escape(pin_count)}\s*[- ]?\s*(?:pin|ball)s?(?![a-z])",
+        result,
+        flags=re.IGNORECASE,
+    ):
+        result = f"{result} {pin_count}-pin"
+    return re.sub(r"\s+", " ", result).strip()
+
+
+def build_entries_from_category_response(
+    source_entries: Sequence[PackageCatalogEntry],
+    relations: Sequence[Mapping[str, Any]],
+    response: Mapping[str, Any],
+) -> list[PackageCatalogEntry]:
+    """把类别模型的关系分组转换回现有目录条目。
+
+    pkg 必须逐字等于当前类别某条关系的 pkg；关系不能跨类别重复。模型只
+    能分组，不能修改公开名称或内部匹配元数据。
+    """
+
+    relation_by_id = {
+        str(relation.get("relation_id", "")): relation
+        for relation in relations
+    }
+    used_relation_ids: set[str] = set()
+    result: list[PackageCatalogEntry] = []
+    invalid_response = False
+    for item in response.get("categories") or []:
+        if not isinstance(item, Mapping):
+            invalid_response = True
+            continue
+        relation_ids = []
+        for raw_relation_id in item.get("relation_ids") or []:
+            relation_id = str(raw_relation_id)
+            if (
+                relation_id not in relation_by_id
+                or relation_id in used_relation_ids
+                or relation_id in relation_ids
+            ):
+                invalid_response = True
+                continue
+            relation_ids.append(relation_id)
+        if not relation_ids:
+            invalid_response = True
+            continue
+
+        pkg = str(item.get("pkg") or "")
+        valid_pkg_values = {
+            str(relation_by_id[relation_id].get("pkg") or "")
+            for relation_id in relation_ids
+        }
+        if not pkg or pkg not in valid_pkg_values:
+            invalid_response = True
+            continue
+
+        entry_indexes = []
+        for relation_id in relation_ids:
+            entry_index = int(relation_by_id[relation_id]["entry_index"])
+            if entry_index not in entry_indexes:
+                entry_indexes.append(entry_index)
+        members = [source_entries[index] for index in entry_indexes]
+        representative = next(
+            (
+                member
+                for member in members
+                if complete_package_name(member) == pkg
+            ),
+            members[0],
+        )
+        identities: list[str] = []
+        evidence_table_ids: list[int] = []
+        for member in members:
+            for identity in [member.identity_name, *member.identity_aliases]:
+                if identity and identity not in identities:
+                    identities.append(identity)
+            for table_id in member.evidence_table_ids:
+                if table_id not in evidence_table_ids:
+                    evidence_table_ids.append(table_id)
+
+        result.append(
+            PackageCatalogEntry(
+                package_key="",
+                display_name=pkg,
+                identity_name=identities[0] if identities else "",
+                identity_aliases=identities[1:],
+                package_type=representative.package_type,
+                package_drawing=representative.package_drawing,
+                pin_count=representative.pin_count,
+                evidence_table_ids=evidence_table_ids,
+            )
+        )
+        used_relation_ids.update(relation_ids)
+
+    # 第三阶段负责确定整篇文档的类别，不能只返回一部分“容易判断”的关系。
+    # 不完整结果整体作废，由调用方进入旧兼容路径，避免类别数量静默减少。
+    if invalid_response or used_relation_ids != set(relation_by_id):
+        return []
+    return result
 
 
 def package_catalog_decision_from_response(
@@ -1840,7 +2112,8 @@ def assignment_from_entry(
     return PackageAssignment(
         package_key=entry.package_key,
         pkg=(
-            clean_public_package_name(entry.package_type)
+            clean_metadata(entry.display_name)
+            or clean_public_package_name(entry.package_type)
             or alphabetic_slot_name(slot_index)
         ),
         reason=reason,

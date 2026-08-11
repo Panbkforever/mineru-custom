@@ -4,10 +4,12 @@ from unittest.mock import patch
 
 import extract.pin_package_extractor as pin_extractor
 from extract.package_catalog_resolver import (
+    PackageCatalogEntry,
     PackageCatalogTable,
     PackageTargetTable,
     clean_package_name,
     find_package_catalog_candidates,
+    resolve_package_categories,
     resolve_document_package_catalog,
 )
 from extract.multi_package_extractor import MultiPackagePlan, PackageBinding
@@ -16,7 +18,276 @@ from extract.pin_package_extractor import (
     TableCandidate,
     TableDecision,
 )
-from extract.semantic_classifier import normalize_package_catalog_response
+from extract.semantic_classifier import (
+    classify_document_package_categories,
+    normalize_document_package_categories,
+    normalize_package_catalog_response,
+)
+
+
+def test_category_response_must_cover_every_relation_and_copy_pkg_exactly():
+    relations = [
+        {"relation_id": "rel:0", "device": "DEV-A", "pkg": "QFN (RGT) 16-pin"},
+        {"relation_id": "rel:1", "device": "DEV-B", "pkg": "QFN (RGV) 16-pin"},
+    ]
+
+    incomplete = normalize_document_package_categories(
+        {
+            "categories": [
+                {
+                    "category_id": "pkg_0",
+                    "pkg": "QFN (RGT) 16-pin",
+                    "relation_ids": ["rel:0"],
+                }
+            ]
+        },
+        relations=relations,
+        expected_relation_ids={"rel:0", "rel:1"},
+    )
+    fabricated = normalize_document_package_categories(
+        {
+            "categories": [
+                {
+                    "category_id": "pkg_0",
+                    "pkg": "QFN",
+                    "relation_ids": ["rel:0", "rel:1"],
+                }
+            ]
+        },
+        relations=relations,
+        expected_relation_ids={"rel:0", "rel:1"},
+    )
+    duplicated = normalize_document_package_categories(
+        {
+            "categories": [
+                {
+                    "category_id": "pkg_0",
+                    "pkg": "QFN (RGT) 16-pin",
+                    "relation_ids": ["rel:0"],
+                },
+                {
+                    "category_id": "pkg_1",
+                    "pkg": "QFN (RGV) 16-pin",
+                    "relation_ids": ["rel:0", "rel:1"],
+                },
+            ]
+        },
+        relations=relations,
+        expected_relation_ids={"rel:0", "rel:1"},
+    )
+
+    assert incomplete == {"categories": []}
+    assert fabricated == {"categories": []}
+    assert duplicated == {"categories": []}
+
+
+def test_category_model_request_contains_only_relations_and_pin_table_headers():
+    relations = [
+        {"relation_id": "rel:0", "device": "DEV-A", "pkg": "QFN (RGT) 16-pin"},
+    ]
+    target = target_table(
+        9,
+        "Table 5-1. DEV-A Pin Functions",
+        ["PIN > NAME", "PIN > QFN NO.", "SIGNAL TYPE"],
+    )
+    captured = {}
+
+    def fake_call(payload, **kwargs):
+        captured["payload"] = payload
+        captured["kwargs"] = kwargs
+        return {
+            "categories": [
+                {
+                    "category_id": "pkg_0",
+                    "pkg": "QFN (RGT) 16-pin",
+                    "relation_ids": ["rel:0"],
+                }
+            ]
+        }
+
+    with (
+        patch.dict("os.environ", {"DEEPSEEK_API_KEY": "test-key"}),
+        patch("extract.semantic_classifier.call_model_json", side_effect=fake_call),
+    ):
+        response = classify_document_package_categories(
+            relations,
+            [target],
+            source_name="device.pdf",
+        )
+
+    assert response["categories"][0]["pkg"] == "QFN (RGT) 16-pin"
+    assert captured["payload"]["device_pkg_relations"] == relations
+    assert captured["payload"]["confirmed_pin_tables"] == [
+        {
+            "table_id": 9,
+            "title": "Table 5-1. DEV-A Pin Functions",
+            "headers": ["PIN > NAME", "PIN > QFN NO.", "SIGNAL TYPE"],
+        }
+    ]
+    assert "table_bindings" not in captured["payload"]["output_schema"]
+
+
+def test_document_category_call_only_groups_relations_and_preserves_full_pkg():
+    entries = [
+        PackageCatalogEntry(
+            package_key="",
+            identity_name="DEV-A1",
+            package_type="QFN",
+            package_drawing="RGT",
+            pin_count="16",
+        ),
+        PackageCatalogEntry(
+            package_key="",
+            identity_name="DEV-A2",
+            package_type="QFN",
+            package_drawing="RGT",
+            pin_count="16",
+        ),
+    ]
+    target = target_table(
+        7,
+        "Table 5-1. DEV-A QFN Pin Functions",
+        ["PIN > NAME", "PIN > QFN 16 NO.", "SIGNAL TYPE"],
+    )
+    captured = {}
+
+    def category_classifier(relations, target_tables, source_name):
+        captured["relations"] = relations
+        captured["target_tables"] = target_tables
+        captured["source_name"] = source_name
+        return {
+            "categories": [
+                {
+                    "category_id": "pkg_0",
+                    "pkg": "QFN (RGT) 16-pin",
+                    "relation_ids": [item["relation_id"] for item in relations],
+                }
+            ]
+        }
+
+    categorized, diagnostics = resolve_package_categories(
+        entries,
+        target_tables=[target],
+        source_name="device.pdf",
+        classifier=category_classifier,
+    )
+
+    assert len(categorized) == 1
+    assert categorized[0].display_name == "QFN (RGT) 16-pin"
+    assert categorized[0].identity_name == "DEV-A1"
+    assert categorized[0].identity_aliases == ["DEV-A2"]
+    assert captured["source_name"] == "device.pdf"
+    assert captured["target_tables"] == [target]
+    assert set(captured["relations"][0]) == {"relation_id", "device", "pkg"}
+    assert diagnostics[0]["status"] == "accepted"
+
+
+def test_category_failure_keeps_existing_catalog_compatibility_path():
+    summary = catalog_table(
+        0,
+        "Device Information",
+        ["DEVICE", "PACKAGE", "DRAWING", "PINS"],
+        [
+            ["DEVICE", "PACKAGE", "DRAWING", "PINS"],
+            ["DEV-A", "QFN", "RGT", "16"],
+            ["DEV-B", "QFN", "RGV", "16"],
+        ],
+    )
+    targets = [
+        target_table(1, "DEV-A Pin Functions", ["PIN NO", "PIN NAME"]),
+        target_table(2, "DEV-B Pin Functions", ["PIN NO", "PIN NAME"]),
+    ]
+
+    def catalog_classifier(table, source_name, target_tables):
+        return {
+            "is_package_summary": True,
+            "table_role": "identity_summary",
+            "header_row_index": 0,
+            "columns": [
+                {"column_index": 0, "role": "package_identity"},
+                {"column_index": 1, "role": "package_type"},
+                {"column_index": 2, "role": "package_drawing"},
+                {"column_index": 3, "role": "pin_count"},
+            ],
+        }
+
+    def failed_category_classifier(relations, target_tables, source_name):
+        raise TimeoutError("temporary category timeout")
+
+    result = resolve_document_package_catalog(
+        all_tables=[summary],
+        target_tables=targets,
+        multi_package_plans={
+            target.table_id: MultiPackagePlan(False, "single_package")
+            for target in targets
+        },
+        use_semantic_classifier=True,
+        classifier=catalog_classifier,
+        category_classifier=failed_category_classifier,
+    )
+
+    assert len(result.entries) == 2
+    assert any(
+        item.get("stage") == "package_category" and item.get("status") == "error"
+        for item in result.diagnostics
+    )
+
+
+def test_successful_category_stage_exposes_full_pkg_without_changing_binding():
+    summary = catalog_table(
+        0,
+        "Device Information",
+        ["DEVICE", "PACKAGE", "DRAWING", "PINS"],
+        [
+            ["DEVICE", "PACKAGE", "DRAWING", "PINS"],
+            ["DEV-A", "QFN", "RGT", "16"],
+        ],
+    )
+    target = target_table(
+        1,
+        "Table 5-1. DEV-A Pin Functions",
+        ["PIN > NAME", "PIN > NO.", "SIGNAL TYPE"],
+    )
+
+    def catalog_classifier(table, source_name, target_tables):
+        return {
+            "is_package_summary": True,
+            "table_role": "identity_summary",
+            "header_row_index": 0,
+            "columns": [
+                {"column_index": 0, "role": "package_identity"},
+                {"column_index": 1, "role": "package_type"},
+                {"column_index": 2, "role": "package_drawing"},
+                {"column_index": 3, "role": "pin_count"},
+            ],
+        }
+
+    def category_classifier(relations, target_tables, source_name):
+        assert len(relations) == 1
+        assert target_tables == [target]
+        return {
+            "categories": [
+                {
+                    "category_id": "pkg_0",
+                    "pkg": relations[0]["pkg"],
+                    "relation_ids": [relations[0]["relation_id"]],
+                }
+            ]
+        }
+
+    result = resolve_document_package_catalog(
+        all_tables=[summary],
+        target_tables=[target],
+        multi_package_plans={1: MultiPackagePlan(False, "single_package")},
+        use_semantic_classifier=True,
+        classifier=catalog_classifier,
+        category_classifier=category_classifier,
+    )
+
+    assert len(result.entries) == 1
+    assert result.entries[0].display_name == "QFN (RGT) 16-pin"
+    assert result.assignment_for(1, 0).pkg == "QFN (RGT) 16-pin"
+    assert result.assignment_for(1, 0).reason == "table_title_or_header"
 
 
 def catalog_table(table_id, title, headers, rows, page_idx=0):
@@ -612,22 +883,29 @@ def test_full_pipeline_uses_catalog_name_without_changing_pin_mapping():
         ColumnDecision(2, "TYPE", "type"),
     ]
 
-    def package_classifier(table, source_name, target_tables):
-        if table.title != "Device Information":
-            return {
-                "is_package_summary": False,
-                "table_role": "irrelevant",
-                "header_row_index": 0,
-                "columns": [],
-            }
+    def package_batch_classifier(tables, **_kwargs):
+        """模拟生产环境当前使用的四表批量协议。"""
+
         return {
-            "is_package_summary": True,
-            "table_role": "identity_summary",
-            "header_row_index": 0,
-            "columns": [
-                {"column_index": 0, "role": "package_identity"},
-                {"column_index": 1, "role": "package_type"},
-            ],
+            request_id: (
+                {
+                    "is_package_summary": True,
+                    "table_role": "identity_summary",
+                    "header_row_index": 0,
+                    "columns": [
+                        {"column_index": 0, "role": "package_identity"},
+                        {"column_index": 1, "role": "package_type"},
+                    ],
+                }
+                if table.title == "Device Information"
+                else {
+                    "is_package_summary": False,
+                    "table_role": "irrelevant",
+                    "header_row_index": 0,
+                    "columns": [],
+                }
+            )
+            for request_id, table in tables
         }
 
     with (
@@ -637,8 +915,12 @@ def test_full_pipeline_uses_catalog_name_without_changing_pin_mapping():
             return_value={1: TableDecision(True, columns=columns)},
         ),
         patch(
-            "extract.semantic_classifier.classify_package_catalog_table",
-            side_effect=package_classifier,
+            "extract.semantic_classifier.classify_package_catalog_tables",
+            side_effect=package_batch_classifier,
+        ),
+        patch(
+            "extract.semantic_classifier.classify_document_package_categories",
+            side_effect=TimeoutError("category compatibility fallback"),
         ),
     ):
         result = pin_extractor.extract_pin_package_info_from_table_candidates(
@@ -838,8 +1120,15 @@ def test_full_pipeline_skips_unresolved_table_before_row_extraction():
             return_value={1: TableDecision(True, columns=columns)},
         ),
         patch(
-            "extract.semantic_classifier.classify_package_catalog_table",
-            side_effect=identity_catalog_classifier,
+            "extract.semantic_classifier.classify_package_catalog_tables",
+            side_effect=lambda tables, **_kwargs: {
+                request_id: identity_catalog_classifier(table, "", ())
+                for request_id, table in tables
+            },
+        ),
+        patch(
+            "extract.semantic_classifier.classify_document_package_categories",
+            side_effect=TimeoutError("category compatibility fallback"),
         ),
     ):
         result = pin_extractor.extract_pin_package_info_from_table_candidates(
