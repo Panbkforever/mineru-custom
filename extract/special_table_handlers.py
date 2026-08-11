@@ -5,6 +5,9 @@
 
 当前特殊情况：
 
+* ``mii_rmii_rgmii_pin_mux_table_filter``：处理表头固定为 ``Pin No.``、
+  ``MII MAC``、``MII PHY``、``RMII MAC``、``RMII PHY``、``RGMII`` 的
+  以太网接口复用矩阵；整表直接过滤，禁止把编号列误当成独立引脚清单。
 * ``reserved_pin_table_handler``：处理只有物理引脚/球号和连接要求的
   Reserved/NC 表。只保留明确要求悬空或禁止连接的行；明确说明封装中不存在
   的位置不作为物理引脚输出。
@@ -50,6 +53,7 @@ def find_special_table_match(
     """依次调用每一种特殊处理函数，返回第一个完整命中的结果。"""
 
     handlers = (
+        mii_rmii_rgmii_pin_mux_table_filter,
         register_word_pin_affected_table_filter,
         reserved_pin_table_handler,
     )
@@ -58,6 +62,51 @@ def find_special_table_match(
         if match is not None:
             return match
     return None
+
+
+def mii_rmii_rgmii_pin_mux_table_filter(
+    title: str,
+    headers: list[str],
+    data_rows: list[list[str]],
+) -> SpecialTableMatch | None:
+    """过滤固定六列表头的 MII/RMII/RGMII 引脚复用矩阵。
+
+    这种表以 ``Pin No.`` 为行主轴，其余五列描述同一物理引脚在不同以太网
+    工作模式下的复用功能，不是“每行一个编号、名称和类型”的物理引脚定义表。
+
+    该规则只按完整表头结构命中，不依赖中文或英文表题。必须同时满足：
+
+    1. 恰好有六个非空表头；
+    2. 第一列是明确的 Pin/Ball/Terminal 物理编号表头；
+    3. 后五列按顺序严格为 MII MAC、MII PHY、RMII MAC、RMII PHY、RGMII。
+
+    少列、多列、改序或普通 ``Pin No.`` 引脚表都不会命中，继续走原流程。
+    """
+
+    normalized_headers = [
+        normalize_header_text(header)
+        for header in headers
+        if normalize_header_text(header)
+    ]
+    if len(normalized_headers) != 6:
+        return None
+    if not is_direct_physical_number_header(normalized_headers[0]):
+        return None
+    if normalized_headers[1:] != [
+        "mii mac",
+        "mii phy",
+        "rmii mac",
+        "rmii phy",
+        "rgmii",
+    ]:
+        return None
+
+    return SpecialTableMatch(
+        handler_name="mii_rmii_rgmii_pin_mux_table_filter",
+        columns=(),
+        included_row_indexes=frozenset(),
+        should_extract=False,
+    )
 
 
 def register_word_pin_affected_table_filter(

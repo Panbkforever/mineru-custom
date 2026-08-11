@@ -8,12 +8,51 @@ from extract.pin_package_extractor import (
 )
 from extract.special_table_handlers import (
     find_special_table_match,
+    mii_rmii_rgmii_pin_mux_table_filter,
     register_word_pin_affected_table_filter,
 )
 
 
 class SpecialTableHandlersTest(unittest.TestCase):
     """验证特殊规则的严格命中条件和普通表保护边界。"""
+
+    def test_mii_rmii_rgmii_pin_mux_table_is_rejected(self) -> None:
+        """固定六列表头的以太网复用矩阵必须在模型前直接过滤。"""
+
+        match = mii_rmii_rgmii_pin_mux_table_filter(
+            "表 7-3 GMAC1 Pin 复用表",
+            ["Pin No.", "MII MAC", "MII PHY", "RMII MAC", "RMII PHY", "RGMII"],
+            [["56", "M1M_CRS", "-", "-", "-", "-"]],
+        )
+
+        self.assertIsNotNone(match)
+        self.assertFalse(match.should_extract)
+        self.assertEqual(match.handler_name, "mii_rmii_rgmii_pin_mux_table_filter")
+
+        table = TableCandidate(
+            html=(
+                "<table>"
+                "<tr><td>Pin No.</td><td>MII MAC</td><td>MII PHY</td>"
+                "<td>RMII MAC</td><td>RMII PHY</td><td>RGMII</td></tr>"
+                "<tr><td>56</td><td>M1M_CRS</td><td>-</td>"
+                "<td>-</td><td>-</td><td>-</td></tr>"
+                "</table>"
+            ),
+            page_idx=0,
+            title="表 7-3 GMAC1 Pin 复用表",
+        )
+        self.assertEqual(extract_pin_package_info_from_table_candidates([table]), [])
+
+    def test_partial_ethernet_mode_headers_do_not_match(self) -> None:
+        """模式列不完整时不得扩大特殊过滤范围。"""
+
+        match = find_special_table_match(
+            "Pin Functions",
+            ["Pin No.", "MII MAC", "MII PHY", "RGMII"],
+            [["56", "M1M_CRS", "-", "-"]],
+        )
+
+        self.assertIsNone(match)
 
     def test_word_bit_table_with_pin_affected_is_rejected(self) -> None:
         """PIN AFFECTED 是寄存器辅助列时，整表必须在模型前过滤。"""
