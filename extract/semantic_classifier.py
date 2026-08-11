@@ -9,9 +9,7 @@
 
 ``classify_table_schema`` 不判断封装名、分组名或表格角色，也不生成最终引脚
 记录。文档级封装总述表使用独立的 ``classify_package_catalog_table`` 请求和
-返回协议。总述关系读取完成后，``classify_document_package_categories`` 每篇
-文档只调用一次，综合完整 device-pkg 关系与已确认引脚表的表题、表头，
-只确定类别数量和完整 pkg 名称。三个协议不能复用返回字段。
+返回协议，两种任务不能复用返回字段。
 """
 
 from __future__ import annotations
@@ -240,93 +238,6 @@ def classify_package_catalog_tables(
     return normalize_package_catalog_batch_response(
         response,
         {request_id for request_id, _ in tables},
-    )
-
-
-def classify_document_package_categories(
-    relations: Sequence[dict[str, Any]],
-    target_tables: Sequence[Any],
-    *,
-    source_name: str = "",
-) -> dict[str, Any]:
-    """每篇 PDF 一次性确定 pkg 类别数量和完整名称。
-
-    ``relations`` 已由第二阶段从原表确定性读取，模型不能再修改 device 或
-    pkg。目标引脚表这里只提供完整表题和表头作为全局分类证据；本请求不做
-    逐表绑定，因此返回协议中没有 table_id 到 category_id 的映射。
-    """
-
-    if not relations:
-        return {"categories": []}
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    if not api_key:
-        raise RuntimeError("启用文档级封装分类需要先设置环境变量 DEEPSEEK_API_KEY")
-
-    relation_ids = {
-        str(relation.get("relation_id", ""))
-        for relation in relations
-        if str(relation.get("relation_id", ""))
-    }
-    payload = {
-        "task": (
-            "Determine only how many independent package/pinout categories exist in "
-            "this document and the complete package name of each category. Use both "
-            "the extracted device-package relations and the titles/headers of tables "
-            "already confirmed as pin tables. Do not bind individual tables."
-        ),
-        "rules": [
-            "Every device and pkg value is source text already extracted from the document; never rewrite, shorten or invent either value.",
-            "The complete pkg includes its package family, drawing/code when present, and physical pin/ball count when present.",
-            "Use pin-table titles and complete headers only to decide which source relations represent distinct package pinout categories.",
-            "Different device rows may belong to one category when the global pin-table evidence shows that they share one package pinout mapping.",
-            "Do not merge categories only because their short package family is the same.",
-            "pkg must be copied exactly from one input relation assigned to that category.",
-            "relation_ids may only contain IDs from the input and one relation ID may appear in at most one category.",
-            "Return category determination only. Do not return table bindings, pin columns, group names, confidence, reasons or pin records.",
-        ],
-        "document": {"source_name": source_name},
-        "device_pkg_relations": [
-            {
-                "relation_id": str(relation.get("relation_id", "")),
-                "device": str(relation.get("device", "")),
-                "pkg": str(relation.get("pkg", "")),
-            }
-            for relation in relations
-        ],
-        "confirmed_pin_tables": [
-            {
-                "table_id": getattr(table, "table_id", None),
-                "title": getattr(table, "title", ""),
-                "headers": list(getattr(table, "headers", ()) or ()),
-            }
-            for table in target_tables
-        ],
-        "output_schema": {
-            "categories": [
-                {
-                    "category_id": "pkg_0",
-                    "pkg": "copied exactly from one input relation",
-                    "relation_ids": ["relation IDs belonging to this category"],
-                }
-            ]
-        },
-    }
-    response = call_model_json(
-        payload,
-        api_key=api_key,
-        system_prompt=(
-            "You determine document-level semiconductor package categories from "
-            "source-grounded device-package relations and confirmed pin-table "
-            "titles/headers. Return valid JSON containing only categories. Never "
-            "bind tables or alter package names."
-        ),
-        max_tokens=int(os.getenv("EXTRACT_CATEGORY_MAX_TOKENS", "3000")),
-        timeout=float(os.getenv("EXTRACT_CATEGORY_TIMEOUT", "60")),
-    )
-    return normalize_document_package_categories(
-        response,
-        relations=relations,
-        expected_relation_ids=relation_ids,
     )
 
 
@@ -649,78 +560,6 @@ def normalize_package_catalog_batch_response(
             continue
         normalized[request_id] = normalize_package_catalog_response(item)
     return normalized
-
-
-def normalize_document_package_categories(
-    response: dict[str, Any],
-    *,
-    relations: Sequence[dict[str, Any]],
-    expected_relation_ids: set[str],
-) -> dict[str, Any]:
-    """校验文档级类别结果，pkg 必须逐字来自第二阶段关系。
-
-    类别模型只负责分组。这里拒绝不存在的关系、重复使用同一关系、重复
-    category_id，以及模型自行改写的 pkg，避免第三阶段污染原始封装名称。
-    """
-
-    pkg_by_relation_id = {
-        str(relation.get("relation_id", "")): str(relation.get("pkg", ""))
-        for relation in relations
-        if str(relation.get("relation_id", ""))
-    }
-    categories: list[dict[str, Any]] = []
-    seen_category_ids: set[str] = set()
-    used_relation_ids: set[str] = set()
-    invalid_response = False
-    for index, item in enumerate(response.get("categories") or []):
-        if not isinstance(item, dict):
-            invalid_response = True
-            continue
-        category_id = str(item.get("category_id") or f"pkg_{index}").strip()
-        if not category_id or category_id in seen_category_ids:
-            invalid_response = True
-            continue
-
-        relation_ids: list[str] = []
-        for raw_relation_id in item.get("relation_ids") or []:
-            relation_id = str(raw_relation_id)
-            if (
-                relation_id not in expected_relation_ids
-                or relation_id in used_relation_ids
-                or relation_id in relation_ids
-            ):
-                invalid_response = True
-                continue
-            relation_ids.append(relation_id)
-        if not relation_ids:
-            invalid_response = True
-            continue
-
-        pkg = str(item.get("pkg") or "")
-        # 完整名称必须精确复制自当前类别包含的一条源关系。
-        valid_pkg_values = {
-            pkg_by_relation_id[relation_id]
-            for relation_id in relation_ids
-            if pkg_by_relation_id.get(relation_id)
-        }
-        if not pkg or pkg not in valid_pkg_values:
-            invalid_response = True
-            continue
-
-        seen_category_ids.add(category_id)
-        used_relation_ids.update(relation_ids)
-        categories.append(
-            {
-                "category_id": category_id,
-                "pkg": pkg,
-                "relation_ids": relation_ids,
-            }
-        )
-    # 模型必须对本次输入的全部关系完成一次且仅一次的分类。漏项通常表示
-    # 截断、限流后的不完整 JSON 或模型擅自忽略数据，不能作为类别真值。
-    if invalid_response or used_relation_ids != expected_relation_ids:
-        return {"categories": []}
-    return {"categories": categories}
 
 
 def normalize_schema_field(field: str) -> str:
