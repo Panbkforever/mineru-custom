@@ -50,6 +50,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from extract.multi_PkgTab_extractor import (
+    MultiPkgTabResolution,
+    catalog_groups_confirmed_by_target_tables,
+    resolve_multi_pkg_tab_structure,
+)
+
 
 class PackageBindingLike(Protocol):
     """多封装绑定对象在本模块中需要的最小字段集合。"""
@@ -221,6 +227,21 @@ def resolve_document_package_catalog(
             }
         )
 
+    # 第二次模型只给出封装目录，不负责判断这些封装是位于同一张表的不同
+    # 字段，还是分别位于多张表。这里先完成文档结构分流，再冻结 slot。
+    multi_pkg_tab_resolution = resolve_multi_pkg_tab_structure(
+        target_tables=target_tables,
+        catalog_entries=entries,
+        multi_package_plans=multi_package_plans,
+    )
+    diagnostics.extend(multi_pkg_tab_resolution.diagnostics)
+    entries = reconcile_multi_pkg_tab_catalog(
+        entries,
+        all_tables=all_tables,
+        resolution=multi_pkg_tab_resolution,
+        diagnostics=diagnostics,
+    )
+
     # 总述表没有建立槽位时，严格确认的表内多封装结构可以提供槽位数量。
     # 如果仍无多封装证据，但存在目标引脚表，则整篇文档只建立一个槽位；
     # 绝不能按目标表数量建立槽位。
@@ -244,6 +265,7 @@ def resolve_document_package_catalog(
         entries=entries,
         target_tables=target_tables,
         multi_package_plans=multi_package_plans,
+        multi_pkg_tab_resolution=multi_pkg_tab_resolution,
         diagnostics=diagnostics,
     )
     return PackageCatalogResolution(entries, assignments, diagnostics)
@@ -1238,6 +1260,198 @@ def merge_redundant_catalog_evidence(
             target.pin_count = incoming.pin_count
 
 
+def reconcile_multi_pkg_tab_catalog(
+    entries: Sequence[PackageCatalogEntry],
+    *,
+    all_tables: Sequence[PackageCatalogTable],
+    resolution: MultiPkgTabResolution,
+    diagnostics: list[dict[str, Any]],
+) -> list[PackageCatalogEntry]:
+    """用跨表引脚表证据整理第二次模型得到的封装目录。
+
+    本函数只在槽位冻结前工作：同一 Drawing/pin_count 被多张目标表明确证明
+    为同一分支时，允许合并不同订购型号产生的重复目录项；目标表明确出现
+    一个目录中缺失的分支时，补建匿名槽位并把局部标签保存为内部别名。
+    公开 pkg 仍只来自 package_type，分支标签不会泄漏到最终名称。
+    """
+
+    result = list(entries)
+    index_to_entry = {
+        index: entry
+        for index, entry in enumerate(entries)
+    }
+
+    # 只有目标表按 Drawing 明确归为同一分支时才跨身份合并。原有目录去重
+    # 仍保持严格，避免仅凭相同 QFN/BGA 封装族误合并不同引脚映射。
+    for index_group in catalog_groups_confirmed_by_target_tables(resolution):
+        available = [
+            index_to_entry[index]
+            for index in index_group
+            if index in index_to_entry
+        ]
+        unique_available = list({id(entry): entry for entry in available}.values())
+        if len(unique_available) < 2:
+            continue
+        target = unique_available[0]
+        for incoming in unique_available[1:]:
+            merge_redundant_catalog_evidence(target, incoming)
+            if incoming in result:
+                result.remove(incoming)
+        for index in index_group:
+            index_to_entry[index] = target
+        diagnostics.append(
+            {
+                "stage": "multi_pkg_tab_catalog_merge",
+                "catalog_entry_indexes": list(index_group),
+                "identity_name": target.identity_name,
+                "identity_aliases": list(target.identity_aliases),
+                "package_drawing": target.package_drawing,
+                "pin_count": target.pin_count,
+            }
+        )
+
+    supported_entry_ids: set[int] = set()
+    for branch in resolution.branches:
+        matched_entries = list(
+            {
+                id(index_to_entry[index]): index_to_entry[index]
+                for index in branch.catalog_entry_indexes
+                if index in index_to_entry
+            }.values()
+        )
+
+        # 目录索引不足时，再用精确分支标签匹配整理后的目录。只接受唯一项，
+        # 多项同名仍保持歧义，不能选择第一个。
+        if not matched_entries:
+            matched_entries = _entries_matching_exact_branch_label(
+                result,
+                branch.label,
+            )
+
+        if len(matched_entries) == 1:
+            entry = matched_entries[0]
+            _append_internal_binding_alias(entry, branch.label)
+            supported_entry_ids.add(id(entry))
+            diagnostics.append(
+                {
+                    "stage": "multi_pkg_tab_catalog_support",
+                    "branch_key": branch.branch_key,
+                    "branch_label": branch.label,
+                    "table_ids": list(branch.table_ids),
+                    "status": "matched_catalog_entry",
+                }
+            )
+            continue
+
+        # 只有已经形成至少两个跨表分支时，局部标签才能证明目录确实漏掉了
+        # 一个槽位。单个普通标题不能单独扩大文档 pkg 数量。
+        if (
+            not matched_entries
+            and resolution.document_mode
+            in {"cross_table_multi_package", "mixed_multi_package"}
+        ):
+            entry = PackageCatalogEntry(
+                package_key="",
+                identity_aliases=[branch.label],
+                evidence_table_ids=list(branch.table_ids),
+            )
+            result.append(entry)
+            supported_entry_ids.add(id(entry))
+            diagnostics.append(
+                {
+                    "stage": "multi_pkg_tab_catalog_support",
+                    "branch_key": branch.branch_key,
+                    "branch_label": branch.label,
+                    "table_ids": list(branch.table_ids),
+                    "status": "created_missing_slot",
+                }
+            )
+
+    # 已经形成明确跨表分支时，区域召回得到的弱总述表不能再额外增加 pkg。
+    # 但“Device/Package/Ordering Information”等自身表题的高优先级证据仍
+    # 保留，因为它可能描述尚未被第一次模型选中的真实封装。
+    if (
+        len(resolution.branches) >= 2
+        and supported_entry_ids
+    ):
+        tables_by_id = {table.table_id: table for table in all_tables}
+        filtered: list[PackageCatalogEntry] = []
+        removed: list[dict[str, Any]] = []
+        for entry in result:
+            if id(entry) in supported_entry_ids or _entry_has_priority_catalog_evidence(
+                entry,
+                tables_by_id,
+            ):
+                filtered.append(entry)
+                continue
+            removed.append(
+                {
+                    "identity_name": entry.identity_name,
+                    "package_type": entry.package_type,
+                    "package_drawing": entry.package_drawing,
+                    "pin_count": entry.pin_count,
+                    "evidence_table_ids": list(entry.evidence_table_ids),
+                }
+            )
+        if removed:
+            diagnostics.append(
+                {
+                    "stage": "multi_pkg_tab_weak_catalog_filter",
+                    "removed": removed,
+                }
+            )
+        result = filtered
+
+    return result
+
+
+def _entries_matching_exact_branch_label(
+    entries: Sequence[PackageCatalogEntry],
+    label: str,
+) -> list[PackageCatalogEntry]:
+    """按内部身份、别名或 Drawing 精确匹配一个跨表分支。"""
+
+    normalized_label = normalize_compact(label)
+    matches = []
+    for entry in entries:
+        values = [
+            entry.identity_name,
+            *entry.identity_aliases,
+            entry.package_drawing,
+        ]
+        if any(normalize_compact(value) == normalized_label for value in values):
+            matches.append(entry)
+    return matches
+
+
+def _append_internal_binding_alias(
+    entry: PackageCatalogEntry,
+    label: str,
+) -> None:
+    """保存局部分支标签供后续表绑定使用，不改变公开 package_type。"""
+
+    label = str(label or "").strip()
+    if (
+        label
+        and label != entry.identity_name
+        and label not in entry.identity_aliases
+    ):
+        entry.identity_aliases.append(label)
+
+
+def _entry_has_priority_catalog_evidence(
+    entry: PackageCatalogEntry,
+    tables_by_id: Mapping[int, PackageCatalogTable],
+) -> bool:
+    """判断目录项是否来自自身表题明确的高优先级封装总述表。"""
+
+    return any(
+        table is not None and _has_priority_catalog_title(table.title)
+        for table_id in entry.evidence_table_ids
+        for table in [tables_by_id.get(table_id)]
+    )
+
+
 def merge_plan_package_labels(
     entries: list[PackageCatalogEntry],
     *,
@@ -1346,6 +1560,7 @@ def bind_target_tables(
     entries: Sequence[PackageCatalogEntry],
     target_tables: Sequence[PackageTargetTable],
     multi_package_plans: Mapping[int, MultiPackagePlanLike],
+    multi_pkg_tab_resolution: MultiPkgTabResolution | None = None,
     diagnostics: list[dict[str, Any]],
 ) -> dict[tuple[int, int], PackageAssignment]:
     """把每张目标表绑定到已冻结槽位，不允许在此阶段创建新槽位。"""
@@ -1366,6 +1581,27 @@ def bind_target_tables(
             entries,
             table,
         )
+        # 只有文档已经形成至少两个可验证跨表分支时，新模块才接管绑定。
+        # 单个局部分支仍沿用原来的表题/表头匹配，避免把普通单封装表误标成
+        # cross_table_package_branch，也保证原有单封装路径完全不变。
+        cross_table_branch = (
+            multi_pkg_tab_resolution.branch_for_table(table.table_id)
+            if (
+                multi_pkg_tab_resolution is not None
+                and multi_pkg_tab_resolution.document_mode
+                in {"cross_table_multi_package", "mixed_multi_package"}
+            )
+            else None
+        )
+        if cross_table_branch is not None:
+            branch_matches = _entries_matching_exact_branch_label(
+                entries,
+                cross_table_branch.label,
+            )
+            # 新模块已经根据表题/表头/最近章节建立了唯一跨表分支。这里只
+            # 接受唯一目录槽位；若目录仍有同名歧义，则保持 unresolved。
+            explicit_matches = branch_matches
+            explicit_reason = "cross_table_package_branch"
 
         # 运行模式名称列需要分别生成 pin 记录，但所有分支属于当前表的同一
         # 物理封装。这里先按表题/最近章节确定一次槽位，再把同一绑定复制给
@@ -1420,6 +1656,7 @@ def bind_target_tables(
                 if assignment is not None:
                     assignments[(table.table_id, local_slot)] = assignment
             if assignment is not None and assignment.reason in {
+                "cross_table_package_branch",
                 "table_title_or_header",
                 "table_group_context",
                 "nearest_chapter_title",
@@ -1537,6 +1774,7 @@ def bind_target_tables(
         # 只有单一且基于当前表明确文字命中的结果，才允许成为后续续表来源。
         first_assignment = assignments.get((table.table_id, 0))
         if first_assignment is not None and first_assignment.reason in {
+            "cross_table_package_branch",
             "multi_package_binding_label",
             "table_title_or_header",
             "table_group_context",

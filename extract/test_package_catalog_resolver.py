@@ -56,6 +56,19 @@ def identity_catalog_classifier(table, source_name, target_tables):
     }
 
 
+def batch_identity_catalog_classifier(tables, source_name, target_tables):
+    """适配当前四表一批接口，供完整提取流程测试替换真实模型。"""
+
+    return {
+        str(table_id): identity_catalog_classifier(
+            table,
+            source_name,
+            target_tables,
+        )
+        for table_id, table in tables
+    }
+
+
 def test_summary_locator_uses_context_headers_and_document_edge():
     summary = catalog_table(
         0,
@@ -637,8 +650,15 @@ def test_full_pipeline_uses_catalog_name_without_changing_pin_mapping():
             return_value={1: TableDecision(True, columns=columns)},
         ),
         patch(
-            "extract.semantic_classifier.classify_package_catalog_table",
-            side_effect=package_classifier,
+            "extract.semantic_classifier.classify_package_catalog_tables",
+            side_effect=lambda tables, source_name, target_tables: {
+                str(table_id): package_classifier(
+                    table,
+                    source_name,
+                    target_tables,
+                )
+                for table_id, table in tables
+            },
         ),
     ):
         result = pin_extractor.extract_pin_package_info_from_table_candidates(
@@ -838,8 +858,8 @@ def test_full_pipeline_skips_unresolved_table_before_row_extraction():
             return_value={1: TableDecision(True, columns=columns)},
         ),
         patch(
-            "extract.semantic_classifier.classify_package_catalog_table",
-            side_effect=identity_catalog_classifier,
+            "extract.semantic_classifier.classify_package_catalog_tables",
+            side_effect=batch_identity_catalog_classifier,
         ),
     ):
         result = pin_extractor.extract_pin_package_info_from_table_candidates(
