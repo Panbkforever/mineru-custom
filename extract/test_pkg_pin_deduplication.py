@@ -4,7 +4,7 @@ from extract.pin_package_extractor import deduplicate_pins_within_packages
 
 
 class PackagePinDeduplicationTest(unittest.TestCase):
-    def test_exact_duplicates_are_removed_across_groups_and_descriptions_are_merged(self) -> None:
+    def test_same_number_and_name_are_deduplicated_and_descriptions_are_merged(self) -> None:
         result = [
             {
                 "pkg": "BGA",
@@ -46,13 +46,13 @@ class PackagePinDeduplicationTest(unittest.TestCase):
 
         self.assertEqual(len(deduplicated[0]["group_list"]), 1)
         pins = deduplicated[0]["group_list"][0]["pin_list"]
-        self.assertEqual(len(pins), 2)
+        self.assertEqual(len(pins), 1)
         self.assertEqual(
             pins[0]["description"],
             "Core power\nConnect to 1.2 V",
         )
-        # type 不同，不能因为 pin_no 和 pin_name 相同而被合并。
-        self.assertEqual(pins[1]["type"], "I")
+        # type 不参与判重，重复记录保留第一次出现的 type。
+        self.assertEqual(pins[0]["type"], "P")
 
     def test_identical_pins_in_different_packages_are_not_merged(self) -> None:
         result = [
