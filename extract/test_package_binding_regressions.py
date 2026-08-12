@@ -7,8 +7,9 @@ import extract.pin_package_extractor as extractor
 from extract.multi_package_extractor import MultiPackagePlan, PackageBinding
 from extract.package_catalog_resolver import (
     PackageCatalogEntry,
+    RawPackageFact,
     bind_multi_package_entries,
-    deduplicate_redundant_catalog_entries,
+    build_strict_package_slots,
 )
 from extract.pin_package_extractor import (
     ColumnDecision,
@@ -66,8 +67,8 @@ class PackageBindingRegressionTest(unittest.TestCase):
             ["1", "2", "3", "4"],
         )
 
-    def test_pin_count_disambiguates_reversed_package_columns(self) -> None:
-        """8/14 引脚分支必须按数量绑定，不能都落入第一个 TSSOP。"""
+    def test_pin_count_never_disambiguates_package_columns(self) -> None:
+        """只有 pin_count 不同但物理身份相同的分支必须保持 unresolved。"""
 
         entries = [
             PackageCatalogEntry("slot:0", package_type="TSSOP", package_drawing="PW", pin_count="14"),
@@ -76,7 +77,7 @@ class PackageBindingRegressionTest(unittest.TestCase):
 
         bound = bind_multi_package_entries(entries, ["8-PIN PW", "14-PIN PW"])
 
-        self.assertEqual([entry.package_key for entry in bound], ["slot:1", "slot:0"])
+        self.assertEqual(bound, [])
 
     def test_identity_footnote_and_catalog_order_do_not_merge_branches(self) -> None:
         """同为 WQFN 的 H/P/S 分支按型号绑定，并忽略型号末尾脚注。"""
@@ -97,22 +98,26 @@ class PackageBindingRegressionTest(unittest.TestCase):
             ["slot:0", "slot:2", "slot:1"],
         )
 
-    def test_duplicate_physical_catalog_rows_do_not_create_extra_slot(self) -> None:
-        """组合写法与分列写法表示同一物理封装时只保留一个槽位。"""
+    def test_strict_slot_merge_ignores_declared_pin_count(self) -> None:
+        """完整三元组相同才合并，declared_pin_count 不参与合并键。"""
 
-        entries = [
-            PackageCatalogEntry("", package_type="(TSSOP-14) - PW"),
-            PackageCatalogEntry("", package_type="TSSOP", package_drawing="PW", pin_count="14"),
-            PackageCatalogEntry("", package_type="TSSOP", package_drawing="PW", pin_count="8"),
-        ]
+        slots = build_strict_package_slots([
+            RawPackageFact("DRV", "TSSOP", "PW", "14", 1, 2),
+            RawPackageFact("DRV", "TSSOP", "PW", "8", 2, 3),
+        ])
 
-        deduplicated = deduplicate_redundant_catalog_entries(entries)
+        self.assertEqual(len(slots), 1)
+        self.assertEqual(len(slots[0].raw_facts), 2)
 
-        self.assertEqual(len(deduplicated), 2)
-        self.assertEqual(
-            [(entry.package_drawing, entry.pin_count) for entry in deduplicated],
-            [("PW", "14"), ("PW", "8")],
-        )
+    def test_incomplete_package_facts_do_not_merge(self) -> None:
+        """三元组缺字段时即使其余文本相同，也必须建立独立槽位。"""
+
+        slots = build_strict_package_slots([
+            RawPackageFact("DRV", "TSSOP", "", "14", 1, 2),
+            RawPackageFact("DRV", "TSSOP", "", "14", 2, 3),
+        ])
+
+        self.assertEqual(len(slots), 2)
 
 
 if __name__ == "__main__":

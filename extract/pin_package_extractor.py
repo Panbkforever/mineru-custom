@@ -2,7 +2,7 @@
 
 本文件只做一件事：把表格转换为项目约定的 JSON 结构。
 
-处理流程固定为九个阶段，阶段之间不互相调用：
+处理流程固定为十个阶段，阶段之间不互相调用：
 
 1. 表格判断：判断当前表是不是“物理引脚/封装关系表”。
 2. 表头结构：仅对候选表展开 rowspan/colspan，建立每列的完整表头路径。
@@ -11,8 +11,9 @@
 5. 多封装分析：只按表格结构生成多个编号列/行的绑定计划。
 6. 封装槽位：先冻结物理封装数量，再绑定每张引脚表；器件型号只用于关联。
 7. 行提取：单封装和多封装走各自独立逻辑，完整读取已经绑定的数据行。
-8. pkg 内去重：只按完全相同的 pin_no、pin_name 合并重复记录，并汇总描述。
-9. 结果整理：按固定槽位分组；pkg 使用物理封装名，未知时按 a/b/c 回退。
+8. 来源追踪：为每条内部记录保存来源表、来源行、原始编号和拆分结果。
+9. pkg 内去重：只按完全相同的 pin_no、pin_name 合并重复记录，并汇总描述。
+10. 结果整理：按固定槽位分组；pkg 使用物理封装名，未知时按 a/b/c 回退。
 
 特别重要的项目规则：
 
@@ -114,6 +115,11 @@
   最长 15 个字符。
 * 最终 JSON 不允许出现完全相同的 pkg 名称。同名 pkg 出现多次时，按冻结
   槽位顺序从第一个开始追加 1、2、3……；只出现一次的 pkg 名称保持不变。
+* 每条内部引脚记录必须保存 source_table_id、source_row、source_pin_no 和
+  normalized_pin_no。正式 JSON 写出前统一删除这些内部字段；调试文件保留
+  各表从原始编号单元格、换行项、拆分 token、行记录到去重后记录的数量。
+* 同一 pkg 下多张表的编号覆盖关系只用于诊断。子集、补充编号和覆盖冲突
+  都不能直接删除任何表或引脚记录。
 * 语义字段判断默认并发数为 4，可通过 ``EXTRACT_SCHEMA_WORKERS`` 覆盖。
 """
 
@@ -160,12 +166,12 @@ from extract.package_catalog_resolver import (
 from extract.table_header_structure import (
     NameColumnBranch,
     NameColumnLayout,
+    TableHeaderStructure,
+    analyze_table_header_structure,
     analyze_name_column_layout,
-    build_header_paths,
     header_paths_to_lists,
     name_layout_to_dict,
     parse_spanned_table,
-    resolve_header_boundary,
 )
 
 
@@ -207,6 +213,8 @@ class TableDecision:
     columns: list[ColumnDecision] = field(default_factory=list)
     # None 表示提取全部数据行；特殊表可以只允许确定的行进入统一提取流程。
     included_row_indexes: frozenset[int] | None = None
+    # 字段映射冲突和确定性修复必须显式留痕，不能只修改 columns。
+    diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -361,48 +369,9 @@ def extract_pin_package_info_from_table_candidates(
             skip(debug, "pinout_matrix_table")
             continue
 
-        # 多层表头可能只有展开 rowspan/colspan 后才能组成“引脚 > 名称”或
-        # “PIN > Package A”字段路径。rough_rows 失败时只对具有明确结构
-        # 锚点的 HTML 重试，避免把普通无关表无条件送入后续昂贵流程。
-        span_rows: list[list[str]] | None = None
-        rough_header_index, rough_headers = choose_header_row(
-            rough_rows,
-            table.title,
-            semantic=use_semantic_classifier,
-        )
-        if rough_header_index < 0:
-            if not should_retry_spanned_header(table, rough_rows):
-                skip(debug, "no_candidate_header")
-                continue
-            span_rows = parse_spanned_table(table.html)
-            rough_header_index, rough_headers = choose_header_row(
-                span_rows,
-                table.title,
-                semantic=use_semantic_classifier,
-            )
-            if rough_header_index < 0:
-                skip(debug, "no_candidate_header_after_span_retry")
-                continue
-            debug["header_retry"] = "span_aware"
-        rough_source_rows = span_rows or rough_rows
-        rough_data_rows = rough_source_rows[rough_header_index + 1 :]
-        if is_ordering_table(rough_headers):
-            skip(debug, "ordering_table")
-            continue
-        if not is_loose_candidate(
-            table.title,
-            rough_headers,
-            rough_data_rows,
-        ):
-            skip(debug, "not_pin_table_candidate")
-            continue
-        if is_non_physical_port_function_table(table.title, rough_headers):
-            skip(debug, "non_physical_port_function_table")
-            continue
-
-        # 只有已经通过宽松初筛的表才执行 span-aware 解析。展开后的 rows
-        # 是后续字段判断、多封装分析和逐行提取共同使用的唯一二维表。
-        rows = span_rows or parse_spanned_table(table.html) or rough_rows
+        # 正式处理一律先展开 rowspan/colspan。表头边界、字段映射、多封装
+        # 分支和逐行提取必须消费同一份二维表，禁止粗解析和展开解析各走一套。
+        rows = parse_spanned_table(table.html) or rough_rows
         if len(rows) < 2:
             skip(debug, "too_few_rows_after_span_expansion")
             continue
@@ -410,18 +379,16 @@ def extract_pin_package_info_from_table_candidates(
             skip(debug, "pinout_matrix_table_after_span_expansion")
             continue
 
-        header_index, headers = choose_header_row(
-            rows,
-            table.title,
-            semantic=use_semantic_classifier,
-        )
-        if header_index < 0:
-            skip(debug, "no_candidate_header_after_span_expansion")
+        header_structure = analyze_table_header_structure(rows)
+        header_index = header_structure.data_start_row - 1
+        if header_index < 0 or header_structure.data_start_row >= len(rows):
+            debug["header_structure"] = header_structure_to_debug(header_structure)
+            skip(debug, "no_data_after_structural_header")
             continue
-        header_paths = build_header_paths(rows, header_index)
+        header_paths = header_structure.columns
         headers = [path.combined for path in header_paths]
         name_layout = analyze_name_column_layout(header_paths)
-        data_rows = rows[header_index + 1 :]
+        data_rows = rows[header_structure.data_start_row :]
 
         # 横向重复字段块是已确认不需要的冗余引脚列表。必须在模型判断和
         # 多封装分析之前整表排除，不能再按普通单封装表进入行提取。
@@ -448,6 +415,7 @@ def extract_pin_package_info_from_table_candidates(
                 "header_index": header_index,
                 "headers": headers,
                 "header_paths": header_paths,
+                "header_structure": header_structure,
                 "name_layout": name_layout,
                 "data_rows": data_rows,
                 "rule_columns": rule_columns,
@@ -458,6 +426,7 @@ def extract_pin_package_info_from_table_candidates(
         debug["header_end"] = header_index
         debug["data_start"] = header_index + 1
         debug["header_paths"] = header_paths_to_lists(header_paths)
+        debug["header_structure"] = header_structure_to_debug(header_structure)
         debug["name_layout"] = name_layout_to_dict(name_layout)
         debug["rule_columns"] = decisions_to_debug(rule_columns)
 
@@ -477,16 +446,21 @@ def extract_pin_package_info_from_table_candidates(
                 item["name_layout"],
             )
 
-    # DESCRIPTION 是最终输出的附加字段，不参与“是否为引脚表”的语义判断。
-    # 因此在模型/规则完成核心字段判断后，再依据已确定的完整表头统一补充，
-    # 保证开启和关闭语义模型时得到相同结果。
+    # 模型映射必须经过代码结构复核。代码可以修复有唯一答案的字段冲突，
+    # 但必须写入 diagnostics；无法唯一修复时整表停止，不能静默选一列。
     for item in prepared:
         decision = decisions[item["table_id"]]
         if decision.should_extract:
-            decision.columns = append_description_column_decision(
-                decision.columns,
-                item["headers"],
+            reviewed_columns, conflicts, valid = review_field_mapping(
+                columns=decision.columns,
+                headers=item["headers"],
+                data_rows=item["data_rows"],
             )
+            decision.columns = reviewed_columns
+            decision.diagnostics.extend(conflicts)
+            if not valid:
+                decision.should_extract = False
+                decision.reason = "field_mapping_conflict"
 
     # 第三阶段：先为所有已经通过判断的表完成多封装结构分析。
     # 此阶段仍然不创建 pin 记录，确保判断和提取完全分离。
@@ -503,8 +477,20 @@ def extract_pin_package_info_from_table_candidates(
             columns=table_decision.columns,
             name_layout=item["name_layout"],
         )
-        multi_package_plans[item["table_id"]] = plan
         item["debug"]["multi_package_plan"] = plan_to_debug(plan)
+        plan_conflicts, plan_valid = review_multi_package_plan(
+            plan,
+            table_decision.columns,
+        )
+        table_decision.diagnostics.extend(plan_conflicts)
+        if not plan_valid:
+            table_decision.should_extract = False
+            table_decision.reason = "field_mapping_conflict"
+            continue
+
+        # 只有通过字段和分支一致性复核的计划才能进入 pkg 分类与绑定阶段。
+        # 旧实现先写入再复核，会让已经拒绝的表仍然扩张封装槽位。
+        multi_package_plans[item["table_id"]] = plan
 
     # 第四阶段：使用全文表格冻结物理封装槽位，并为每张已确认的引脚表
     # 绑定已有槽位。封装判断与行提取保持分离，此处仍不创建 pin 记录。
@@ -561,8 +547,34 @@ def extract_pin_package_info_from_table_candidates(
                             "package_drawing": entry.package_drawing,
                             "pin_count": entry.pin_count,
                             "evidence_table_ids": entry.evidence_table_ids,
+                            "origin": entry.origin,
+                            "raw_facts": [
+                                {
+                                    "device": fact.device,
+                                    "package": fact.package,
+                                    "drawing_code": fact.drawing_code,
+                                    "declared_pin_count": fact.declared_pin_count,
+                                    "source_table_id": fact.source_table_id,
+                                    "source_row_index": fact.source_row_index,
+                                    "table_role": fact.table_role,
+                                }
+                                for fact in entry.raw_facts
+                            ],
                         }
                         for entry in package_resolution.entries
+                    ],
+                    "document_route": package_resolution.document_route,
+                    "raw_facts": [
+                        {
+                            "device": fact.device,
+                            "package": fact.package,
+                            "drawing_code": fact.drawing_code,
+                            "declared_pin_count": fact.declared_pin_count,
+                            "source_table_id": fact.source_table_id,
+                            "source_row_index": fact.source_row_index,
+                            "table_role": fact.table_role,
+                        }
+                        for fact in package_resolution.raw_facts
                     ],
                     "diagnostics": package_resolution.diagnostics,
                 }
@@ -639,6 +651,10 @@ def extract_pin_package_info_from_table_candidates(
         )
 
         extracted_count = 0
+        # 阶段统计只描述数量变化，不参与是否保留记录的判断。后续如果出现
+        # 引脚缺失，可以直接定位是在 HTML 结构、编号拆分还是去重阶段发生。
+        stage_counts = new_table_stage_counts()
+        debug["stage_counts"] = stage_counts
 
         # 真正的多封装表严格执行绑定计划。每个封装独立读取自己的 pin_no，
         # 不能再进入普通逻辑把多个编号列拼接成一个字段。
@@ -648,7 +664,14 @@ def extract_pin_package_info_from_table_candidates(
                 # 封装目录的唯一绑定。表内标签不能直接绕过目录写入输出。
                 local_slot = local_package_index_for_bound_row(plan, bound_row)
                 package_assignment = package_assignments[local_slot]
-                for record in extract_records_from_bound_package_row(bound_row):
+                source_pin_values = [bound_row.pin_no]
+                records = extract_records_from_bound_package_row(bound_row)
+                update_stage_counts_before_add(
+                    stage_counts,
+                    source_pin_values,
+                    records,
+                )
+                for record in records:
                     # 多封装绑定对象只保存 pin_no/pin_name/type。description
                     # 必须使用 row_index 回到同一原始数据行读取，不能从相邻
                     # 绑定或已经生成的记录继承。
@@ -663,6 +686,12 @@ def extract_pin_package_info_from_table_candidates(
                         record["source"] = source_name
                     if include_debug and item["table"].page_idx is not None:
                         record["source_page"] = item["table"].page_idx + 1
+                    attach_record_trace(
+                        record,
+                        table_id=item["table_id"],
+                        source_row=item["header_structure"].data_start_row + bound_row.row_index,
+                        source_pin_values=source_pin_values,
+                    )
                     bucket = get_package_bucket(packages, package_assignment)
                     group = get_or_create_group(bucket, group_name)
                     add_pin_record_to_group(group, record)
@@ -684,12 +713,28 @@ def extract_pin_package_info_from_table_candidates(
                 if is_group_row(row):
                     # 表内结构标题不是引脚数据，也不再创建新的输出 group。
                     continue
-                for record in extract_records_from_row(row, table_decision.columns):
+                source_pin_values = mapped_pin_number_values(
+                    row,
+                    table_decision.columns,
+                )
+                records = extract_records_from_row(row, table_decision.columns)
+                update_stage_counts_before_add(
+                    stage_counts,
+                    source_pin_values,
+                    records,
+                )
+                for record in records:
                     record.pop("_raw_fields", None)
                     if include_debug and source_name:
                         record["source"] = source_name
                     if include_debug and item["table"].page_idx is not None:
                         record["source_page"] = item["table"].page_idx + 1
+                    attach_record_trace(
+                        record,
+                        table_id=item["table_id"],
+                        source_row=item["header_structure"].data_start_row + row_index,
+                        source_pin_values=source_pin_values,
+                    )
                     bucket = get_package_bucket(packages, package_assignment)
                     group = get_or_create_group(bucket, group_name)
                     add_pin_record_to_group(group, record)
@@ -720,7 +765,24 @@ def extract_pin_package_info_from_table_candidates(
     # 精确去重。此处位于写 JSON 之前，因此后出现表格中的 description 已经
     # 全部可用，同时不会反向影响表格判断、字段映射或 package 绑定。
     result = build_public_result(packages, include_debug)
-    return deduplicate_pins_within_packages(result)
+    coverage_diagnostics = analyze_table_pin_coverage(result)
+    records_before_dedup = count_records_by_source_table(result)
+    deduplicate_pins_within_packages(result)
+    records_after_dedup = count_records_by_source_table(result)
+    finalize_stage_counts(
+        LAST_EXTRACTION_DEBUG,
+        records_before_dedup,
+        records_after_dedup,
+    )
+    attach_pipeline_diagnostics(
+        LAST_EXTRACTION_DEBUG,
+        records_before_dedup=records_before_dedup,
+        records_after_dedup=records_after_dedup,
+        table_coverage=coverage_diagnostics,
+    )
+    # _trace 只服务调试和数量核对，正式 JSON 绝不能泄露内部定位字段。
+    strip_internal_record_fields(result)
+    return result
 
 
 def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, include_debug: bool) -> dict[int, TableDecision]:
@@ -1271,6 +1333,263 @@ def append_description_column_decision(
     return result
 
 
+def review_field_mapping(
+    *,
+    columns: list[ColumnDecision],
+    headers: list[str],
+    data_rows: list[list[str]],
+) -> tuple[list[ColumnDecision], list[dict[str, Any]], bool]:
+    """复核模型/规则字段映射，返回“字段、诊断、是否可继续”。
+
+    复核只消费冻结后的表头路径和正式数据行，不参与 pkg 判断。能够由结构
+    唯一确定的错误会修复并记录；存在多个同等答案时返回 ``valid=False``。
+    """
+
+    reviewed = deduplicate_column_decisions(columns)
+    diagnostics: list[dict[str, Any]] = []
+
+    # DESCRIPTION 是第一次模型协议的一部分。模型漏选时，只有表头中存在
+    # 唯一直接 DESCRIPTION 列才允许确定性恢复，并明确记录恢复证据。
+    selected_descriptions = [
+        column
+        for column in reviewed
+        if normalize_field_name(column.field_name) == "description"
+    ]
+    direct_descriptions = [
+        index
+        for index, header in enumerate(headers)
+        if is_description_header(header)
+    ]
+    if not selected_descriptions and len(direct_descriptions) == 1:
+        index = direct_descriptions[0]
+        reviewed.append(ColumnDecision(index, headers[index], "description", 10))
+        diagnostics.append({
+            "code": "field_mapping_conflict",
+            "field": "description",
+            "resolution": "recovered_unique_direct_header",
+            "selected_column": index,
+        })
+    elif len(selected_descriptions) > 1:
+        direct_selected = [
+            column
+            for column in selected_descriptions
+            if is_description_header(column.raw_header)
+        ]
+        if len(direct_selected) != 1:
+            diagnostics.append({
+                "code": "field_mapping_conflict",
+                "field": "description",
+                "resolution": "unresolved_multiple_columns",
+                "candidate_columns": [column.index for column in selected_descriptions],
+            })
+            return deduplicate_column_decisions(reviewed), diagnostics, False
+        reviewed = [
+            column
+            for column in reviewed
+            if normalize_field_name(column.field_name) != "description"
+        ] + direct_selected
+        diagnostics.append({
+            "code": "field_mapping_conflict",
+            "field": "description",
+            "resolution": "kept_unique_direct_header",
+            "selected_column": direct_selected[0].index,
+        })
+
+    # type 列同时结合表头直接性和列值形态复核。MUX/BUFFER/POWER 等辅助列
+    # 不能压过唯一的 SIGNAL/PIN/I/O TYPE；没有唯一答案时停止该表。
+    selected_types = [
+        column
+        for column in reviewed
+        if normalize_field_name(column.field_name) == "type"
+    ]
+    direct_type_indexes = [
+        index
+        for index, header in enumerate(headers)
+        if is_direct_pin_type_header(header)
+    ]
+    selected_type_is_auxiliary = any(
+        is_auxiliary_type_header(column.raw_header)
+        for column in selected_types
+    )
+    if len(direct_type_indexes) == 1 and (
+        not selected_types
+        or len(selected_types) > 1
+        or selected_type_is_auxiliary
+        or selected_types[0].index != direct_type_indexes[0]
+    ):
+        index = direct_type_indexes[0]
+        reviewed = [
+            column
+            for column in reviewed
+            if normalize_field_name(column.field_name) != "type"
+        ]
+        reviewed.append(ColumnDecision(index, headers[index], "type", 10))
+        diagnostics.append({
+            "code": "field_mapping_conflict",
+            "field": "type",
+            "resolution": "replaced_with_unique_direct_type",
+            "selected_column": index,
+        })
+    elif len(selected_types) > 1:
+        ranked = sorted(
+            selected_types,
+            key=lambda column: score_type_column(column, data_rows),
+            reverse=True,
+        )
+        if (
+            len(ranked) > 1
+            and score_type_column(ranked[0], data_rows)
+            == score_type_column(ranked[1], data_rows)
+        ):
+            diagnostics.append({
+                "code": "field_mapping_conflict",
+                "field": "type",
+                "resolution": "unresolved_equal_candidates",
+                "candidate_columns": [column.index for column in ranked],
+            })
+            return deduplicate_column_decisions(reviewed), diagnostics, False
+        reviewed = [
+            column
+            for column in reviewed
+            if normalize_field_name(column.field_name) != "type"
+        ] + ranked[:1]
+        diagnostics.append({
+            "code": "field_mapping_conflict",
+            "field": "type",
+            "resolution": "selected_by_header_and_value_shape",
+            "selected_column": ranked[0].index,
+        })
+    elif len(selected_types) == 1 and is_auxiliary_type_header(
+        selected_types[0].raw_header
+    ):
+        # 没有直接 TYPE 列时也不能把 MUX MODE/BUFFER TYPE 等辅助列默认为
+        # 最终 type。此处只拒绝明确的辅助表头，不用固定枚举数据内容猜字段。
+        values = [
+            row[selected_types[0].index]
+            for row in data_rows
+            if selected_types[0].index < len(row)
+            and str(row[selected_types[0].index]).strip()
+        ]
+        type_shape_hits = sum(looks_like_signal_type(value) for value in values[:30])
+        if not values or type_shape_hits < max(1, len(values[:30]) // 2):
+            diagnostics.append({
+                "code": "field_mapping_conflict",
+                "field": "type",
+                "resolution": "rejected_auxiliary_type_column",
+                "selected_column": selected_types[0].index,
+                "type_shape_hits": type_shape_hits,
+                "sample_size": min(len(values), 30),
+            })
+            return deduplicate_column_decisions(reviewed), diagnostics, False
+
+    if not has_pin_number_column(reviewed):
+        diagnostics.append({
+            "code": "field_mapping_conflict",
+            "field": "pin_no",
+            "resolution": "missing_required_mapping",
+        })
+        return deduplicate_column_decisions(reviewed), diagnostics, False
+
+    return deduplicate_column_decisions(reviewed), diagnostics, True
+
+
+def review_multi_package_plan(
+    plan: MultiPackagePlan,
+    columns: list[ColumnDecision],
+) -> tuple[list[dict[str, Any]], bool]:
+    """复核多封装分支与模型字段映射是否一一对应。
+
+    多封装计划只能消费模型已经确认、随后又经结构复核的字段。分支列数量
+    不一致时不能少取一列后继续提取，否则会把多个封装静默并入同一槽位。
+    """
+
+    if not plan.is_multi_package:
+        return [], True
+
+    pin_indexes = {
+        column.index
+        for column in columns
+        if normalize_field_name(column.field_name) == "pin_no"
+        or column.field_name == "package_pin_no"
+    }
+    name_indexes = {
+        column.index
+        for column in columns
+        if normalize_field_name(column.field_name) == "pin_name"
+    }
+    diagnostics: list[dict[str, Any]] = []
+    invalid_bindings = []
+    for slot, binding in enumerate(plan.bindings):
+        reasons = []
+        if binding.pin_no_column not in pin_indexes:
+            reasons.append("pin_no_column_not_selected")
+        if (
+            binding.pin_name_column is not None
+            and binding.pin_name_column not in name_indexes
+        ):
+            reasons.append("pin_name_column_not_selected")
+        if reasons:
+            invalid_bindings.append({"local_slot": slot, "reasons": reasons})
+
+    branch_count_mismatch = False
+    if plan.mode == "package_columns":
+        branch_count_mismatch = len({b.pin_no_column for b in plan.bindings}) != len(pin_indexes)
+    elif plan.mode in {"package_name_columns", "parallel_name_columns"}:
+        branch_count_mismatch = len({b.pin_name_column for b in plan.bindings}) != len(name_indexes)
+
+    if invalid_bindings or branch_count_mismatch:
+        diagnostics.append({
+            "code": "field_mapping_conflict",
+            "field": "multi_package_branches",
+            "resolution": "unresolved_branch_column_mismatch",
+            "plan_mode": plan.mode,
+            "binding_count": len(plan.bindings),
+            "selected_pin_columns": sorted(pin_indexes),
+            "selected_name_columns": sorted(name_indexes),
+            "invalid_bindings": invalid_bindings,
+        })
+        return diagnostics, False
+    return diagnostics, True
+
+
+def is_direct_pin_type_header(value: str) -> bool:
+    """判断表头是否直接表达物理引脚/信号类型。"""
+
+    header = normalize_header(strip_numeric_header_footnotes(value))
+    return bool(
+        header in {"type", "io", "i o", "i/o", "类型"}
+        or any(
+            token in header
+            for token in (
+                "signal type",
+                "pin type",
+                "terminal type",
+                "io type",
+                "i o type",
+                "引脚类型",
+                "信号类型",
+            )
+        )
+    ) and not is_auxiliary_type_header(header)
+
+
+def is_auxiliary_type_header(value: str) -> bool:
+    """识别不应作为最终 pin type 的模式、缓冲器和供电辅助列。"""
+
+    header = normalize_header(strip_numeric_header_footnotes(value))
+    return any(
+        token in header
+        for token in (
+            "mux mode",
+            "mode type",
+            "buffer type",
+            "buffer",
+            "power source",
+            "reset state",
+        )
+    )
+
+
 def is_description_header(value: str) -> bool:
     """识别 DESCRIPTION 列，并隔离误附加在表头后的首行描述文字。
 
@@ -1403,7 +1722,7 @@ def extract_records_from_bound_package_row(
 
     # 绑定计划已经证明该列是该封装的 pin_no。单元格为空属于原始数据，
     # 不能再通过空列表静默丢行，因此用一个空编号保留该条记录。
-    pin_numbers = split_pin_numbers(bound_row.pin_no) or [""]
+    pin_numbers = split_pin_numbers_preserving_source(bound_row.pin_no)
     pin_names = split_parallel_pin_names(
         bound_row.pin_name,
         len(pin_numbers),
@@ -1450,7 +1769,7 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
         # 封装专属编号列优先：每个封装列分别生成自己的 pin 记录。
         for value in package_columns:
             # 列映射已经确定；空单元格仍要生成 pin_no="" 的记录。
-            pin_numbers = split_pin_numbers(value) or [""]
+            pin_numbers = split_pin_numbers_preserving_source(value)
             pin_names = split_parallel_pin_names(
                 fields.get("pin_name", ""),
                 len(pin_numbers),
@@ -1470,7 +1789,7 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
     pin_value = fields.get("pin_no", "")
     # 表级判断已保证存在 pin_no 映射。这里的空字符串只表示当前数据行
     # 编号为空，不代表字段缺失，因此仍保留一条空编号记录。
-    pin_numbers = split_pin_numbers(pin_value) or [""]
+    pin_numbers = split_pin_numbers_preserving_source(pin_value)
     pin_names = split_parallel_pin_names(
         fields.get("pin_name", ""),
         len(pin_numbers),
@@ -1486,6 +1805,105 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
         record["_raw_fields"] = raw_fields
         records.append(record)
     return records
+
+
+def split_pin_numbers_preserving_source(value: str) -> list[str]:
+    """拆分编号，同时保证非空原始单元格不会静默变成空列表。"""
+
+    pin_numbers = split_pin_numbers(value)
+    if pin_numbers:
+        return pin_numbers
+    original = plain_text(str(value or "")).strip()
+    return [original] if original else [""]
+
+
+def mapped_pin_number_values(
+    row: list[str],
+    columns: list[ColumnDecision],
+) -> list[str]:
+    """读取一行中已经确认的所有编号单元格原值，供来源追踪使用。"""
+
+    values = []
+    for column in columns:
+        if not (
+            normalize_field_name(column.field_name) == "pin_no"
+            or column.field_name == "package_pin_no"
+        ):
+            continue
+        values.append(row[column.index] if column.index < len(row) else "")
+    return values
+
+
+def attach_record_trace(
+    record: dict[str, Any],
+    *,
+    table_id: int,
+    source_row: int,
+    source_pin_values: list[str],
+) -> None:
+    """给内部记录附加来源；该字段在正式 JSON 写出前统一删除。"""
+
+    normalized = [
+        pin_no
+        for value in source_pin_values
+        if str(value or "").strip()
+        for pin_no in split_pin_numbers_preserving_source(value)
+    ]
+    record["_trace"] = {
+        "source_table_id": table_id,
+        # 使用原始 HTML 二维表的零基行号，便于直接回查 parse_spanned_table。
+        "source_row": source_row,
+        "source_pin_no": "\n".join(str(value) for value in source_pin_values),
+        "normalized_pin_no": normalized,
+    }
+
+
+def new_table_stage_counts() -> dict[str, int]:
+    """创建一张表的阶段计数器；键名固定，便于跨文件比较。"""
+
+    return {
+        "source_pin_cell_count": 0,
+        "source_nonempty_pin_cell_count": 0,
+        "source_explicit_line_item_count": 0,
+        "pin_tokens_after_split": 0,
+        "records_after_row_extraction": 0,
+        "records_before_dedup": 0,
+        "records_after_dedup": 0,
+        "deduplicated_record_count": 0,
+        "preserved_original_pin_cell_count": 0,
+        "silent_pin_loss_count": 0,
+    }
+
+
+def update_stage_counts_before_add(
+    counts: dict[str, int],
+    source_pin_values: list[str],
+    records: list[dict[str, Any]],
+) -> None:
+    """记录编号单元格从原值到行记录的数量变化。"""
+
+    counts["source_pin_cell_count"] += len(source_pin_values)
+    expected_record_tokens = 0
+    for value in source_pin_values:
+        text = str(value or "")
+        if text.strip():
+            counts["source_nonempty_pin_cell_count"] += 1
+            # 这里只统计 HTML 中明确保留下来的换行项，不把普通空格当换行。
+            counts["source_explicit_line_item_count"] += max(
+                1,
+                len([line for line in text.splitlines() if line.strip()]),
+            )
+        split_values = split_pin_numbers_preserving_source(text)
+        if text.strip():
+            counts["pin_tokens_after_split"] += len(split_values)
+            expected_record_tokens += len(split_values)
+            if len(split_values) == 1 and split_values[0] == plain_text(text).strip():
+                counts["preserved_original_pin_cell_count"] += 1
+    counts["records_after_row_extraction"] += len(records)
+    # 非空编号单元格即使无法规范化，也必须至少保留原字符串对应的记录。
+    # 这里只记录诊断，不擅自补造数据，便于准确定位发生丢失的处理分支。
+    if len(records) < expected_record_tokens:
+        counts["silent_pin_loss_count"] += expected_record_tokens - len(records)
 
 
 def split_pin_numbers(value: str) -> list[str]:
@@ -1673,21 +2091,14 @@ def parse_html_table(html: str) -> list[list[str]]:
 
 
 def choose_header_row(rows: list[list[str]], title: str = "", semantic: bool = False) -> tuple[int, list[str]]:
-    """先找字段语义种子行，再通过结构关系确定完整表头边界。"""
-    best = (-1, -1, [])
-    # 十二行只是异常 HTML 的防护上限。这里的字段词只用于确认候选表头中
-    # 已经出现可识别字段，不参与判断下一行是表头还是数据；最终边界统一交给
-    # table_header_structure.resolve_header_boundary() 按父子列结构确定。
-    for index in range(min(12, len(rows))):
-        headers = build_combined_headers(rows, index)
-        score = sum(classify_header(header)[1] for header in headers)
-        if score > best[1]:
-            best = (index, score, headers)
-    if best[1] < (2 if semantic else 4):
+    """兼容旧调用：只按结构返回表头终点，不再用字段词决定边界。"""
+
+    del title, semantic
+    structure = analyze_table_header_structure(rows)
+    if not structure.header_rows or structure.data_start_row >= len(rows):
         return -1, []
-    boundary = resolve_header_boundary(rows, best[0])
-    headers = build_combined_headers(rows, boundary.header_end)
-    return boundary.header_end, headers
+    header_index = structure.data_start_row - 1
+    return header_index, [column.combined for column in structure.columns]
 
 
 def should_retry_spanned_header(
@@ -1829,12 +2240,196 @@ def build_public_result(
 
     result = []
     for bucket in packages.values():
-        groups = [{"group": group.group, "pin_list": group.pin_list} for group in bucket["_groups"].values() if group.pin_list]
-        item = {"pkg": bucket["pkg"], "group_list": groups}
+        # 先复制内部记录，后续去重和覆盖诊断仍需要 _trace；最后统一剥离。
+        groups = [
+            {
+                "group": group.group,
+                "pin_list": [dict(pin) for pin in group.pin_list],
+            }
+            for group in bucket["_groups"].values()
+            if group.pin_list
+        ]
+        item = {
+            "pkg": bucket["pkg"],
+            "group_list": groups,
+            "_package_key": bucket["package_key"],
+        }
         if include_debug:
             item["package_key"] = bucket["package_key"]
         result.append(item)
     return append_duplicate_pkg_suffixes(result)
+
+
+def count_records_by_source_table(
+    result: list[dict[str, Any]],
+) -> dict[int, int]:
+    """按内部来源表统计当前记录数。"""
+
+    counts: Counter[int] = Counter()
+    for package in result:
+        for group in package.get("group_list", []):
+            for pin in group.get("pin_list", []):
+                trace = pin.get("_trace", {})
+                table_id = trace.get("source_table_id")
+                if isinstance(table_id, int):
+                    counts[table_id] += 1
+    return dict(counts)
+
+
+def finalize_stage_counts(
+    debug_items: list[dict[str, Any]],
+    records_before_dedup: dict[int, int],
+    records_after_dedup: dict[int, int],
+) -> None:
+    """把去重前后数量回写到每张表的阶段统计。"""
+
+    for debug in debug_items:
+        table_id = debug.get("table_id")
+        counts = debug.get("stage_counts")
+        if not isinstance(table_id, int) or not isinstance(counts, dict):
+            continue
+        before = records_before_dedup.get(table_id, 0)
+        after = records_after_dedup.get(table_id, 0)
+        counts["records_before_dedup"] = before
+        counts["records_after_dedup"] = after
+        counts["deduplicated_record_count"] = max(0, before - after)
+
+
+def analyze_table_pin_coverage(
+    result: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """比较同一 pkg 下各来源表的编号集合，仅生成诊断，不删除数据。"""
+
+    diagnostics: list[dict[str, Any]] = []
+    for package in result:
+        pins_by_table: dict[int, set[str]] = {}
+        invalid_shapes_by_table: dict[int, set[str]] = {}
+        for group in package.get("group_list", []):
+            for pin in group.get("pin_list", []):
+                trace = pin.get("_trace", {})
+                table_id = trace.get("source_table_id")
+                pin_no = str(pin.get("pin_no", "")).strip()
+                if isinstance(table_id, int) and pin_no:
+                    pins_by_table.setdefault(table_id, set()).add(pin_no)
+                    if not is_plausible_pin_token(pin_no):
+                        invalid_shapes_by_table.setdefault(table_id, set()).add(pin_no)
+
+        table_ids = sorted(pins_by_table)
+        relations: list[dict[str, Any]] = []
+        for left_index, left_table in enumerate(table_ids):
+            left = pins_by_table[left_table]
+            for right_table in table_ids[left_index + 1 :]:
+                right = pins_by_table[right_table]
+                if not left or not right:
+                    continue
+                intersection = left & right
+                left_only = left - right
+                right_only = right - left
+                if left == right:
+                    relation = "same_pin_coverage"
+                elif right < left:
+                    relation = "right_table_is_subset"
+                elif left < right:
+                    relation = "left_table_is_subset"
+                else:
+                    relation = "overlapping_or_independent_tables"
+
+                union_size = len(left | right)
+                overlap_ratio = len(intersection) / union_size if union_size else 0.0
+                item = {
+                    "left_table_id": left_table,
+                    "right_table_id": right_table,
+                    "relation": relation,
+                    "left_pin_count": len(left),
+                    "right_pin_count": len(right),
+                    "intersection_count": len(intersection),
+                    "overlap_ratio": round(overlap_ratio, 4),
+                    "left_only_count": len(left_only),
+                    "right_only_count": len(right_only),
+                    "left_only_sample": sorted(left_only)[:50],
+                    "right_only_sample": sorted(right_only)[:50],
+                }
+                if left_only or right_only:
+                    item["diagnostic"] = "supplemental_only_pin"
+                if relation == "overlapping_or_independent_tables" and overlap_ratio < 0.25:
+                    item["diagnostic"] = "table_coverage_conflict"
+                relations.append(item)
+
+        diagnostics.append({
+            "package_key": package.get("_package_key", ""),
+            "pkg": package.get("pkg", ""),
+            "tables": [
+                {"table_id": table_id, "unique_pin_count": len(pins_by_table[table_id])}
+                for table_id in table_ids
+            ],
+            "relations": relations,
+            "invalid_pin_shape": [
+                {
+                    "table_id": table_id,
+                    "values": sorted(values)[:100],
+                    "count": len(values),
+                }
+                for table_id, values in sorted(invalid_shapes_by_table.items())
+            ],
+        })
+    return diagnostics
+
+
+def is_plausible_pin_token(value: str) -> bool:
+    """宽松判断编号形态，只用于诊断，绝不参与记录过滤。
+
+    数字编号、BGA 坐标、显式占位值和未展开范围都视为可接受。包含长句、
+    多个普通单词或表头脚注碎片时返回 False，供调试文件定位来源。
+    """
+
+    text = plain_text(str(value or "")).strip()
+    if not text:
+        return True
+    if re.fullmatch(r"(?:N\s*/\s*A|N/?C|RESERVED|-+)", text, re.IGNORECASE):
+        return True
+    if re.fullmatch(r"[A-Za-z]{0,4}\d+[A-Za-z0-9_+\-]*", text):
+        return True
+    if re.fullmatch(r"\d+[A-Za-z]?", text):
+        return True
+    if re.fullmatch(r"[A-Za-z]+\d+\s*-\s*[A-Za-z]+\d+", text):
+        return True
+    if re.fullmatch(r"[A-Za-z]+\[\d+\s*:\s*\d+\]", text):
+        return True
+    return False
+
+
+def attach_pipeline_diagnostics(
+    debug_items: list[dict[str, Any]],
+    *,
+    records_before_dedup: dict[int, int],
+    records_after_dedup: dict[int, int],
+    table_coverage: list[dict[str, Any]],
+) -> None:
+    """把文档级阶段统计挂到首张表的调试节点，避免重复写入。"""
+
+    if not debug_items:
+        return
+    before = sum(records_before_dedup.values())
+    after = sum(records_after_dedup.values())
+    debug_items[0]["pipeline_diagnostics"] = {
+        "records_before_dedup": before,
+        "records_after_dedup": after,
+        "deduplicated_record_count": max(0, before - after),
+        "records_by_source_table_before_dedup": records_before_dedup,
+        "records_by_source_table_after_dedup": records_after_dedup,
+        "table_coverage": table_coverage,
+    }
+
+
+def strip_internal_record_fields(result: list[dict[str, Any]]) -> None:
+    """删除正式 JSON 不允许出现的内部追踪字段。"""
+
+    for package in result:
+        package.pop("_package_key", None)
+        for group in package.get("group_list", []):
+            for pin in group.get("pin_list", []):
+                for key in [key for key in pin if str(key).startswith("_")]:
+                    pin.pop(key, None)
 
 
 def deduplicate_pins_within_packages(
@@ -2166,6 +2761,26 @@ def decisions_to_debug(columns: list[ColumnDecision]) -> list[dict[str, Any]]:
     return [{"index": c.index, "header": c.raw_header, "field": c.field_name, "score": c.score} for c in columns]
 
 
+def header_structure_to_debug(
+    structure: TableHeaderStructure,
+) -> dict[str, Any]:
+    """把冻结的表头边界和列路径完整写入调试信息。"""
+
+    return {
+        "header_rows": list(structure.header_rows),
+        "data_start_row": structure.data_start_row,
+        "columns": [
+            {
+                "index": column.column_index,
+                "path": list(column.parts),
+            }
+            for column in structure.columns
+        ],
+        "evidence": list(structure.evidence),
+        "confidence": structure.confidence,
+    }
+
+
 def decision_to_debug(decision: TableDecision) -> dict[str, Any]:
     """把表格决策对象转换成可写入 debug JSON 的字典。"""
     return {
@@ -2175,6 +2790,7 @@ def decision_to_debug(decision: TableDecision) -> dict[str, Any]:
         "confidence": decision.confidence,
         "reason": decision.reason,
         "columns": decisions_to_debug(decision.columns),
+        "diagnostics": decision.diagnostics,
         "included_row_indexes": (
             sorted(decision.included_row_indexes)
             if decision.included_row_indexes is not None

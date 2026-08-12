@@ -19,8 +19,9 @@
   必须保持不同分支。
 * 没有 ``Package/封装`` 文字时，已经由第二次模型确认的器件身份或 Drawing
   仍可作为严格匹配证据。
-* 同一 Drawing、相同 pin_count 的多个订购型号，只在目标引脚表明确按该
-  Drawing 分组时才允许归并，不能仅凭封装族相同进行归并。
+* 声明 pin 数量只保留为原始信息，绝不参与分支分类或表格绑定。
+* 相同 Drawing 但器件身份不同的目录项仍是不同槽位；局部表只写 Drawing
+  时可能形成歧义，必须留给绑定层记录 unresolved。
 * 没有唯一证据的表不创建分支，也不默认绑定第一个 pkg。
 * ``parallel_name_columns`` 是同一封装的多个名称模式，不创建 pkg 分支。
 """
@@ -315,8 +316,8 @@ def _find_table_branch_evidence(
                 saw_ambiguous,
             )
 
-        # Drawing 比器件身份更接近物理封装分支。同一 Drawing 的多个 SKU
-        # 只要 pin_count 不冲突，就作为一组目录证据返回。
+        # Drawing 比器件身份更接近物理封装分支。这里仅建立局部证据，
+        # 不使用 pin_count 合并目录项；最终仍需绑定层验证唯一槽位。
         drawing_matches = _matches_by_field(entries, text, "package_drawing")
         drawing_groups = _group_drawing_matches(entries, drawing_matches)
         if len(drawing_groups) == 1:
@@ -486,15 +487,15 @@ def _group_drawing_matches(
     entries: Sequence[CatalogEntryLike],
     indexes: Sequence[int],
 ) -> list[tuple[str, tuple[int, ...]]]:
-    """Drawing 相同但 pin_count 冲突时保持不同组。"""
+    """只按 Drawing 聚合局部证据，pin_count 不参与结构分类。"""
 
-    grouped: dict[tuple[str, str], list[int]] = {}
-    labels: dict[tuple[str, str], str] = {}
+    grouped: dict[str, list[int]] = {}
+    labels: dict[str, str] = {}
     for index in indexes:
         entry = entries[index]
         drawing = str(entry.package_drawing or "").strip()
-        key = (_normalize_compact(drawing), _clean_pin_count(entry.pin_count))
-        if not key[0]:
+        key = _normalize_compact(drawing)
+        if not key:
             continue
         grouped.setdefault(key, []).append(index)
         labels.setdefault(key, drawing)
@@ -526,18 +527,19 @@ def _catalog_matches_are_one_physical_branch(
     entries: Sequence[CatalogEntryLike],
     indexes: Sequence[int],
 ) -> bool:
-    """判断多个目录匹配是否确实描述同一 Drawing/pin_count。"""
+    """判断多个匹配是否具有完全一致的器件、封装和 Drawing 三元组。"""
 
     if len(indexes) <= 1:
         return True
     signatures = {
         (
+            _normalize_compact(entries[index].identity_name),
+            _normalize_compact(entries[index].package_type),
             _normalize_compact(entries[index].package_drawing),
-            _clean_pin_count(entries[index].pin_count),
         )
         for index in indexes
     }
-    return len(signatures) == 1 and bool(next(iter(signatures))[0])
+    return len(signatures) == 1 and all(next(iter(signatures)))
 
 
 def _drawing_branch_key(
@@ -545,15 +547,9 @@ def _drawing_branch_key(
     indexes: Sequence[int],
     label: str,
 ) -> str:
-    """Drawing 和显式 pin_count 共同构成稳定的物理分支键。"""
+    """Drawing 构成局部分支键；目录槽位身份仍由绑定层严格判断。"""
 
-    pin_counts = {
-        _clean_pin_count(entries[index].pin_count)
-        for index in indexes
-        if _clean_pin_count(entries[index].pin_count)
-    }
-    pin_count = next(iter(pin_counts)) if len(pin_counts) == 1 else ""
-    return f"drawing:{_normalize_compact(label)}:{pin_count}"
+    return f"drawing:{_normalize_compact(label)}"
 
 
 def _identity_label_matches(entry: CatalogEntryLike, label: str) -> bool:

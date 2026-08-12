@@ -1,5 +1,7 @@
 """文档级封装目录和表格绑定的通用测试。"""
 
+import inspect
+import unittest
 from unittest.mock import patch
 
 import extract.pin_package_extractor as pin_extractor
@@ -7,9 +9,7 @@ from extract.package_catalog_resolver import (
     PackageCatalogEntry,
     PackageCatalogTable,
     PackageTargetTable,
-    clean_package_name,
     find_package_catalog_candidates,
-    merge_plan_package_labels,
     resolve_document_package_catalog,
 )
 from extract.multi_package_extractor import MultiPackagePlan, PackageBinding
@@ -370,203 +370,10 @@ def test_multi_package_type_labels_do_not_duplicate_catalog_entries():
     assert result.assignment_for(2, 1).pkg == "QFN 28"
 
 
-def test_confirmed_plan_removes_identity_only_extra_slots():
-    """严格两分支表存在时，四条纯器件型号不能创建四个 pkg。"""
-
-    target = target_table(
-        2,
-        "Pin Attributes",
-        ["SIGNAL NAME", "PKG-C NO.", "PKG-S NO.", "TYPE"],
-    )
-    plan = MultiPackagePlan(
-        True,
-        "package_columns",
-        bindings=(
-            PackageBinding("PKG-C", 1, 0, 3),
-            PackageBinding("PKG-S", 2, 0, 3),
-        ),
-    )
-    diagnostics = []
-    entries = [
-        PackageCatalogEntry("", identity_name=f"DEVICE-{index}")
-        for index in range(4)
-    ]
-
-    result = merge_plan_package_labels(
-        entries,
-        target_tables=[target],
-        multi_package_plans={2: plan},
-        diagnostics=diagnostics,
-    )
-
-    assert len(result) == 2
-    assert all(not entry.identity_name for entry in result)
-    assert diagnostics[-1]["stage"] == (
-        "package_catalog_confirmed_plan_reconciliation"
-    )
-    assert diagnostics[-1]["before"] == 4
-    assert diagnostics[-1]["after"] == 2
 
 
-def test_confirmed_plan_keeps_physical_packages_and_drops_weak_identities():
-    """两个真实物理封装加两个器件型号时，最终仍只有两个槽位。"""
-
-    target = target_table(
-        2,
-        "Pin Attributes",
-        ["SIGNAL NAME", "FCBGA NO.", "FCCSP NO.", "TYPE"],
-    )
-    plan = MultiPackagePlan(
-        True,
-        "package_columns",
-        bindings=(
-            PackageBinding("FCBGA", 1, 0, 3),
-            PackageBinding("FCCSP", 2, 0, 3),
-        ),
-    )
-    entries = [
-        PackageCatalogEntry(
-            "",
-            identity_name="DEVICE-A",
-            package_type="FCBGA",
-            package_drawing="ALV",
-            pin_count="441",
-        ),
-        PackageCatalogEntry(
-            "",
-            identity_name="DEVICE-B",
-            package_type="FCCSP",
-            package_drawing="S",
-            pin_count="293",
-        ),
-        PackageCatalogEntry("", identity_name="DEVICE-S"),
-        PackageCatalogEntry("", identity_name="DEVICE-FAMILY"),
-    ]
-
-    result = merge_plan_package_labels(
-        entries,
-        target_tables=[target],
-        multi_package_plans={2: plan},
-    )
-
-    assert len(result) == 2
-    assert [entry.package_type for entry in result] == ["FCBGA", "FCCSP"]
-
-
-def test_confirmed_plan_does_not_merge_same_physical_name_mapping_spaces():
-    """相同封装元数据但不同器件映射空间仍是两个独立槽位。"""
-
-    target = target_table(
-        2,
-        "Pin Attributes",
-        ["SIGNAL NAME", "DEVICE-A NO.", "DEVICE-B NO.", "TYPE"],
-    )
-    plan = MultiPackagePlan(
-        True,
-        "package_columns",
-        bindings=(
-            PackageBinding("DEVICE-A", 1, 0, 3),
-            PackageBinding("DEVICE-B", 2, 0, 3),
-        ),
-    )
-    entries = [
-        PackageCatalogEntry(
-            "",
-            identity_name="DEVICE-A",
-            package_type="BGA",
-            package_drawing="ZCZ",
-            pin_count="324",
-        ),
-        PackageCatalogEntry(
-            "",
-            identity_name="DEVICE-B",
-            package_type="BGA",
-            package_drawing="ZCZ",
-            pin_count="324",
-        ),
-        PackageCatalogEntry("", identity_name="DEVICE-FAMILY"),
-    ]
-
-    result = merge_plan_package_labels(
-        entries,
-        target_tables=[target],
-        multi_package_plans={2: plan},
-    )
-
-    assert len(result) == 2
-    assert [entry.identity_name for entry in result] == [
-        "DEVICE-A",
-        "DEVICE-B",
-    ]
-
-
-def test_confirmed_plan_does_not_delete_additional_physical_packages():
-    """真实物理签名多于局部表分支时，不能用一张表裁剪全文目录。"""
-
-    target = target_table(
-        2,
-        "Partial Pin Map",
-        ["SIGNAL NAME", "PKG-A NO.", "PKG-B NO.", "TYPE"],
-    )
-    plan = MultiPackagePlan(
-        True,
-        "package_columns",
-        bindings=(
-            PackageBinding("PKG-A", 1, 0, 3),
-            PackageBinding("PKG-B", 2, 0, 3),
-        ),
-    )
-    entries = [
-        PackageCatalogEntry(
-            "",
-            package_type=f"PACKAGE-{index}",
-            package_drawing=f"DRAWING-{index}",
-            pin_count=str(20 + index),
-        )
-        for index in range(3)
-    ]
-
-    result = merge_plan_package_labels(
-        entries,
-        target_tables=[target],
-        multi_package_plans={2: plan},
-    )
-
-    assert len(result) == 3
-
-
-def test_name_branch_plan_does_not_trim_document_catalog():
-    """名称分支可能只覆盖部分封装，不能用于裁剪全文目录。"""
-
-    target = target_table(
-        2,
-        "Mode-specific Pin Names",
-        ["PACKAGE-A NAME", "PACKAGE-B NAME", "PIN NO.", "TYPE"],
-    )
-    plan = MultiPackagePlan(
-        True,
-        "package_name_columns",
-        bindings=(
-            PackageBinding("PACKAGE-A", 2, 0, 3),
-            PackageBinding("PACKAGE-B", 2, 1, 3),
-        ),
-    )
-    entries = [
-        PackageCatalogEntry("", identity_name=f"DEVICE-{index}")
-        for index in range(3)
-    ]
-
-    result = merge_plan_package_labels(
-        entries,
-        target_tables=[target],
-        multi_package_plans={2: plan},
-    )
-
-    assert len(result) == 3
-
-
-def test_identity_summary_creates_real_packages_and_packaging_only_enriches():
-    """总述表创建 INA 身份，包装表只能补 DCK/DGK/RGV 等元数据。"""
+def test_incomplete_identity_and_packaging_facts_remain_separate_slots():
+    """缺 drawing 的身份事实不能和缺 device 的包装事实进行弱合并。"""
 
     identity_summary = catalog_table(
         0,
@@ -631,18 +438,21 @@ def test_identity_summary_creates_real_packages_and_packaging_only_enriches():
         classifier=classifier,
     )
 
-    assert [entry.identity_name for entry in result.entries] == [
-        "INA290",
-        "INA2290",
-        "INA4290",
+    assert len(result.entries) == 6
+    assert [entry.identity_name for entry in result.entries[:3]] == [
+        "INA290", "INA2290", "INA4290",
     ]
+    assert [entry.identity_name for entry in result.entries[3:]] == ["", "", ""]
     assert [
         (entry.package_type, entry.package_drawing, entry.pin_count)
         for entry in result.entries
     ] == [
+        ("SC-70", "", "5"),
+        ("VSSOP", "", "8"),
+        ("QFN", "", "16"),
         ("SC-70", "DCK", "5"),
         ("VSSOP", "DGK", "8"),
-        ("QFN", "RGV", "16"),
+        ("VQFN", "RGV", "16"),
     ]
     assert [result.assignment_for(table_id, 0).pkg for table_id in (1, 2, 3)] == [
         "SC-70",
@@ -691,8 +501,8 @@ def test_same_public_package_type_does_not_merge_independent_identity_slots():
         "slot:1",
     ]
     assert [item.pkg for item in result.declared_assignments()] == [
-        "QFN",
-        "QFN",
+        "RGV",
+        "RGT",
     ]
 
 
@@ -733,7 +543,7 @@ def test_packaging_metadata_can_establish_physical_slot_without_identity():
     assert len(result.entries) == 1
     assert result.entries[0].identity_name == ""
     assert result.entries[0].package_type == "VSSOP"
-    assert result.declared_assignments()[0].pkg == "VSSOP"
+    assert result.declared_assignments()[0].pkg == "DGK"
 
 
 def test_unresolved_tables_share_one_frozen_fallback_slot():
@@ -759,13 +569,9 @@ def test_unresolved_tables_share_one_frozen_fallback_slot():
     assert [item.pkg for item in result.declared_assignments()] == ["a"]
 
 
-def test_package_name_rejects_multiple_or_overlong_values():
-    assert clean_package_name("SF2507") == "SF2507"
-    assert clean_package_name("SF2507|SF2507E") == ""
-    assert clean_package_name("ABCDEFGHIJKLMNOP") == ""
 
 
-def test_catalog_model_response_keeps_only_structure_not_package_values():
+def test_catalog_model_response_keeps_structure_and_literal_entries_only():
     normalized = normalize_package_catalog_response(
         {
             "is_package_summary": True,
@@ -775,7 +581,7 @@ def test_catalog_model_response_keeps_only_structure_not_package_values():
                 {"column_index": 0, "role": "package_identity"},
                 {"column_index": 1, "role": "package_type"},
             ],
-            # 即使模型违规返回名称，规范化层也必须彻底丢弃。
+            # 未按 entries 协议返回的旧 packages 字段必须彻底丢弃。
             "packages": [{"name": "WRONG_MODEL_VALUE"}],
         }
     )
@@ -788,6 +594,7 @@ def test_catalog_model_response_keeps_only_structure_not_package_values():
             {"column_index": 0, "role": "package_identity"},
             {"column_index": 1, "role": "package_type"},
         ],
+        "entries": [],
     }
 
 
@@ -1072,3 +879,14 @@ def test_full_pipeline_skips_unresolved_table_before_row_extraction():
     assert skipped["status"] == "skipped"
     assert skipped["skip_reason"] == "package_unresolved"
     assert skipped["package_binding"]["unresolved_local_slots"] == [0]
+
+
+def load_tests(loader, tests, pattern):
+    """让不依赖 pytest fixture 的函数式测试也能被 unittest 完整收集。"""
+
+    suite = unittest.TestSuite()
+    module = __import__(__name__, fromlist=["*"])
+    for name, function in inspect.getmembers(module, inspect.isfunction):
+        if name.startswith("test_"):
+            suite.addTest(unittest.FunctionTestCase(function, description=name))
+    return suite

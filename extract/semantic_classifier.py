@@ -4,7 +4,8 @@
 
 1. 每个请求接收最多四张初筛表的标题、完整表头和代表性数据行，逐表判断
    是否提取；小表的数据行保持完整。
-2. 表格需要提取时，把目标列映射为 ``pin_no``、``pin_name`` 或 ``type``。
+2. 表格需要提取时，把目标列映射为 ``pin_no``、``pin_name``、``type``
+   或 ``description``。
 3. 每张表使用独立 ``request_id``；批内表格禁止相互合并或共享判断结果。
 
 ``classify_table_schema`` 不判断封装名、分组名或表格角色，也不生成最终引脚
@@ -91,7 +92,7 @@ def classify_table_schema_batch(
             "for every request_id; never combine evidence or columns across tables."
         ),
         "rules": build_schema_prompt_payload("", [], [])["rules"],
-        "allowed_fields": ["pin_no", "pin_name", "type"],
+        "allowed_fields": ["pin_no", "pin_name", "type", "description"],
         "tables": requests,
         "output_schema": {
             "results": [
@@ -101,7 +102,7 @@ def classify_table_schema_batch(
                     "columns": [
                         {
                             "column_index": 0,
-                            "field": "pin_no|pin_name|type",
+                            "field": "pin_no|pin_name|type|description",
                         }
                     ],
                 }
@@ -158,7 +159,8 @@ def classify_package_catalog_tables(
         "task": (
             "Independently classify every complete candidate table for document-level "
             "package resolution. Return one result per request_id. Never combine tables "
-            "or return package names and extracted cell values."
+            "and transcribe raw device/package/drawing/pin-count values with their "
+            "source row indexes. Never merge, normalize, rank, or infer packages."
         ),
         "rules": [
             "Read the complete table, title and chapter context.",
@@ -175,6 +177,8 @@ def classify_package_catalog_tables(
             "header_row_index is zero-based and points to the last header row; data starts on the following row.",
             "Return irrelevant when the table neither establishes identities nor supplies packaging metadata.",
             "This task does not identify pin_no, pin_name, type, group names or row values.",
+            "For accepted tables, copy each package record into entries using only literal cell values from one source row.",
+            "Never merge entries, never decide whether two packages are equal, and never use pin count to merge or rank packages.",
         ],
         "document": {"source_name": source_name},
         "tables": [
@@ -222,6 +226,13 @@ def classify_package_catalog_tables(
                     "pin_count|orderable_sku|ignore"
                 ),
             }],
+            "entries": [{
+                "device": "literal source cell value or empty string",
+                "package": "literal source cell value or empty string",
+                "drawing_code": "literal source cell value or empty string",
+                "declared_pin_count": "literal source cell value or empty string",
+                "source_row_index": "zero-based original row index",
+            }],
         }]},
     }
     response = call_model_json(
@@ -230,7 +241,8 @@ def classify_package_catalog_tables(
         system_prompt=(
             "You independently classify up to four complete semiconductor package-summary "
             "or packaging tables. Return valid JSON containing only results. Preserve "
-            "every request_id and never merge tables or output package names/cell values."
+            "every request_id. Copy requested cell values literally with source row indexes; "
+            "never merge, infer, rank, or normalize package records."
         ),
         max_tokens=int(os.getenv("EXTRACT_PACKAGE_BATCH_MAX_TOKENS", "7000")),
         timeout=float(os.getenv("EXTRACT_PACKAGE_TIMEOUT", "60")),
@@ -255,7 +267,7 @@ def build_schema_prompt_payload(
         "task": (
             "Decide whether this semiconductor datasheet table should be used to extract "
             "physical pin/ball/terminal records. If it should, identify only the columns "
-            "needed as pin_no, pin_name, or type."
+            "needed as pin_no, pin_name, type, or description."
         ),
         "rules": [
             "Use semantic meaning, not exact header names only.",
@@ -270,10 +282,11 @@ def build_schema_prompt_payload(
             "Rows may be a deterministic sample from a large table. Use them only to validate column semantics; never assume omitted rows or packages do not exist.",
             "Structural branch labels identify parallel object/package branches, but they are not final public package names.",
             "For multiple type-like columns, select only the type most directly describing the pin/signal, such as SIGNAL TYPE rather than BUFFER TYPE.",
-            "Do not select description, conditions, min/typ/max, unit, reset state, power source, notes, ordering, or other auxiliary columns.",
+            "Select the direct DESCRIPTION column as description when it exists.",
+            "Do not select conditions, min/typ/max, unit, reset state, power source, notes, ordering, or other auxiliary columns.",
             "Do not return package names, group names, table roles, confidence scores, reasons, or extracted row values.",
         ],
-        "allowed_fields": ["pin_no", "pin_name", "type"],
+        "allowed_fields": ["pin_no", "pin_name", "type", "description"],
         "table": {
             "title": title,
             "headers": headers,
@@ -294,7 +307,7 @@ def build_schema_prompt_payload(
             "columns": [
                 {
                     "column_index": 0,
-                    "field": "pin_no|pin_name|type",
+                    "field": "pin_no|pin_name|type|description",
                 }
             ],
         },
@@ -485,7 +498,7 @@ def normalize_schema_batch_response(
 
 
 def normalize_package_catalog_response(response: dict[str, Any]) -> dict[str, Any]:
-    """只保留表格结构协议，彻底丢弃模型生成的名称和值。"""
+    """保留结构和原始抄录值；值仍须由目录模块回到原表逐行验证。"""
 
     table_role = re.sub(
         r"[^a-z_]+",
@@ -537,11 +550,29 @@ def normalize_package_catalog_response(response: dict[str, Any]) -> dict[str, An
                 "role": role,
             }
         )
+    entries = []
+    for item in response.get("entries") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            source_row_index = int(item.get("source_row_index", -1))
+        except (TypeError, ValueError):
+            source_row_index = -1
+        entries.append(
+            {
+                "device": str(item.get("device") or ""),
+                "package": str(item.get("package") or ""),
+                "drawing_code": str(item.get("drawing_code") or ""),
+                "declared_pin_count": str(item.get("declared_pin_count") or ""),
+                "source_row_index": source_row_index,
+            }
+        )
     return {
         "is_package_summary": bool(response.get("is_package_summary")),
         "table_role": table_role,
         "header_row_index": header_row_index,
         "columns": columns,
+        "entries": entries,
     }
 
 
@@ -582,6 +613,6 @@ def normalize_schema_field(field: str) -> str:
         "i_o": "type",
     }
     normalized = aliases.get(normalized, normalized)
-    if normalized not in {"pin_no", "pin_name", "type"}:
+    if normalized not in {"pin_no", "pin_name", "type", "description"}:
         return "ignore"
     return normalized

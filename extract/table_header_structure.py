@@ -6,8 +6,8 @@
 固定处理流程：
 
 1. 展开 HTML 单元格的 ``rowspan`` 和 ``colspan``，形成列对齐的二维表格。
-2. 字段语义只负责提供一个候选种子行；表头是否继续向下延伸，只依据父子行
-   的跨列结构、重复父节点和子节点分裂关系判断。
+2. 只依据父子行的跨列结构、重复父节点、子节点分裂关系和后续稳定数据结构，
+   独立确定完整表头与数据起始行；字段语义不参与边界判断。
 3. 同时处理一个名称对应多个编号、一个编号对应多个名称以及多层封装分支表头。
 4. 根据确定的最后一行表头，为每个数据列建立完整表头路径。
 5. 将 PIN NAME、BALL NAME、SIGNAL NAME、TERMINAL NAME 统一视为
@@ -83,6 +83,17 @@ class HeaderBoundary:
     header_end: int
     data_start: int
     evidence: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TableHeaderStructure:
+    """候选表冻结后的表头结构，是后续所有字段判断的唯一边界来源。"""
+
+    header_rows: tuple[int, ...]
+    data_start_row: int
+    columns: tuple[HeaderColumnPath, ...]
+    evidence: tuple[str, ...] = ()
+    confidence: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -254,6 +265,54 @@ def build_header_paths(
     return tuple(result)
 
 
+def analyze_table_header_structure(
+    rows: Sequence[Sequence[str]],
+) -> TableHeaderStructure:
+    """不读取字段关键词，纯结构确定表头区域和数据起始行。
+
+    默认第一行属于表头。随后只在相邻两行形成明确的父子拆分关系时向下
+    延伸。父节点覆盖整张表、没有区域外稳定列时，还必须由下一行证明：候选
+    子表头与后续数据行的列形态明显不同。这样既支持任意语言和任意字段名，
+    也不会把普通两列数据误当成第二层表头。
+    """
+
+    if not rows:
+        return TableHeaderStructure((), 0, (), ("表格没有可分析行",), 0.0)
+
+    boundary = 0
+    evidence = ["第 1 行作为结构分析起点"]
+    while boundary + 1 < len(rows):
+        child_index = boundary + 1
+        reason = _structural_header_refinement_reason(
+            rows[boundary],
+            rows[child_index],
+            child_index,
+            following_rows=rows[child_index + 1 : child_index + 5],
+        )
+        if not reason:
+            break
+        boundary = child_index
+        evidence.append(reason)
+
+    header_rows = tuple(range(boundary + 1))
+    columns = build_header_paths(rows, boundary)
+    confidence = min(1.0, 0.65 + 0.1 * max(0, len(header_rows) - 1))
+    if boundary + 1 >= len(rows):
+        # 没有正文行时仍返回结构，但降低可信度，后续候选筛选会拒绝空数据表。
+        confidence = min(confidence, 0.35)
+        evidence.append("表头之后没有正文行")
+    else:
+        evidence.append(f"第 {boundary + 2} 行是冻结后的数据起始行")
+
+    return TableHeaderStructure(
+        header_rows=header_rows,
+        data_start_row=boundary + 1,
+        columns=columns,
+        evidence=tuple(evidence),
+        confidence=confidence,
+    )
+
+
 def _repair_structural_header_blanks(
     rows: Sequence[Sequence[str]],
     width: int,
@@ -294,38 +353,21 @@ def resolve_header_boundary(
     rows: Sequence[Sequence[str]],
     seed_header_index: int,
 ) -> HeaderBoundary:
-    """从候选种子行向下确定完整表头边界。
+    """兼容旧调用；边界现在统一由纯结构分析生成。
 
-    ``seed_header_index`` 来自后续字段识别阶段，只表示“到这一行已经能形成
-    可识别字段”。本函数不再读取字段名称，也不再判断单元格是否像引脚号；
-    它只识别多层表头中通用的“重复父节点 -> 子节点分裂”结构。
+    ``seed_header_index`` 仅用于兼容旧接口，不再影响边界。这样调用方即使
+    先做过字段识别，也不能把字段关键词重新带回表头/数据边界判断。
     """
 
-    if seed_header_index < 0 or seed_header_index >= len(rows):
+    if seed_header_index < 0 or not rows:
         return HeaderBoundary(0, -1, 0, ("没有可用的字段表头种子行",))
-
-    boundary = seed_header_index
-    evidence = [f"候选种子行位于第 {seed_header_index + 1} 行"]
-
-    # 每次只允许紧邻下一行通过完整结构校验；一旦命中真实数据立即停止。
-    # 不限制表头层数，避免把合法的三层以上封装表头截断。
-    while boundary + 1 < len(rows):
-        candidate_index = boundary + 1
-        reason = _structural_header_refinement_reason(
-            rows[boundary],
-            rows[candidate_index],
-            candidate_index,
-        )
-        if not reason:
-            break
-        boundary = candidate_index
-        evidence.append(reason)
-
+    structure = analyze_table_header_structure(rows)
+    boundary = structure.data_start_row - 1
     return HeaderBoundary(
         header_start=0,
         header_end=boundary,
-        data_start=boundary + 1,
-        evidence=tuple(evidence),
+        data_start=structure.data_start_row,
+        evidence=structure.evidence,
     )
 
 
@@ -342,6 +384,8 @@ def _structural_header_refinement_reason(
     parent: Sequence[str],
     child: Sequence[str],
     child_index: int,
+    *,
+    following_rows: Sequence[Sequence[str]] = (),
 ) -> str:
     """只依据相邻两行的列结构判断子行是否仍属于表头。
 
@@ -351,18 +395,32 @@ def _structural_header_refinement_reason(
     """
 
     width = max(len(parent), len(child))
-    parent_values = [_normalize(_cell(parent, index)) for index in range(width)]
-    child_values = [_normalize(_cell(child, index)) for index in range(width)]
+    # 先按明确的共同子分组修复父行内部空位，再分析父子关系。这个步骤只
+    # 依赖相邻单元格的 span 结构，不会把普通正文空值向左或向右填充。
+    repaired = _repair_structural_header_blanks((parent, child), width)
+    parent_values = [_normalize(value) for value in repaired[0]]
+    child_values = [_normalize(value) for value in repaired[1]]
     groups = _contiguous_repeated_groups(parent_values)
     split_groups: list[tuple[int, ...]] = []
+    intermediate_groups: list[tuple[int, ...]] = []
     for group in groups:
         labels = [child_values[index] for index in group]
         if all(labels) and len(set(labels)) >= 2:
             split_groups.append(group)
-    if not split_groups:
+        elif (
+            all(labels)
+            and len(set(labels)) == 1
+            and labels[0] != parent_values[group[0]]
+            and _following_row_splits_group(group, child_values, following_rows)
+        ):
+            # 例如 ``PIN -> NAME -> Device A/Device B``：中间 NAME 行本身
+            # 尚未分裂，但紧邻下一行会分裂同一区域，因此 NAME 仍是表头。
+            intermediate_groups.append(group)
+    if not split_groups and not intermediate_groups:
         return ""
 
-    branch_indexes = {index for group in split_groups for index in group}
+    structural_groups = split_groups + intermediate_groups
+    branch_indexes = {index for group in structural_groups for index in group}
     unchanged_outside = 0
     for index in range(width):
         if index in branch_indexes or not child_values[index]:
@@ -373,14 +431,94 @@ def _structural_header_refinement_reason(
 
     # 纯两列表在没有外部稳定列时无法仅靠结构区分“子表头”和第一条数据。
     # 多个独立父节点同时分裂本身是足够强的结构证据。
-    if unchanged_outside == 0 and len(split_groups) < 2:
-        return ""
+    if unchanged_outside == 0 and len(structural_groups) < 2:
+        # 父节点覆盖整张表时没有“区域外稳定列”可供验证。此时必须检查
+        # 下一批行的无语义列形态，只有候选子行与后续正文存在明显结构变化
+        # 才接受，避免 AXIS/AXIS 后的 VALUE-A/VALUE-B 被误当表头。
+        if not _child_differs_from_following_data(child, following_rows):
+            return ""
 
     spans = ", ".join(
         f"{group[0] + 1}-{group[-1] + 1}"
-        for group in split_groups
+        for group in structural_groups
     )
     return f"第 {child_index + 1} 行按重复父节点拆分列 {spans}"
+
+
+def _following_row_splits_group(
+    group: Sequence[int],
+    child_values: Sequence[str],
+    following_rows: Sequence[Sequence[str]],
+) -> bool:
+    """确认中间父层在下一行确实拆成多个不同子标签。"""
+
+    if not following_rows:
+        return False
+    next_row = following_rows[0]
+    labels = [_normalize(_cell(next_row, index)) for index in group]
+    if not all(labels) or len(set(labels)) < 2:
+        return False
+    # 中间行覆盖该区域的标签必须保持一致，避免从普通数据行跨层寻找模式。
+    return len({child_values[index] for index in group}) == 1
+
+
+def _child_differs_from_following_data(
+    child: Sequence[str],
+    following_rows: Sequence[Sequence[str]],
+) -> bool:
+    """用不含字段词典的单元格形态确认整表父节点下的子表头。"""
+
+    usable = [row for row in following_rows if any(str(value or "").strip() for value in row)]
+    if not usable:
+        return False
+    child_profile = _row_shape_profile(child)
+    similarities = [
+        _profile_similarity(child_profile, _row_shape_profile(row))
+        for row in usable
+    ]
+    return sum(similarities) / len(similarities) < 0.72
+
+
+def _row_shape_profile(row: Sequence[str]) -> tuple[str, ...]:
+    """把一行转换成通用形态，不判断内容是否像引脚或字段名。"""
+
+    return tuple(_cell_shape(value) for value in row)
+
+
+def _cell_shape(value: object) -> str:
+    """按空值、数值、紧凑标识符、短语和长文本区分单元格形态。"""
+
+    text = " ".join(str(value or "").split())
+    if not text:
+        return "empty"
+    if re.fullmatch(r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)", text):
+        return "number"
+    if len(text) <= 40 and not re.search(r"\s", text):
+        return "compact"
+    if len(text) <= 80:
+        return "phrase"
+    return "long_text"
+
+
+def _profile_similarity(
+    left: Sequence[str],
+    right: Sequence[str],
+) -> float:
+    """计算两个无语义行形态的逐列相似度。"""
+
+    width = max(len(left), len(right))
+    if width == 0:
+        return 1.0
+    matches = 0.0
+    for index in range(width):
+        left_value = left[index] if index < len(left) else "empty"
+        right_value = right[index] if index < len(right) else "empty"
+        if left_value == right_value:
+            matches += 1.0
+        elif {left_value, right_value} <= {"compact", "number"}:
+            # 数值与紧凑标识符都属于原子值，但仍只计半分。
+            matches += 0.5
+    return matches / width
 
 
 def _contiguous_repeated_groups(values: Sequence[str]) -> list[tuple[int, ...]]:

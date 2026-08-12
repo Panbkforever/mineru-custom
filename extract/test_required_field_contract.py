@@ -6,9 +6,12 @@ from extract.multi_package_extractor import BoundPackageRow
 from extract.pin_package_extractor import (
     ColumnDecision,
     TableCandidate,
+    attach_record_trace,
     decision_from_schema,
     extract_pin_package_info_from_table_candidates,
     extract_records_from_bound_package_row,
+    new_table_stage_counts,
+    update_stage_counts_before_add,
 )
 
 
@@ -136,6 +139,51 @@ class RequiredFieldContractTest(unittest.TestCase):
 
         self.assertTrue(decision.should_extract)
         self.assertEqual(decision.reason, "semantic_selected")
+
+    def test_explicit_pin_lines_are_counted_without_silent_loss(self) -> None:
+        """显式换行恢复后的两个编号必须形成可核对的两项阶段统计。"""
+
+        counts = new_table_stage_counts()
+        records = [{"pin_no": "B12"}, {"pin_no": "A12"}]
+
+        update_stage_counts_before_add(counts, ["B12\nA12"], records)
+
+        self.assertEqual(counts["source_pin_cell_count"], 1)
+        self.assertEqual(counts["source_explicit_line_item_count"], 2)
+        self.assertEqual(counts["pin_tokens_after_split"], 2)
+        self.assertEqual(counts["records_after_row_extraction"], 2)
+        self.assertEqual(counts["silent_pin_loss_count"], 0)
+
+    def test_unrecognized_nonempty_pin_value_is_preserved_and_traced(self) -> None:
+        """不能拆分的原始编号不得丢弃，并且必须能回查来源表和来源行。"""
+
+        counts = new_table_stage_counts()
+        records = [{"pin_no": "RAW?PIN"}]
+        update_stage_counts_before_add(counts, ["RAW?PIN"], records)
+        attach_record_trace(
+            records[0],
+            table_id=9,
+            source_row=24,
+            source_pin_values=["RAW?PIN"],
+        )
+
+        self.assertEqual(counts["pin_tokens_after_split"], 1)
+        self.assertEqual(counts["preserved_original_pin_cell_count"], 1)
+        self.assertEqual(counts["silent_pin_loss_count"], 0)
+        self.assertEqual(records[0]["_trace"]["source_table_id"], 9)
+        self.assertEqual(records[0]["_trace"]["source_row"], 24)
+        self.assertEqual(records[0]["_trace"]["normalized_pin_no"], ["RAW?PIN"])
+
+    def test_nonempty_pin_value_without_output_record_is_reported_as_loss(self) -> None:
+        """非空编号未生成记录时必须计入 silent_pin_loss_count。"""
+
+        counts = new_table_stage_counts()
+
+        update_stage_counts_before_add(counts, ["B12\nA12"], [])
+
+        self.assertEqual(counts["pin_tokens_after_split"], 2)
+        self.assertEqual(counts["records_after_row_extraction"], 0)
+        self.assertEqual(counts["silent_pin_loss_count"], 2)
 
 
 if __name__ == "__main__":

@@ -10,24 +10,23 @@
    器件信息、封装信息、订购信息及对应英文时属于最高优先级；否则只从
    目录前、目录结束后三页或文档末十页等限定页面区域召回。章节标题不能
    代替当前表题触发最高优先级。
-2. 模型只判断表格角色、表头行和列角色，不返回任何 pkg 值。
-3. 代码按照模型给出的列索引逐行读取原表，并结合已经严格确认的表内分支，
-   确定文档中有几个相互独立的物理引脚映射空间，再冻结为
-   slot:0、slot:1……。
-4. ``package_identity``（器件型号）只作为跨表关联证据；公开 ``pkg`` 只取
-   ``package_type``（SC-70、VSSOP、QFN 等物理封装名称）。
-5. 严格确认的 N 个表内分支是 N 个独立输出槽位的下限。总述表即使只找到
-   一个公开封装名，也必须建立 N 个槽位并复用该名称；最终输出再追加数字
-   后缀。已有严格多分支证据时，只有器件型号、没有任何物理封装元数据的
-   目录项不能额外增加槽位。没有多分支证据时，仍保持原目录判断流程。
+2. 模型只判断表格角色和字段位置；代码按这些位置从原表保留 device、
+   package、drawing、declared_pin_count 原始事实，模型不能合并事实。
+3. 原始事实与输出槽位分开保存。只有 device、package、drawing 三项都完整
+   且全部一致的事实才允许合并；pin_count 只记录，绝不参与合并或绑定。
+4. 已确认引脚表中的明确封装分支可以反向补全目录缺失槽位，并记录
+   ``catalog_conflict``；普通数据值不能用于猜测 pkg。
+5. 封装槽位只能来自第二次模型抄录的原始事实，或已确认引脚表中明确的
+   封装分支表头。禁止根据声明 pin 数、候选表数量或预期结果克隆槽位。
 6. 目标引脚表只通过表题、章节标题、表头和多封装列标签绑定已有槽位；
    description 和数据行不能参与绑定。
 7. 槽位冻结后，任何未匹配表都不能创建新 pkg。单封装文档可以绑定唯一
    槽位；多封装文档中无法唯一归属的表必须标记为 unresolved，禁止默认
    塞入第一个槽位。真实名称缺失时仅对已经确认的槽位使用 a、b、c……。
 8. 多封装表的全部本地分支必须一次性执行一对一绑定；禁止每个分支独立
-   兜底后落入同一个 package_key。标签脚注、drawing 和 pin_count 只用于
-   内部消歧，不改变任何引脚行内容。
+   兜底后落入同一个 package_key。标签脚注清理后的 device、package 和
+   drawing 可以提供精确匹配证据；pin_count 只进入诊断，永不参与消歧、
+   槽位合并或表格绑定，也不改变任何引脚行内容。
 9. ``XXX Mode Pin Name`` 形成的运行模式分支只控制名称列读取，不创建 pkg
    槽位；这些分支必须共同绑定当前表所属的同一个物理封装。
 
@@ -48,12 +47,11 @@ from __future__ import annotations
 
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from extract.multi_PkgTab_extractor import (
     MultiPkgTabResolution,
-    catalog_groups_confirmed_by_target_tables,
     resolve_multi_pkg_tab_structure,
 )
 
@@ -97,6 +95,23 @@ class PackageTargetTable:
     headers: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class RawPackageFact:
+    """第二次模型确认字段后，从原始表格读取的一条封装事实。
+
+    该对象只保存证据，不等同于输出槽位。``declared_pin_count`` 便于调试和
+    校验，但不得进入槽位合并键或目标表绑定分数。
+    """
+
+    device: str = ""
+    package: str = ""
+    drawing_code: str = ""
+    declared_pin_count: str = ""
+    source_table_id: int = -1
+    source_row_index: int = -1
+    table_role: str = ""
+
+
 @dataclass
 class PackageCatalogEntry:
     """一个已经冻结的物理封装槽位。
@@ -112,6 +127,8 @@ class PackageCatalogEntry:
     package_drawing: str = ""
     pin_count: str = ""
     evidence_table_ids: list[int] = field(default_factory=list)
+    raw_facts: list[RawPackageFact] = field(default_factory=list)
+    origin: str = "package_catalog"
 
 
 @dataclass(frozen=True)
@@ -124,6 +141,17 @@ class PackageColumnRole:
 
 
 @dataclass(frozen=True)
+class PackageCatalogRawValue:
+    """第二次模型对一条原始封装记录的逐字段抄录结果。"""
+
+    device: str = ""
+    package: str = ""
+    drawing_code: str = ""
+    declared_pin_count: str = ""
+    source_row_index: int = -1
+
+
+@dataclass(frozen=True)
 class PackageCatalogDecision:
     """模型对一张候选表的结构判断。"""
 
@@ -131,6 +159,7 @@ class PackageCatalogDecision:
     table_role: str
     header_row_index: int
     columns: tuple[PackageColumnRole, ...] = ()
+    raw_values: tuple[PackageCatalogRawValue, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -149,6 +178,8 @@ class PackageCatalogResolution:
     entries: list[PackageCatalogEntry]
     assignments: dict[tuple[int, int], PackageAssignment]
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    raw_facts: list[RawPackageFact] = field(default_factory=list)
+    document_route: str = "package_structure_unresolved"
 
     def assignment_for(
         self,
@@ -195,6 +226,7 @@ def resolve_document_package_catalog(
 
     diagnostics: list[dict[str, Any]] = []
     entries: list[PackageCatalogEntry] = []
+    raw_facts: list[RawPackageFact] = []
 
     # 已经由第一次模型确认的引脚表不能再次作为封装总述候选送入第二次
     # 模型。两个模型阶段职责独立，避免重复请求和相互污染。
@@ -213,20 +245,19 @@ def resolve_document_package_catalog(
             classifier=classifier,
         )
         diagnostics.extend(semantic_diagnostics)
+        raw_facts = [fact for entry in entries for fact in entry.raw_facts]
 
-    # 同一物理封装有时会被总述表和 Packaging Information 分别写成
-    # ``(TSSOP-14) - PW`` 与 ``TSSOP / PW / 14``。冻结槽位前只合并物理
-    # 元数据完全相同且身份不冲突的重复证据，不能合并不同器件身份。
-    before_deduplication = len(entries)
-    entries = deduplicate_redundant_catalog_entries(entries)
-    if len(entries) != before_deduplication:
-        diagnostics.append(
-            {
-                "stage": "package_catalog_deduplication",
-                "before": before_deduplication,
-                "after": len(entries),
-            }
-        )
+    # 引脚表表头中的明确封装分支是强证据。目录缺少分支时在冻结 slot 之前
+    # 补槽位，并留下 catalog_conflict；普通数据行永远不能触发该补全。
+    entries = supplement_slots_from_explicit_table_branches(
+        entries,
+        target_tables=target_tables,
+        multi_package_plans=multi_package_plans,
+        diagnostics=diagnostics,
+    )
+    # 表头反向补全产生的强证据也属于本次解析的原始事实，调试信息必须
+    # 覆盖完整槽位来源，不能只记录第二次模型返回的事实。
+    raw_facts = [fact for entry in entries for fact in entry.raw_facts]
 
     # 第二次模型只给出封装目录，不负责判断这些封装是位于同一张表的不同
     # 字段，还是分别位于多张表。这里先完成文档结构分流，再冻结 slot。
@@ -236,22 +267,8 @@ def resolve_document_package_catalog(
         multi_package_plans=multi_package_plans,
     )
     diagnostics.extend(multi_pkg_tab_resolution.diagnostics)
-    entries = reconcile_multi_pkg_tab_catalog(
-        entries,
-        all_tables=all_tables,
-        resolution=multi_pkg_tab_resolution,
-        diagnostics=diagnostics,
-    )
-
-    # 总述表没有建立槽位时，严格确认的表内多封装结构可以提供槽位数量。
-    # 如果仍无多封装证据，但存在目标引脚表，则整篇文档只建立一个槽位；
-    # 绝不能按目标表数量建立槽位。
-    entries = merge_plan_package_labels(
-        entries,
-        target_tables=target_tables,
-        multi_package_plans=multi_package_plans,
-        diagnostics=diagnostics,
-    )
+    # 旧版 reconcile/merge_plan 会按 pin_count、封装族或分支数量修剪/克隆
+    # 目录项。新主流程不再调用这些函数，槽位只能来自原始事实或明确表头。
     if not entries and target_tables:
         entries = [
             PackageCatalogEntry(
@@ -270,7 +287,13 @@ def resolve_document_package_catalog(
         multi_pkg_tab_resolution=multi_pkg_tab_resolution,
         diagnostics=diagnostics,
     )
-    return PackageCatalogResolution(entries, assignments, diagnostics)
+    return PackageCatalogResolution(
+        entries=entries,
+        assignments=assignments,
+        diagnostics=diagnostics,
+        raw_facts=raw_facts,
+        document_route=multi_pkg_tab_resolution.document_mode,
+    )
 
 
 def find_package_catalog_candidates(
@@ -617,6 +640,26 @@ def package_catalog_decision_from_response(
     ) or (
         table_role == "packaging_metadata" and "orderable_sku" in roles
     )
+    raw_values: list[PackageCatalogRawValue] = []
+    for item in response.get("entries") or []:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            source_row_index = int(item.get("source_row_index", -1))
+        except (TypeError, ValueError):
+            source_row_index = -1
+        raw_values.append(
+            PackageCatalogRawValue(
+                device=clean_identity_name(str(item.get("device") or "")),
+                package=clean_public_package_name(str(item.get("package") or "")),
+                drawing_code=clean_metadata(str(item.get("drawing_code") or "")),
+                declared_pin_count=clean_pin_count(
+                    str(item.get("declared_pin_count") or "")
+                ),
+                source_row_index=source_row_index,
+            )
+        )
+
     return PackageCatalogDecision(
         is_package_summary=(
             bool(response.get("is_package_summary")) and structurally_valid
@@ -624,6 +667,7 @@ def package_catalog_decision_from_response(
         table_role=table_role if structurally_valid else "irrelevant",
         header_row_index=header_row_index,
         columns=tuple(columns),
+        raw_values=tuple(raw_values),
     )
 
 
@@ -635,342 +679,212 @@ def build_catalog_entries_from_decisions(
     *,
     target_tables: Sequence[PackageTargetTable] = (),
 ) -> list[PackageCatalogEntry]:
-    """先建立身份槽位，再补元数据；必要时由包装结构建立物理槽位。"""
+    """把模型确认的原始列转换为事实，再按严格身份键建立槽位。
 
-    entries: list[PackageCatalogEntry] = []
+    模型不拥有合并权限。代码逐行读取原始单元格；pin_count 只进入事实和
+    调试信息。所有通过第二次模型确认并由原表复核的事实都参与建槽；模型
+    返回的表格角色不能改变槽位数量，也不能让某类事实覆盖另一类事实。
+    """
 
-    # 第一遍只处理身份总述表。无论包装信息表在文档中位于前部还是后部，
-    # 都必须等器件身份槽位建立后才能参与补充。
-    for _, table, decision in decisions:
-        if decision.table_role != "identity_summary":
+    facts = extract_raw_package_facts(decisions, diagnostics)
+    slot_facts = facts
+    entries = build_strict_package_slots(slot_facts)
+
+    # 所有原始事实都附加到能够严格命中的槽位；未命中的事实仍保留在全局
+    # diagnostics 中，不能靠 SKU 前缀、pin_count 或封装族相似度强行合并。
+    for fact in facts:
+        key = strict_package_fact_key(fact)
+        if key is None:
             continue
-        created_names = create_identity_entries_from_table(
-            entries,
-            table,
-            decision,
-        )
-        diagnostics.append(
-            {
-                "stage": "package_catalog_rows",
-                "table_id": table.table_id,
-                "table_role": decision.table_role,
-                "created_or_merged": created_names,
-            }
-        )
+        for entry in entries:
+            if strict_entry_key(entry) == key and fact not in entry.raw_facts:
+                entry.raw_facts.append(fact)
+                if fact.source_table_id not in entry.evidence_table_ids:
+                    entry.evidence_table_ids.append(fact.source_table_id)
+                break
 
-    # 第二遍优先给已有身份槽位补元数据。
-    for _, table, decision in decisions:
-        if decision.table_role != "packaging_metadata":
-            continue
-        enriched_names = enrich_entries_from_packaging_table(
-            entries,
-            table,
-            decision,
-        )
-        diagnostics.append(
-            {
-                "stage": "package_catalog_rows",
-                "table_id": table.table_id,
-                "table_role": decision.table_role,
-                "enriched": enriched_names,
-            }
-        )
-
-    # 没有独立身份总述表时，订购表中的 SKU 仍可与目标引脚表题/章节中已经
-    # 出现的器件身份做严格前缀关联。例如 SF2507BC 与 SF2507、SF2507EBC
-    # 与 SF2507E。代码只接受目标表真实出现过的最长身份前缀，不自行截 SKU。
-    for _, table, decision in decisions:
-        if decision.table_role != "packaging_metadata":
-            continue
-        derived = create_target_identity_entries_from_packaging_table(
-            table,
-            decision,
-            target_tables,
-        )
-        for entry in derived:
-            merge_catalog_entry(entries, entry)
-        if derived:
-            diagnostics.append(
-                {
-                    "stage": "package_catalog_rows",
-                    "table_id": table.table_id,
-                    "table_role": decision.table_role,
-                    "created_from_target_identity": [
-                        {
-                            "identity_name": entry.identity_name,
-                            "package_type": entry.package_type,
-                            "package_drawing": entry.package_drawing,
-                            "pin_count": entry.pin_count,
-                        }
-                        for entry in derived
-                    ],
-                }
-            )
-
-    # 某些文档没有单独的器件身份总述表，只有 Packaging Information。
-    # 此时 package_type + drawing + pin_count 的唯一组合足以确定物理槽位，
-    # 但 orderable_sku 本身仍不能成为公开 pkg。
-    if not entries:
-        for _, table, decision in decisions:
-            if decision.table_role != "packaging_metadata":
-                continue
-            created = create_entries_from_packaging_table(table, decision)
-            for entry in created:
-                merge_physical_metadata_entry(entries, entry)
-            if created:
-                diagnostics.append(
-                    {
-                        "stage": "package_catalog_rows",
-                        "table_id": table.table_id,
-                        "table_role": decision.table_role,
-                        "created_physical_slots": [
-                            {
-                                "package_type": entry.package_type,
-                                "package_drawing": entry.package_drawing,
-                                "pin_count": entry.pin_count,
-                            }
-                            for entry in created
-                        ],
-                    }
-                )
+    diagnostics.append(
+        {
+            "stage": "package_slot_construction",
+            "raw_fact_count": len(facts),
+            "slot_fact_count": len(slot_facts),
+            "slot_count": len(entries),
+            "merge_rule": "complete_device_package_drawing_exact_match",
+            "pin_count_used_for_merge": False,
+        }
+    )
     return entries
 
 
-def create_target_identity_entries_from_packaging_table(
-    table: PackageCatalogTable,
-    decision: PackageCatalogDecision,
-    target_tables: Sequence[PackageTargetTable],
-) -> list[PackageCatalogEntry]:
-    """用订购 SKU 与目标表中的器件身份建立独立封装槽位。
+def extract_raw_package_facts(
+    decisions: Sequence[
+        tuple[int, PackageCatalogTable, PackageCatalogDecision]
+    ],
+    diagnostics: list[dict[str, Any]],
+) -> list[RawPackageFact]:
+    """按模型确认的列位置读取原表，保留每条封装事实及来源行。"""
 
-    该函数不从 SKU 猜测型号。只有一个字母数字标识符已经出现在目标引脚表
-    的表题或章节标题中，并且它是 SKU 的完整前缀时才允许关联；多个候选
-    同时匹配时取最长者，避免 ``SF2507E`` 被较短的 ``SF2507`` 抢占。
-    """
-
-    identity_candidates = collect_target_identity_candidates(target_tables)
-    if not identity_candidates:
-        return []
-
-    sku_columns = columns_for_role(decision, "orderable_sku")
-    matched_rows: list[tuple[str, Sequence[str]]] = []
-    for row in table.rows[decision.header_row_index + 1 :]:
-        sku_values = [
-            cell_value(row, column)
-            for column in sku_columns
-            if cell_value(row, column)
-        ]
-        identity = longest_target_identity_prefix(
-            sku_values,
-            identity_candidates,
-        )
-        if identity:
-            matched_rows.append((identity, row))
-
-    # 只有一项身份时无法证明多个订购行是否代表独立 pinout。此时保留原有
-    # 物理元数据/表内分支逻辑，避免把同一器件的温度或包装后缀误拆成 pkg。
-    distinct_identities = {
-        normalize_compact(identity)
-        for identity, _ in matched_rows
-    }
-    if len(distinct_identities) < 2:
-        return []
-
-    result: list[PackageCatalogEntry] = []
-    for identity, row in matched_rows:
-        package_type = first_role_value(row, decision, "package_type")
-        pin_count = clean_pin_count(
-            first_role_value(row, decision, "pin_count")
-        )
-        package_type, type_pin_count = split_package_type_and_pin_count(
-            package_type
-        )
-        incoming = PackageCatalogEntry(
-            package_key="",
-            identity_name=identity,
-            package_type=clean_public_package_name(package_type),
-            package_drawing=first_role_value(
-                row,
-                decision,
-                "package_drawing",
-            ),
-            pin_count=pin_count or type_pin_count,
-            evidence_table_ids=[table.table_id],
-        )
-        merge_catalog_entry(result, incoming)
-    return result
-
-
-def collect_target_identity_candidates(
-    target_tables: Sequence[PackageTargetTable],
-) -> dict[str, str]:
-    """收集目标表局部标题中真实出现的短器件标识符。"""
-
-    candidates: dict[str, str] = {}
-    for table in target_tables:
-        texts = [table.title, *table.current_chapter_titles]
-        for text in texts:
-            for token in re.findall(
-                r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9-]{3,14})(?![A-Za-z0-9])",
-                str(text or ""),
-            ):
-                compact = normalize_compact(token)
-                # 器件标识符必须同时含字母和数字。Table、Package、LQFP 等
-                # 普通标题词不满足该条件，也不会进入 SKU 前缀匹配。
-                if (
-                    not re.search(r"[a-z]", compact)
-                    or not re.search(r"\d", compact)
-                ):
-                    continue
-                cleaned = clean_identity_name(token)
-                if cleaned:
-                    candidates.setdefault(compact, cleaned)
-    return candidates
-
-
-def longest_target_identity_prefix(
-    sku_values: Sequence[str],
-    identity_candidates: Mapping[str, str],
-) -> str:
-    """返回与任一订购 SKU 匹配的最长目标表身份前缀。"""
-
-    matches: list[tuple[int, str]] = []
-    for sku_value in sku_values:
-        sku = normalize_compact(sku_value)
-        for compact, display_name in identity_candidates.items():
-            if sku.startswith(compact):
-                matches.append((len(compact), display_name))
-    if not matches:
-        return ""
-    matches.sort(key=lambda item: (-item[0], item[1]))
-    return matches[0][1]
-
-
-def create_identity_entries_from_table(
-    entries: list[PackageCatalogEntry],
-    table: PackageCatalogTable,
-    decision: PackageCatalogDecision,
-) -> list[str]:
-    """从身份总述表逐行创建槽位；器件型号只保存为内部关联键。"""
-
-    created_names: list[str] = []
-    identity_columns = columns_for_role(decision, "package_identity")
-    for row in table.rows[decision.header_row_index + 1 :]:
-        for identity_column in identity_columns:
-            identity_name = clean_identity_name(
-                cell_value(row, identity_column)
+    facts: list[RawPackageFact] = []
+    for _, table, decision in decisions:
+        table_facts: list[RawPackageFact] = []
+        # 模型按协议返回原始值时，先逐项校验这些值确实存在于对应原表行；
+        # 校验不通过的模型文本不能成为事实。随后仍由列映射读取原表，保证
+        # 模型漏项不会造成目录事实静默消失。
+        verified_model_values = {
+            (
+                value.device,
+                value.package,
+                value.drawing_code,
+                value.declared_pin_count,
+                value.source_row_index,
             )
-            if (
-                not identity_name
-                or is_generic_package_label(identity_name)
-                or is_repeated_header_value(
-                    identity_name,
-                    identity_column.header,
+            for value in decision.raw_values
+            if package_raw_value_exists_in_source(table, value)
+        }
+        for row_index, row in enumerate(
+            table.rows[decision.header_row_index + 1 :],
+            start=decision.header_row_index + 1,
+        ):
+            device = first_role_value(row, decision, "package_identity")
+            # orderable_sku 是订购料号，不是器件身份。包装表没有独立
+            # package_identity 时 device 必须保持为空，后续也不能用 SKU
+            # 前缀推断或补写 device。
+            package = first_role_value(row, decision, "package_type")
+            package, embedded_pin_count = split_package_type_and_pin_count(package)
+            drawing = first_role_value(row, decision, "package_drawing")
+            pin_count = (
+                clean_pin_count(first_role_value(row, decision, "pin_count"))
+                or embedded_pin_count
+            )
+            fact = RawPackageFact(
+                device=clean_identity_name(device),
+                package=clean_public_package_name(package),
+                drawing_code=clean_metadata(drawing),
+                declared_pin_count=pin_count,
+                source_table_id=table.table_id,
+                source_row_index=row_index,
+                table_role=decision.table_role,
+            )
+            # 空行、重复表头和只有 pin_count 的行都不是封装事实。
+            if not (fact.device or fact.package or fact.drawing_code):
+                continue
+            if any(
+                is_repeated_header_value(value, column.header)
+                for value, role in (
+                    (fact.device, "package_identity"),
+                    (fact.package, "package_type"),
+                    (fact.drawing_code, "package_drawing"),
                 )
+                for column in columns_for_role(decision, role)
+                if value
             ):
                 continue
-            package_type = first_role_value(row, decision, "package_type")
-            pin_count = clean_pin_count(
-                first_role_value(row, decision, "pin_count")
-            )
-            package_type, type_pin_count = split_package_type_and_pin_count(
-                package_type
-            )
-            package_type = clean_public_package_name(package_type)
-            incoming = PackageCatalogEntry(
-                package_key="",
-                identity_name=identity_name,
-                package_type=package_type,
-                package_drawing=first_role_value(
-                    row,
-                    decision,
-                    "package_drawing",
-                ),
-                pin_count=pin_count or type_pin_count,
-                evidence_table_ids=[table.table_id],
-            )
-            merge_catalog_entry(entries, incoming)
-            if identity_name not in created_names:
-                created_names.append(identity_name)
-    return created_names
+            facts.append(fact)
+            table_facts.append(fact)
+        diagnostics.append(
+            {
+                "stage": "package_catalog_raw_facts",
+                "table_id": table.table_id,
+                "table_role": decision.table_role,
+                "facts": [raw_package_fact_to_dict(fact) for fact in table_facts],
+                "verified_model_value_count": len(verified_model_values),
+            }
+        )
+    return facts
 
 
-def create_entries_from_packaging_table(
+def package_raw_value_exists_in_source(
     table: PackageCatalogTable,
-    decision: PackageCatalogDecision,
-) -> list[PackageCatalogEntry]:
-    """从包装表读取物理封装组合，不把订购型号误写为 pkg。"""
+    value: PackageCatalogRawValue,
+) -> bool:
+    """验证模型抄录值来自指定原表行，防止模型生成不存在的封装。"""
 
-    result: list[PackageCatalogEntry] = []
-    for row in table.rows[decision.header_row_index + 1 :]:
-        package_type = first_role_value(row, decision, "package_type")
-        package_type, type_pin_count = split_package_type_and_pin_count(
-            package_type
-        )
-        package_type = clean_public_package_name(package_type)
-        package_drawing = clean_metadata(
-            first_role_value(row, decision, "package_drawing")
-        )
-        pin_count = clean_pin_count(
-            first_role_value(row, decision, "pin_count")
-        ) or type_pin_count
-        if not package_type:
-            continue
-        result.append(
-            PackageCatalogEntry(
-                package_key="",
-                package_type=package_type,
-                package_drawing=package_drawing,
-                pin_count=pin_count,
-                evidence_table_ids=[table.table_id],
-            )
-        )
-    return result
-
-
-def enrich_entries_from_packaging_table(
-    entries: list[PackageCatalogEntry],
-    table: PackageCatalogTable,
-    decision: PackageCatalogDecision,
-) -> list[str]:
-    """按订购型号前缀关联已有 pkg，并补充包装元数据。"""
-
-    enriched_names: list[str] = []
-    lookup_columns = [
-        *columns_for_role(decision, "package_identity"),
-        *columns_for_role(decision, "orderable_sku"),
+    if value.source_row_index < 0 or value.source_row_index >= len(table.rows):
+        return False
+    row_text = normalize_compact(" ".join(table.rows[value.source_row_index]))
+    evidence = [
+        value.device,
+        value.package,
+        value.drawing_code,
+        value.declared_pin_count,
     ]
-    for row in table.rows[decision.header_row_index + 1 :]:
-        lookup_values = [
-            cell_value(row, column)
-            for column in lookup_columns
-            if cell_value(row, column)
-        ]
-        entry = match_existing_entry_from_orderable_values(entries, lookup_values)
-        if entry is None:
+    nonempty = [normalize_compact(item) for item in evidence if item]
+    return bool(nonempty and all(item in row_text for item in nonempty))
+
+
+def build_strict_package_slots(
+    facts: Sequence[RawPackageFact],
+) -> list[PackageCatalogEntry]:
+    """按完整三元组建立槽位；任何字段缺失时都不主动与其他事实合并。"""
+
+    entries: list[PackageCatalogEntry] = []
+    keyed_entries: dict[tuple[str, str, str], PackageCatalogEntry] = {}
+    for fact in facts:
+        key = strict_package_fact_key(fact)
+        if key is not None and key in keyed_entries:
+            entry = keyed_entries[key]
+            entry.raw_facts.append(fact)
+            if fact.source_table_id not in entry.evidence_table_ids:
+                entry.evidence_table_ids.append(fact.source_table_id)
             continue
 
-        package_type = first_role_value(row, decision, "package_type")
-        pin_count = clean_pin_count(
-            first_role_value(row, decision, "pin_count")
+        entry = PackageCatalogEntry(
+            package_key="",
+            identity_name=fact.device,
+            package_type=fact.package,
+            package_drawing=fact.drawing_code,
+            pin_count=fact.declared_pin_count,
+            evidence_table_ids=[fact.source_table_id],
+            raw_facts=[fact],
+            origin="package_catalog",
         )
-        package_type, type_pin_count = split_package_type_and_pin_count(
-            package_type
+        entries.append(entry)
+        if key is not None:
+            keyed_entries[key] = entry
+    return entries
+
+
+def strict_package_fact_key(
+    fact: RawPackageFact,
+) -> tuple[str, str, str] | None:
+    """完整 device/package/drawing 才生成可合并键，pin_count 不参与。"""
+
+    values = (
+        normalize_compact(fact.device),
+        normalize_compact(fact.package),
+        normalize_compact(fact.drawing_code),
+    )
+    return values if all(values) else None
+
+
+def strict_entry_key(
+    entry: PackageCatalogEntry,
+) -> tuple[str, str, str] | None:
+    """返回槽位的严格身份键，供原始事实附加和测试使用。"""
+
+    return strict_package_fact_key(
+        RawPackageFact(
+            device=entry.identity_name,
+            package=entry.package_type,
+            drawing_code=entry.package_drawing,
         )
-        update_entry_metadata(
-            entry,
-            package_type=package_type,
-            package_drawing=first_role_value(
-                row,
-                decision,
-                "package_drawing",
-            ),
-            pin_count=pin_count or type_pin_count,
-            evidence_table_id=table.table_id,
-        )
-        if entry.identity_name not in enriched_names:
-            enriched_names.append(entry.identity_name)
-    return enriched_names
+    )
+
+
+def raw_package_fact_to_dict(fact: RawPackageFact) -> dict[str, Any]:
+    """将事实转换为稳定调试结构，不改变任何原始字段语义。"""
+
+    return {
+        "device": fact.device,
+        "package": fact.package,
+        "drawing_code": fact.drawing_code,
+        "declared_pin_count": fact.declared_pin_count,
+        "source_table_id": fact.source_table_id,
+        "source_row_index": fact.source_row_index,
+        "table_role": fact.table_role,
+    }
+
+
 
 
 def columns_for_role(
@@ -1029,640 +943,6 @@ def split_package_type_and_pin_count(value: str) -> tuple[str, str]:
     return clean_metadata(match.group(1)), match.group(2)
 
 
-def match_existing_entry_from_orderable_values(
-    entries: Sequence[PackageCatalogEntry],
-    values: Sequence[str],
-) -> PackageCatalogEntry | None:
-    """用完整身份或订购型号前缀匹配已有 pkg，歧义时不补充。"""
-
-    ranked: list[tuple[int, PackageCatalogEntry]] = []
-    for entry in entries:
-        identity = normalize_compact(entry.identity_name)
-        if not identity:
-            continue
-        for value in values:
-            candidate = normalize_compact(value)
-            if candidate == identity or candidate.startswith(identity):
-                ranked.append((len(identity), entry))
-                break
-    if not ranked:
-        return None
-    best_length = max(length for length, _ in ranked)
-    best_entries = [
-        entry
-        for length, entry in ranked
-        if length == best_length
-    ]
-    # 槽位此时尚未执行 freeze_package_slots，package_key 仍为空，不能拿它
-    # 判断歧义；器件身份才是这一阶段可用的唯一稳定键。
-    unique = {
-        normalize_compact(entry.identity_name): entry
-        for entry in best_entries
-    }
-    return next(iter(unique.values())) if len(unique) == 1 else None
-
-
-def update_entry_metadata(
-    entry: PackageCatalogEntry,
-    *,
-    package_type: str,
-    package_drawing: str,
-    pin_count: str,
-    evidence_table_id: int,
-) -> None:
-    """只填充尚未确定的元数据，不能覆盖身份总述表已有信息。"""
-
-    if package_type and not entry.package_type:
-        entry.package_type = package_type
-    if package_drawing and not entry.package_drawing:
-        entry.package_drawing = package_drawing
-    if pin_count and not entry.pin_count:
-        entry.pin_count = pin_count
-    if evidence_table_id not in entry.evidence_table_ids:
-        entry.evidence_table_ids.append(evidence_table_id)
-
-
-def merge_catalog_entry(
-    entries: list[PackageCatalogEntry],
-    incoming: PackageCatalogEntry,
-) -> None:
-    """只按器件身份或明确别名合并，不按封装类型猜测。"""
-
-    incoming_names = {
-        normalize_compact(incoming.identity_name),
-        *(normalize_compact(alias) for alias in incoming.identity_aliases),
-    }
-    for existing in entries:
-        existing_names = {
-            normalize_compact(existing.identity_name),
-            *(normalize_compact(alias) for alias in existing.identity_aliases),
-        }
-        if incoming_names.isdisjoint(existing_names):
-            continue
-        for alias in [
-            incoming.identity_name,
-            *incoming.identity_aliases,
-        ]:
-            if (
-                alias != existing.identity_name
-                and alias not in existing.identity_aliases
-            ):
-                existing.identity_aliases.append(alias)
-        for table_id in incoming.evidence_table_ids:
-            if table_id not in existing.evidence_table_ids:
-                existing.evidence_table_ids.append(table_id)
-        if not existing.package_type:
-            existing.package_type = incoming.package_type
-        if not existing.package_drawing:
-            existing.package_drawing = incoming.package_drawing
-        if not existing.pin_count:
-            existing.pin_count = incoming.pin_count
-        return
-    entries.append(incoming)
-
-
-def merge_physical_metadata_entry(
-    entries: list[PackageCatalogEntry],
-    incoming: PackageCatalogEntry,
-) -> None:
-    """包装表无身份列时，按完整物理元数据组合去重槽位。
-
-    package_type 相同但 drawing 或 pin_count 不同，仍保留为不同槽位。
-    """
-
-    incoming_key = physical_metadata_key(incoming)
-    for existing in entries:
-        if physical_metadata_key(existing) != incoming_key:
-            continue
-        for table_id in incoming.evidence_table_ids:
-            if table_id not in existing.evidence_table_ids:
-                existing.evidence_table_ids.append(table_id)
-        return
-    entries.append(incoming)
-
-
-def physical_metadata_key(entry: PackageCatalogEntry) -> tuple[str, str, str]:
-    """生成包装表槽位去重键，避免仅凭一个 QFN 字符串错误归并。"""
-
-    return (
-        normalize_compact(entry.package_type),
-        normalize_compact(entry.package_drawing),
-        clean_pin_count(entry.pin_count),
-    )
-
-
-def deduplicate_redundant_catalog_entries(
-    entries: Sequence[PackageCatalogEntry],
-) -> list[PackageCatalogEntry]:
-    """合并同一物理封装的重复表述，同时保留不同身份的独立槽位。
-
-    只有 family、drawing、pin_count 三项都能确定且完全一致时才允许合并；
-    两个非空器件身份不同则强制保留，避免把同封装类型的不同映射空间合并。
-    """
-
-    result: list[PackageCatalogEntry] = []
-    for incoming in entries:
-        incoming_signature = canonical_physical_metadata(incoming)
-        incoming_identity = normalize_compact(incoming.identity_name)
-        duplicate: PackageCatalogEntry | None = None
-
-        for existing in result:
-            existing_identity = normalize_compact(existing.identity_name)
-            identities_conflict = bool(
-                incoming_identity
-                and existing_identity
-                and incoming_identity != existing_identity
-            )
-            if identities_conflict:
-                continue
-            if (
-                incoming_signature[0]
-                and incoming_signature[1]
-                and incoming_signature[2]
-                and incoming_signature == canonical_physical_metadata(existing)
-            ):
-                duplicate = existing
-                break
-
-        if duplicate is None:
-            result.append(incoming)
-            continue
-        merge_redundant_catalog_evidence(duplicate, incoming)
-    return result
-
-
-def canonical_physical_metadata(
-    entry: PackageCatalogEntry,
-) -> tuple[str, str, str]:
-    """把组合写法转换为仅用于比较的 family/drawing/pin_count。"""
-
-    package_type = clean_metadata(entry.package_type)
-    drawing = clean_metadata(entry.package_drawing)
-    pin_count = clean_pin_count(entry.pin_count)
-
-    # 数据手册常用 ``(TSSOP-14) - PW`` 表示封装族、引脚数和 drawing。
-    # 该格式三项证据齐全，可以与分列元数据安全比较；SC-70 这类普通
-    # 封装名不会命中该规则，因此不会把 70 误当作引脚数。
-    combined_match = re.fullmatch(
-        r"\(\s*([A-Za-z][A-Za-z0-9]*)\s*-\s*(\d+)\s*\)"
-        r"\s*[-–—]\s*([A-Za-z0-9]+)",
-        package_type,
-    )
-    if combined_match:
-        package_type = combined_match.group(1)
-        pin_count = pin_count or combined_match.group(2)
-        drawing = drawing or combined_match.group(3)
-
-    # 只有显式包含 PIN 的写法才从普通文本中提取数量，避免把 SC-70、
-    # QFN-16 等名称内部数字在证据不足时直接解释成 pin_count。
-    explicit_pin_match = re.fullmatch(
-        r"(.+?)\s+(\d+)\s*[- ]?\s*pin(?:s)?",
-        package_type,
-        flags=re.IGNORECASE,
-    )
-    if explicit_pin_match:
-        package_type = clean_metadata(explicit_pin_match.group(1))
-        pin_count = pin_count or explicit_pin_match.group(2)
-
-    return (
-        normalize_compact(package_type),
-        normalize_compact(drawing),
-        clean_pin_count(pin_count),
-    )
-
-
-def merge_redundant_catalog_evidence(
-    target: PackageCatalogEntry,
-    incoming: PackageCatalogEntry,
-) -> None:
-    """把重复目录项的身份、别名和更结构化的物理元数据合入原槽位。"""
-
-    if not target.identity_name and incoming.identity_name:
-        target.identity_name = incoming.identity_name
-    for alias in [incoming.identity_name, *incoming.identity_aliases]:
-        if alias and alias != target.identity_name and alias not in target.identity_aliases:
-            target.identity_aliases.append(alias)
-    for table_id in incoming.evidence_table_ids:
-        if table_id not in target.evidence_table_ids:
-            target.evidence_table_ids.append(table_id)
-
-    # 分列字段比组合字符串更适合作为公开名称和后续匹配证据。
-    target_detail = bool(target.package_drawing) + bool(target.pin_count)
-    incoming_detail = bool(incoming.package_drawing) + bool(incoming.pin_count)
-    if incoming_detail > target_detail:
-        target.package_type = incoming.package_type or target.package_type
-        target.package_drawing = incoming.package_drawing or target.package_drawing
-        target.pin_count = incoming.pin_count or target.pin_count
-    else:
-        if not target.package_type:
-            target.package_type = incoming.package_type
-        if not target.package_drawing:
-            target.package_drawing = incoming.package_drawing
-        if not target.pin_count:
-            target.pin_count = incoming.pin_count
-
-
-def reconcile_multi_pkg_tab_catalog(
-    entries: Sequence[PackageCatalogEntry],
-    *,
-    all_tables: Sequence[PackageCatalogTable],
-    resolution: MultiPkgTabResolution,
-    diagnostics: list[dict[str, Any]],
-) -> list[PackageCatalogEntry]:
-    """用跨表引脚表证据整理第二次模型得到的封装目录。
-
-    本函数只在槽位冻结前工作：同一 Drawing/pin_count 被多张目标表明确证明
-    为同一分支时，允许合并不同订购型号产生的重复目录项；目标表明确出现
-    一个目录中缺失的分支时，补建匿名槽位并把局部标签保存为内部别名。
-    公开 pkg 仍只来自 package_type，分支标签不会泄漏到最终名称。
-    """
-
-    result = list(entries)
-    index_to_entry = {
-        index: entry
-        for index, entry in enumerate(entries)
-    }
-
-    # 只有目标表按 Drawing 明确归为同一分支时才跨身份合并。原有目录去重
-    # 仍保持严格，避免仅凭相同 QFN/BGA 封装族误合并不同引脚映射。
-    for index_group in catalog_groups_confirmed_by_target_tables(resolution):
-        available = [
-            index_to_entry[index]
-            for index in index_group
-            if index in index_to_entry
-        ]
-        unique_available = list({id(entry): entry for entry in available}.values())
-        if len(unique_available) < 2:
-            continue
-        target = unique_available[0]
-        for incoming in unique_available[1:]:
-            merge_redundant_catalog_evidence(target, incoming)
-            if incoming in result:
-                result.remove(incoming)
-        for index in index_group:
-            index_to_entry[index] = target
-        diagnostics.append(
-            {
-                "stage": "multi_pkg_tab_catalog_merge",
-                "catalog_entry_indexes": list(index_group),
-                "identity_name": target.identity_name,
-                "identity_aliases": list(target.identity_aliases),
-                "package_drawing": target.package_drawing,
-                "pin_count": target.pin_count,
-            }
-        )
-
-    supported_entry_ids: set[int] = set()
-    for branch in resolution.branches:
-        matched_entries = list(
-            {
-                id(index_to_entry[index]): index_to_entry[index]
-                for index in branch.catalog_entry_indexes
-                if index in index_to_entry
-            }.values()
-        )
-
-        # 目录索引不足时，再用精确分支标签匹配整理后的目录。只接受唯一项，
-        # 多项同名仍保持歧义，不能选择第一个。
-        if not matched_entries:
-            matched_entries = _entries_matching_exact_branch_label(
-                result,
-                branch.label,
-            )
-
-        if len(matched_entries) == 1:
-            entry = matched_entries[0]
-            _append_internal_binding_alias(entry, branch.label)
-            supported_entry_ids.add(id(entry))
-            diagnostics.append(
-                {
-                    "stage": "multi_pkg_tab_catalog_support",
-                    "branch_key": branch.branch_key,
-                    "branch_label": branch.label,
-                    "table_ids": list(branch.table_ids),
-                    "status": "matched_catalog_entry",
-                }
-            )
-            continue
-
-        # 只有已经形成至少两个跨表分支时，局部标签才能证明目录确实漏掉了
-        # 一个槽位。单个普通标题不能单独扩大文档 pkg 数量。
-        if (
-            not matched_entries
-            and resolution.document_mode
-            in {"cross_table_multi_package", "mixed_multi_package"}
-        ):
-            entry = PackageCatalogEntry(
-                package_key="",
-                identity_aliases=[branch.label],
-                evidence_table_ids=list(branch.table_ids),
-            )
-            result.append(entry)
-            supported_entry_ids.add(id(entry))
-            diagnostics.append(
-                {
-                    "stage": "multi_pkg_tab_catalog_support",
-                    "branch_key": branch.branch_key,
-                    "branch_label": branch.label,
-                    "table_ids": list(branch.table_ids),
-                    "status": "created_missing_slot",
-                }
-            )
-
-    # 已经形成明确跨表分支时，区域召回得到的弱总述表不能再额外增加 pkg。
-    # 但“Device/Package/Ordering Information”等自身表题的高优先级证据仍
-    # 保留，因为它可能描述尚未被第一次模型选中的真实封装。
-    if (
-        len(resolution.branches) >= 2
-        and supported_entry_ids
-    ):
-        tables_by_id = {table.table_id: table for table in all_tables}
-        filtered: list[PackageCatalogEntry] = []
-        removed: list[dict[str, Any]] = []
-        for entry in result:
-            if id(entry) in supported_entry_ids or _entry_has_priority_catalog_evidence(
-                entry,
-                tables_by_id,
-            ):
-                filtered.append(entry)
-                continue
-            removed.append(
-                {
-                    "identity_name": entry.identity_name,
-                    "package_type": entry.package_type,
-                    "package_drawing": entry.package_drawing,
-                    "pin_count": entry.pin_count,
-                    "evidence_table_ids": list(entry.evidence_table_ids),
-                }
-            )
-        if removed:
-            diagnostics.append(
-                {
-                    "stage": "multi_pkg_tab_weak_catalog_filter",
-                    "removed": removed,
-                }
-            )
-        result = filtered
-
-    return result
-
-
-def _entries_matching_exact_branch_label(
-    entries: Sequence[PackageCatalogEntry],
-    label: str,
-) -> list[PackageCatalogEntry]:
-    """按内部身份、别名或 Drawing 精确匹配一个跨表分支。"""
-
-    normalized_label = normalize_compact(label)
-    matches = []
-    for entry in entries:
-        values = [
-            entry.identity_name,
-            *entry.identity_aliases,
-            entry.package_drawing,
-        ]
-        if any(normalize_compact(value) == normalized_label for value in values):
-            matches.append(entry)
-    return matches
-
-
-def _append_internal_binding_alias(
-    entry: PackageCatalogEntry,
-    label: str,
-) -> None:
-    """保存局部分支标签供后续表绑定使用，不改变公开 package_type。"""
-
-    label = str(label or "").strip()
-    if (
-        label
-        and label != entry.identity_name
-        and label not in entry.identity_aliases
-    ):
-        entry.identity_aliases.append(label)
-
-
-def _entry_has_priority_catalog_evidence(
-    entry: PackageCatalogEntry,
-    tables_by_id: Mapping[int, PackageCatalogTable],
-) -> bool:
-    """判断目录项是否来自自身表题明确的高优先级封装总述表。"""
-
-    return any(
-        table is not None and _has_priority_catalog_title(table.title)
-        for table_id in entry.evidence_table_ids
-        for table in [tables_by_id.get(table_id)]
-    )
-
-
-def merge_plan_package_labels(
-    entries: list[PackageCatalogEntry],
-    *,
-    target_tables: Sequence[PackageTargetTable],
-    multi_package_plans: Mapping[int, MultiPackagePlanLike],
-    diagnostics: list[dict[str, Any]] | None = None,
-) -> list[PackageCatalogEntry]:
-    """用最完整的多封装计划保证文档目录具有足够的独立槽位。
-
-    不能累计每张表的标签，否则同一组封装在多个表中重复出现时会被重复计数。
-    如果总述阶段只识别到一个公开封装名称，而表内结构严格确认存在 N 个
-    分支，则复制该封装元数据建立 N 个独立槽位。复制的是名称和物理元数据，
-    不是数据桶；每个分支随后仍按自己的 ``package_key`` 独立提取。
-    """
-
-    result = list(entries)
-    target_ids = {table.table_id for table in target_tables}
-    eligible_plans = [
-        (table_id, plan)
-        for table_id, plan in multi_package_plans.items()
-        if (
-            table_id in target_ids
-            and plan_creates_package_slots(plan)
-            and len(plan.bindings) >= 2
-        )
-    ]
-    if not eligible_plans:
-        return result
-
-    # 槽位最多的计划通常是完整封装映射表；同数量时保持文档顺序。
-    table_id, anchor_plan = max(
-        eligible_plans,
-        key=lambda item: (len(item[1].bindings), -item[0]),
-    )
-
-    required_slots = len(anchor_plan.bindings)
-
-    # 第二次模型可能从 Device/Ordering Information 中返回多条器件型号记录。
-    # 器件型号是绑定证据，不等于物理封装槽位。只有 package_columns 已经用
-    # N 个独立 pin_no 列严格证明存在 N 个物理映射空间时，才把目录中超过 N
-    # 的“型号行”降回证据。名称分支、行分段和局部续表不参与这次收紧，避免
-    # 一张只覆盖部分封装的局部表裁剪全文目录。
-    if anchor_plan.mode == "package_columns" and len(result) > required_slots:
-        reconciled, reconciliation = reconcile_catalog_to_confirmed_plan(
-            result,
-            required_slots=required_slots,
-            evidence_table_id=table_id,
-        )
-        if reconciliation is not None:
-            result = reconciled
-            if diagnostics is not None:
-                diagnostics.append(reconciliation)
-
-    # 一个真实封装名称不能覆盖已经确认的多个表内分支。为每个分支复制一个
-    # 独立目录项，freeze_package_slots() 随后会为它们分配不同的 slot key。
-    # 公开名称允许相同，最终 JSON 的统一后缀逻辑负责生成 WQFN1/WQFN2……。
-    if len(result) == 1 and required_slots > 1:
-        template = result[0]
-        evidence_table_ids = list(template.evidence_table_ids)
-        if table_id not in evidence_table_ids:
-            evidence_table_ids.append(table_id)
-        return [
-            replace(
-                template,
-                package_key="",
-                identity_aliases=list(template.identity_aliases),
-                evidence_table_ids=list(evidence_table_ids),
-            )
-            for _binding in anchor_plan.bindings
-        ]
-
-    # 总述可能只识别出部分封装。严格表头已经确认 N 个独立分支时，目录槽位
-    # 至少也必须有 N 个；缺失槽位保持匿名，不能拿分支标签冒充真实封装名。
-    if 1 < len(result) < required_slots:
-        for _slot_index in range(len(result), required_slots):
-            result.append(
-                PackageCatalogEntry(
-                    package_key="",
-                    evidence_table_ids=[table_id],
-                )
-            )
-        return result
-
-    # 总述已经确认足够的槽位时，不能再根据某一张表增删目录数量。
-    if result:
-        return result
-
-    for binding in anchor_plan.bindings:
-        package_type = clean_public_package_name(binding.package)
-        result.append(
-            PackageCatalogEntry(
-                package_key="",
-                package_type=package_type,
-                evidence_table_ids=[table_id],
-            )
-        )
-    return result
-
-
-def reconcile_catalog_to_confirmed_plan(
-    entries: Sequence[PackageCatalogEntry],
-    *,
-    required_slots: int,
-    evidence_table_id: int,
-) -> tuple[list[PackageCatalogEntry], dict[str, Any] | None]:
-    """用严格表内分支约束纯器件身份目录项的槽位数量。
-
-    该函数只在“目录项数量大于严格 package_columns 分支数量”时调用，且不
-    改变普通单封装、名称分支、行分段和没有多分支证据的文档。处理规则如下：
-
-    * ``package_type/drawing/pin_count`` 均为空的项只是器件身份，不能创建槽位；
-    * 有物理元数据的项保持原有独立身份，本函数不负责跨身份合并；
-    * 强物理项不超过严格分支数时，以严格分支数补齐最终槽位；
-    * 强物理项已经超过严格分支数时说明证据冲突，保持原目录，不武断删减。
-
-    这样只收紧“弱目录扩大 pkg 数量”这一条边界，不会用某一张局部表覆盖
-    文档中已经明确存在的更多不同物理封装。
-    """
-
-    if required_slots < 2 or len(entries) <= required_slots:
-        return list(entries), None
-
-    physical_entries: list[PackageCatalogEntry] = []
-    physical_signatures: list[tuple[str, str, str]] = []
-    identity_only_entries: list[PackageCatalogEntry] = []
-
-    for entry in entries:
-        signature = canonical_physical_metadata(entry)
-        if not any(signature):
-            identity_only_entries.append(entry)
-            continue
-
-        # 强物理目录项可能代表“相同封装名称、不同器件映射空间”。此前目录
-        # 阶段已经按自己的规则完成去重，这里只复制并保留，绝不跨身份合并。
-        physical_signatures.append(signature)
-        physical_entries.append(
-            replace(
-                entry,
-                package_key="",
-                identity_aliases=list(entry.identity_aliases),
-                evidence_table_ids=list(entry.evidence_table_ids),
-            )
-        )
-
-    # 不同物理签名已经超过表内分支数量时，当前表可能只覆盖文档的一部分
-    # package。此时不能根据局部表删目录，继续保留原有结果。
-    if len(physical_entries) > required_slots:
-        return list(entries), None
-
-    evidence_ids = list(
-        dict.fromkeys(
-            [
-                table_id
-                for entry in entries
-                for table_id in entry.evidence_table_ids
-            ]
-            + [evidence_table_id]
-        )
-    )
-    result = list(physical_entries)
-
-    if not result:
-        # 目录全是器件型号时，真实 pkg 名暂时未知，但严格表头已经证明槽位
-        # 数量。建立 N 个匿名槽位，最终 JSON 使用 a/b/c，而不是按型号行计数。
-        result = [
-            PackageCatalogEntry(
-                package_key="",
-                evidence_table_ids=list(evidence_ids),
-            )
-            for _slot_index in range(required_slots)
-        ]
-    elif len(result) == 1 and required_slots > 1:
-        # 两个映射空间可以具有相同物理封装名称；复制槽位而不是合并数据桶。
-        template = result[0]
-        result = [
-            replace(
-                template,
-                package_key="",
-                identity_aliases=list(template.identity_aliases),
-                evidence_table_ids=list(evidence_ids),
-            )
-            for _slot_index in range(required_slots)
-        ]
-    else:
-        while len(result) < required_slots:
-            result.append(
-                PackageCatalogEntry(
-                    package_key="",
-                    evidence_table_ids=list(evidence_ids),
-                )
-            )
-
-    return result, {
-        "stage": "package_catalog_confirmed_plan_reconciliation",
-        "status": "reconciled",
-        "evidence_table_id": evidence_table_id,
-        "required_slots": required_slots,
-        "before": len(entries),
-        "after": len(result),
-        "physical_signatures": [list(value) for value in physical_signatures],
-        "identity_only_entries_removed": [
-            {
-                "identity_name": entry.identity_name,
-                "identity_aliases": list(entry.identity_aliases),
-                "evidence_table_ids": list(entry.evidence_table_ids),
-            }
-            for entry in identity_only_entries
-        ],
-    }
 
 
 def plan_creates_package_slots(plan: MultiPackagePlanLike | None) -> bool:
@@ -1677,6 +957,137 @@ def plan_creates_package_slots(plan: MultiPackagePlanLike | None) -> bool:
         and plan.is_multi_package
         and plan.mode != "parallel_name_columns"
     )
+
+
+def _entries_matching_exact_branch_label(
+    entries: Sequence[PackageCatalogEntry],
+    label: str,
+) -> list[PackageCatalogEntry]:
+    """按器件身份、封装类型、内部别名或 Drawing 精确匹配表头分支。"""
+
+    normalized_label = normalize_compact(label)
+    if not normalized_label:
+        return []
+    return [
+        entry
+        for entry in entries
+        if any(
+            normalize_compact(value) == normalized_label
+            for value in (
+                entry.identity_name,
+                entry.package_type,
+                *entry.identity_aliases,
+                entry.package_drawing,
+            )
+        )
+    ]
+
+
+def _append_internal_binding_alias(
+    entry: PackageCatalogEntry,
+    label: str,
+) -> None:
+    """保存表头分支标签作为内部绑定证据，不修改公开 package_type。"""
+
+    label = str(label or "").strip()
+    if (
+        label
+        and label != entry.identity_name
+        and label not in entry.identity_aliases
+    ):
+        entry.identity_aliases.append(label)
+
+
+def supplement_slots_from_explicit_table_branches(
+    entries: Sequence[PackageCatalogEntry],
+    *,
+    target_tables: Sequence[PackageTargetTable],
+    multi_package_plans: Mapping[int, MultiPackagePlanLike],
+    diagnostics: list[dict[str, Any]],
+) -> list[PackageCatalogEntry]:
+    """用明确的表头封装分支补全目录漏项，不读取任何正式数据值。
+
+    只有 ``package_columns`` 和 ``package_name_columns`` 表示物理封装分支；
+    运行模式、按行选择器和普通单封装表都不能扩张文档槽位。
+    """
+
+    result = list(entries)
+    table_by_id = {table.table_id: table for table in target_tables}
+    for table_id, plan in multi_package_plans.items():
+        if not (
+            plan is not None
+            and plan.is_multi_package
+            and plan.mode in {"package_columns", "package_name_columns"}
+        ):
+            continue
+        table = table_by_id.get(table_id)
+        for binding in plan.bindings:
+            label = clean_explicit_branch_label(binding.package)
+            if not label:
+                continue
+            matches = _entries_matching_exact_branch_label(result, label)
+            if len(matches) == 1:
+                _append_internal_binding_alias(matches[0], label)
+                continue
+            if len(matches) > 1:
+                diagnostics.append(
+                    {
+                        "stage": "package_catalog_conflict",
+                        "status": "ambiguous_existing_branch",
+                        "reason": "catalog_conflict",
+                        "table_id": table_id,
+                        "branch_label": label,
+                        "matched_entry_count": len(matches),
+                    }
+                )
+                continue
+
+            # 标签直接来自已经确认的逐列父表头。创建的槽位保留该标签作为
+            # drawing/显示证据；它不是从数据行或 description 猜出来的。
+            fact = RawPackageFact(
+                drawing_code=label,
+                source_table_id=table_id,
+                source_row_index=-1,
+                table_role="explicit_pin_table_branch",
+            )
+            entry = PackageCatalogEntry(
+                package_key="",
+                identity_aliases=[label],
+                package_drawing=label,
+                evidence_table_ids=[table_id],
+                raw_facts=[fact],
+                origin="explicit_pin_table_branch",
+            )
+            result.append(entry)
+            diagnostics.append(
+                {
+                    "stage": "package_catalog_conflict",
+                    "status": "supplemented_missing_slot",
+                    "reason": "catalog_conflict",
+                    "table_id": table_id,
+                    "table_title": table.title if table is not None else "",
+                    "branch_label": label,
+                }
+            )
+    return result
+
+
+def clean_explicit_branch_label(value: str) -> str:
+    """清理结构分析得到的分支标签；拒绝空白和明显的长描述。"""
+
+    label = re.sub(r"<[^>]+>", " ", str(value or ""))
+    label = re.sub(r"\s+", " ", label).strip(" ,;:")
+    # 多层表头经路径拼接后常形成 ``SSOP 28 PIN``、``QFN 32 BALL``。
+    # 末尾的字段角色不属于封装名称，移除后仍保留封装族和数字规格。
+    label = re.sub(
+        r"\s+(?:PIN|PINS|BALL|BALLS)(?:\s*(?:NO\.?|NUMBER))?$",
+        "",
+        label,
+        flags=re.IGNORECASE,
+    ).strip(" ,;:")
+    if not label or len(label) > 40 or "|" in label:
+        return ""
+    return label
 
 
 def freeze_package_slots(entries: Sequence[PackageCatalogEntry]) -> None:
@@ -1803,6 +1214,23 @@ def bind_target_tables(
         # 模糊标签可能同时落入第一个槽位，导致本应分开的 pkg 再次合并。
         if plan_creates_package_slots(plan) and len(local_labels) >= 2:
             bound_entries = bind_multi_package_entries(entries, local_labels)
+            if not bound_entries:
+                # 多分支整体绑定必须同时具有完整且唯一的证据。任一分支
+                # 无法确定时整张表保持 unresolved，不能按目录位置硬配。
+                for local_slot, local_label in enumerate(local_labels):
+                    append_package_binding_diagnostic(
+                        diagnostics,
+                        table=table,
+                        local_slot=local_slot,
+                        local_label=local_label,
+                        assignment=None,
+                        reason="package_unresolved",
+                        matched_entries=match_entries_in_text(entries, local_label),
+                        entries=entries,
+                    )
+                previous_explicit = None
+                previous_context = ""
+                continue
             for local_slot, (local_label, entry) in enumerate(
                 zip(local_labels, bound_entries)
             ):
@@ -1852,19 +1280,6 @@ def bind_target_tables(
                     entry,
                     entries,
                     reason="single_document_package",
-                )
-            elif (
-                plan is not None
-                and plan.is_multi_package
-                and len(local_labels) == len(entries)
-            ):
-                # 表内已经严格确认有 N 个封装编号列，文档目录也有 N 个槽位。
-                # 在标签无法匹配时仍可按稳定列顺序一一对应，数量不发生变化。
-                entry = entries[local_slot]
-                assignment = assignment_from_entry(
-                    entry,
-                    entries,
-                    reason="multi_package_positional_binding",
                 )
             elif (
                 not matches
@@ -1958,26 +1373,41 @@ def bind_multi_package_entries(
     entries: Sequence[PackageCatalogEntry],
     local_labels: Sequence[str],
 ) -> list[PackageCatalogEntry]:
-    """把一张表的全部本地分支一次性绑定到互不重复的文档槽位。
+    """把一张表的全部本地分支绑定到互不重复且证据唯一的目录槽位。
 
-    绑定是一个小规模最大权重匹配问题。分支标签与目录项之间的型号、封装族、
-    drawing 和显式 pin_count 共同计分；无证据时才用列顺序打破平局。无论
-    得分高低，同一张多封装表内都禁止两个分支复用同一个 ``package_key``。
+    这里只比较器件身份、封装名称和 drawing。声明 pin 数量及列位置都不
+    参与绑定。任一分支没有正向证据、存在并列最高分或多个分支指向同一
+    槽位时返回空列表，由调用方把整张表记录为 unresolved。
     """
 
     if len(entries) < len(local_labels):
-        raise ValueError(
-            "package catalog has fewer slots than confirmed table branches"
-        )
+        return []
 
     score_matrix = [
         [
-            multi_package_binding_score(label, entry, local_slot, entry_slot)
+            multi_package_binding_score(label, entry)
             for entry_slot, entry in enumerate(entries)
         ]
         for local_slot, label in enumerate(local_labels)
     ]
+
+    # 每个分支都必须有且只有一个最高分槽位。先做逐分支唯一性校验，避免
+    # 匈牙利算法在同分或全零矩阵中人为制造一个看似完整的绑定。
+    unique_slots: list[int] = []
+    for scores in score_matrix:
+        best_score = max(scores, default=0)
+        if best_score <= 0:
+            return []
+        best_slots = [index for index, score in enumerate(scores) if score == best_score]
+        if len(best_slots) != 1:
+            return []
+        unique_slots.append(best_slots[0])
+    if len(set(unique_slots)) != len(unique_slots):
+        return []
+
     selected_slots = maximum_weight_unique_assignment(score_matrix)
+    if selected_slots != unique_slots:
+        return []
     return [entries[entry_slot] for entry_slot in selected_slots]
 
 
@@ -2058,8 +1488,6 @@ def maximum_weight_unique_assignment(
 def multi_package_binding_score(
     local_label: str,
     entry: PackageCatalogEntry,
-    local_slot: int,
-    entry_slot: int,
 ) -> int:
     """计算一个分支标签与一个目录槽位之间的确定性关联分数。"""
 
@@ -2093,25 +1521,9 @@ def multi_package_binding_score(
         elif package_name_in_text(drawing, label_text):
             score += 300
 
-    label_pin_count = explicit_pin_count_from_label(local_label)
-    entry_pin_count = clean_pin_count(entry.pin_count)
-    if label_pin_count and entry_pin_count:
-        score += 400 if label_pin_count == entry_pin_count else -500
-
-    # 结构证据完全相同时才依赖稳定列顺序。该分值远低于任何语义证据。
-    score += max(0, 20 - abs(local_slot - entry_slot))
     return score
 
 
-def explicit_pin_count_from_label(value: str) -> str:
-    """只读取带 PIN 文字的显式引脚数，避免把型号内部数字当作数量。"""
-
-    match = re.search(
-        r"(?<![A-Za-z0-9])(\d+)\s*[- ]?\s*pin(?:s)?(?![A-Za-z0-9])",
-        str(value or ""),
-        flags=re.IGNORECASE,
-    )
-    return clean_pin_count(match.group(1)) if match else ""
 
 
 def match_entries_in_text(
@@ -2204,12 +1616,17 @@ def assignment_from_entry(
             for index, candidate in enumerate(entries)
             if candidate.package_key == entry.package_key
         ),
-        0,
+        None,
     )
+    if slot_index is None:
+        raise ValueError(
+            f"package entry is not present in the frozen catalog: {entry.package_key}"
+        )
     return PackageAssignment(
         package_key=entry.package_key,
         pkg=(
-            clean_public_package_name(entry.package_type)
+            clean_metadata(entry.package_drawing)
+            or clean_public_package_name(entry.package_type)
             or alphabetic_slot_name(slot_index)
         ),
         reason=reason,
@@ -2287,10 +1704,6 @@ def extract_public_package_name_from_metadata(value: str) -> str:
     return re.sub(r"\s+", " ", match.group(1)).strip()
 
 
-def clean_package_name(value: str) -> str:
-    """兼容旧调用名称；当前语义等同于清理公开物理封装名。"""
-
-    return clean_public_package_name(value)
 
 
 def catalog_header_hints(rows: Sequence[Sequence[str]]) -> tuple[str, ...]:
