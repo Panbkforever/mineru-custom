@@ -135,6 +135,72 @@ class TableHeaderStructureTest(unittest.TestCase):
             [1],
         )
 
+    def test_name_role_footnotes_never_create_package_branches(self) -> None:
+        """BALL/SIGNAL NAME 的脚注编号不能被当作 package 标签。"""
+
+        rows = [
+            ["BALL NAME [2]", "SIGNAL NAME [3]", "ZCZ_C NO.", "ZCZ_S NO."],
+            ["PAD_A", "SIG_A", "A1", "B1"],
+            ["", "SIG_B", "A2", "B2"],
+        ]
+        paths = build_header_paths(rows, 0)
+        layout = analyze_name_column_layout(paths)
+
+        self.assertEqual(layout.mode, "equivalent_names")
+
+        # 等价名称列先选完整的一列，随后两个独立编号列仍应形成两个物理
+        # package 分支；名称列等价与多封装编号列是两层互不冲突的结构。
+        headers = [path.combined for path in paths]
+        decisions = reconcile_name_column_decisions(
+            [
+                ColumnDecision(0, headers[0], "pin_name"),
+                ColumnDecision(1, headers[1], "pin_name"),
+                ColumnDecision(2, headers[2], "pin_no"),
+                ColumnDecision(3, headers[3], "pin_no"),
+            ],
+            headers,
+            rows[1:],
+            layout,
+        )
+        self.assertEqual(
+            [
+                decision.index
+                for decision in decisions
+                if decision.field_name == "pin_name"
+            ],
+            [1],
+        )
+
+        plan = analyze_multi_package_table(
+            title="Pin Attributes",
+            header_rows=rows[:1],
+            headers=headers,
+            data_rows=rows[1:],
+            columns=decisions,
+            name_layout=layout,
+        )
+        self.assertTrue(plan.is_multi_package)
+        self.assertEqual(plan.mode, "package_columns")
+        self.assertEqual(
+            [binding.pin_no_column for binding in plan.bindings],
+            [2, 3],
+        )
+
+    def test_mode_and_pinlist_name_views_do_not_create_package_slots(self) -> None:
+        """运行模式名称和 Pinlist 名称并排时只形成名称视图分支。"""
+
+        rows = [
+            ["SOP Mode Signal Name", "Pinlist Signal Name", "PIN NO."],
+            ["BOOT", "GPIO0", "A1"],
+        ]
+        layout = analyze_name_column_layout(build_header_paths(rows, 0))
+
+        self.assertEqual(layout.mode, "parallel_name_branches")
+        self.assertEqual(
+            [branch.label for branch in layout.branches],
+            ["SOP Mode", "Pinlist"],
+        )
+
     def test_different_name_parents_do_not_consume_first_data_row(self) -> None:
         rows = [
             ["BALL NAME", "SIGNAL NAME", "BALL NO."],

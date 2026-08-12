@@ -18,7 +18,8 @@
    ``package_type``（SC-70、VSSOP、QFN 等物理封装名称）。
 5. 严格确认的 N 个表内分支是 N 个独立输出槽位的下限。总述表即使只找到
    一个公开封装名，也必须建立 N 个槽位并复用该名称；最终输出再追加数字
-   后缀。没有多分支证据时，包装信息表或单封装兜底才决定槽位数量。
+   后缀。已有严格多分支证据时，只有器件型号、没有任何物理封装元数据的
+   目录项不能额外增加槽位。没有多分支证据时，仍保持原目录判断流程。
 6. 目标引脚表只通过表题、章节标题、表头和多封装列标签绑定已有槽位；
    description 和数据行不能参与绑定。
 7. 槽位冻结后，任何未匹配表都不能创建新 pkg。单封装文档可以绑定唯一
@@ -249,6 +250,7 @@ def resolve_document_package_catalog(
         entries,
         target_tables=target_tables,
         multi_package_plans=multi_package_plans,
+        diagnostics=diagnostics,
     )
     if not entries and target_tables:
         entries = [
@@ -1457,6 +1459,7 @@ def merge_plan_package_labels(
     *,
     target_tables: Sequence[PackageTargetTable],
     multi_package_plans: Mapping[int, MultiPackagePlanLike],
+    diagnostics: list[dict[str, Any]] | None = None,
 ) -> list[PackageCatalogEntry]:
     """用最完整的多封装计划保证文档目录具有足够的独立槽位。
 
@@ -1487,6 +1490,22 @@ def merge_plan_package_labels(
     )
 
     required_slots = len(anchor_plan.bindings)
+
+    # 第二次模型可能从 Device/Ordering Information 中返回多条器件型号记录。
+    # 器件型号是绑定证据，不等于物理封装槽位。只有 package_columns 已经用
+    # N 个独立 pin_no 列严格证明存在 N 个物理映射空间时，才把目录中超过 N
+    # 的“型号行”降回证据。名称分支、行分段和局部续表不参与这次收紧，避免
+    # 一张只覆盖部分封装的局部表裁剪全文目录。
+    if anchor_plan.mode == "package_columns" and len(result) > required_slots:
+        reconciled, reconciliation = reconcile_catalog_to_confirmed_plan(
+            result,
+            required_slots=required_slots,
+            evidence_table_id=table_id,
+        )
+        if reconciliation is not None:
+            result = reconciled
+            if diagnostics is not None:
+                diagnostics.append(reconciliation)
 
     # 一个真实封装名称不能覆盖已经确认的多个表内分支。为每个分支复制一个
     # 独立目录项，freeze_package_slots() 随后会为它们分配不同的 slot key。
@@ -1532,6 +1551,118 @@ def merge_plan_package_labels(
             )
         )
     return result
+
+
+def reconcile_catalog_to_confirmed_plan(
+    entries: Sequence[PackageCatalogEntry],
+    *,
+    required_slots: int,
+    evidence_table_id: int,
+) -> tuple[list[PackageCatalogEntry], dict[str, Any] | None]:
+    """用严格表内分支约束纯器件身份目录项的槽位数量。
+
+    该函数只在“目录项数量大于严格 package_columns 分支数量”时调用，且不
+    改变普通单封装、名称分支、行分段和没有多分支证据的文档。处理规则如下：
+
+    * ``package_type/drawing/pin_count`` 均为空的项只是器件身份，不能创建槽位；
+    * 有物理元数据的项保持原有独立身份，本函数不负责跨身份合并；
+    * 强物理项不超过严格分支数时，以严格分支数补齐最终槽位；
+    * 强物理项已经超过严格分支数时说明证据冲突，保持原目录，不武断删减。
+
+    这样只收紧“弱目录扩大 pkg 数量”这一条边界，不会用某一张局部表覆盖
+    文档中已经明确存在的更多不同物理封装。
+    """
+
+    if required_slots < 2 or len(entries) <= required_slots:
+        return list(entries), None
+
+    physical_entries: list[PackageCatalogEntry] = []
+    physical_signatures: list[tuple[str, str, str]] = []
+    identity_only_entries: list[PackageCatalogEntry] = []
+
+    for entry in entries:
+        signature = canonical_physical_metadata(entry)
+        if not any(signature):
+            identity_only_entries.append(entry)
+            continue
+
+        # 强物理目录项可能代表“相同封装名称、不同器件映射空间”。此前目录
+        # 阶段已经按自己的规则完成去重，这里只复制并保留，绝不跨身份合并。
+        physical_signatures.append(signature)
+        physical_entries.append(
+            replace(
+                entry,
+                package_key="",
+                identity_aliases=list(entry.identity_aliases),
+                evidence_table_ids=list(entry.evidence_table_ids),
+            )
+        )
+
+    # 不同物理签名已经超过表内分支数量时，当前表可能只覆盖文档的一部分
+    # package。此时不能根据局部表删目录，继续保留原有结果。
+    if len(physical_entries) > required_slots:
+        return list(entries), None
+
+    evidence_ids = list(
+        dict.fromkeys(
+            [
+                table_id
+                for entry in entries
+                for table_id in entry.evidence_table_ids
+            ]
+            + [evidence_table_id]
+        )
+    )
+    result = list(physical_entries)
+
+    if not result:
+        # 目录全是器件型号时，真实 pkg 名暂时未知，但严格表头已经证明槽位
+        # 数量。建立 N 个匿名槽位，最终 JSON 使用 a/b/c，而不是按型号行计数。
+        result = [
+            PackageCatalogEntry(
+                package_key="",
+                evidence_table_ids=list(evidence_ids),
+            )
+            for _slot_index in range(required_slots)
+        ]
+    elif len(result) == 1 and required_slots > 1:
+        # 两个映射空间可以具有相同物理封装名称；复制槽位而不是合并数据桶。
+        template = result[0]
+        result = [
+            replace(
+                template,
+                package_key="",
+                identity_aliases=list(template.identity_aliases),
+                evidence_table_ids=list(evidence_ids),
+            )
+            for _slot_index in range(required_slots)
+        ]
+    else:
+        while len(result) < required_slots:
+            result.append(
+                PackageCatalogEntry(
+                    package_key="",
+                    evidence_table_ids=list(evidence_ids),
+                )
+            )
+
+    return result, {
+        "stage": "package_catalog_confirmed_plan_reconciliation",
+        "status": "reconciled",
+        "evidence_table_id": evidence_table_id,
+        "required_slots": required_slots,
+        "before": len(entries),
+        "after": len(result),
+        "physical_signatures": [list(value) for value in physical_signatures],
+        "identity_only_entries_removed": [
+            {
+                "identity_name": entry.identity_name,
+                "identity_aliases": list(entry.identity_aliases),
+                "evidence_table_ids": list(entry.evidence_table_ids),
+            }
+            for entry in identity_only_entries
+        ],
+    }
 
 
 def plan_creates_package_slots(plan: MultiPackagePlanLike | None) -> bool:

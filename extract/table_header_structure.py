@@ -18,11 +18,15 @@
 特别重要的项目规则：
 
 * BALL NAME 与 SIGNAL NAME 等价，不能因为两列同时出现就判定为多封装。
+* 名称角色后的 ``[2]``、``(3)``、†、‡ 等脚注只属于表头注释，不能作为
+  package 分支标签。
 * 普通等价名称列最终只能选择一列，禁止使用 ``|`` 合并。
 * ``NAME > Package A/Package B`` 和
   ``Package A/Package B > NAME`` 都属于封装分支结构。
 * ``MII Mode Pin Name``、``PHY Mode Pin Name`` 等列属于运行模式分支；这些列
   可以分别提取名称，但绝不能据此增加 pkg 数量。
+* ``SOP Mode Signal Name`` 与 ``Pinlist Signal Name`` 这类“模式 + 清单视图”
+  并排名称列同样不是物理封装轴。
 * 本模块返回的 ``branch_label`` 只是表内分支证据，不是最终公开 pkg 名称。
 * ``-``、``--``、``—`` 和空单元格属于数据值；边界判断不能以占位符为由删行。
 * 表头边界不能根据 ``PIN``、``NAME`` 等固定文字，也不能根据单元格内容
@@ -443,7 +447,13 @@ def analyze_name_column_layout(
     display_labels: dict[str, str] = {}
     for column_index, label in labels_by_column.items():
         normalized_label = _normalize(label)
-        if not normalized_label or _is_generic_branch_label(normalized_label):
+        # ``BALL NAME [2]`` 与 ``SIGNAL NAME [3]`` 中的 2/3 只是脚注。
+        # 名称角色被删除后不能再把这些纯数字残留解释成两个封装分支。
+        if (
+            not normalized_label
+            or _is_generic_branch_label(normalized_label)
+            or _is_footnote_only_branch_label(normalized_label)
+        ):
             continue
         grouped.setdefault(normalized_label, []).append(column_index)
         display_labels.setdefault(normalized_label, label)
@@ -461,7 +471,9 @@ def analyze_name_column_layout(
         # ``XXX Mode Pin Name`` 的横向分支描述的是同一物理封装在不同运行
         # 模式下的信号名称，不是多个物理封装。结构层必须先把这条轴标明，
         # 后续单表提取可以保留各分支，但文档级 pkg 目录不能把它们计数。
-        if _branches_are_operating_modes(branches):
+        if _branches_are_operating_modes(branches) or _branches_mix_mode_and_view_labels(
+            branches
+        ):
             return NameColumnLayout(
                 mode="parallel_name_branches",
                 name_column_indexes=indexes,
@@ -509,6 +521,32 @@ def _branches_are_operating_modes(
         )
         for branch in branches
     )
+
+
+def _branches_mix_mode_and_view_labels(
+    branches: Sequence[NameColumnBranch],
+) -> bool:
+    """识别“运行模式名称列 + 普通引脚清单名称列”的非封装横轴。
+
+    某些表把 ``SOP Mode Signal Name`` 与 ``Pinlist Signal Name`` 并排放置。
+    两列描述的是同一物理封装的不同视图，不是两个 package。只要分支中明确
+    出现 Mode/模式，同时没有 Package/封装等物理封装轴文字，就保持多名称
+    读取，但禁止这些名称列增加文档级 pkg 数量。
+    """
+
+    if len(branches) < 2:
+        return False
+    labels = [_normalize(branch.label) for branch in branches]
+    has_mode_label = any(
+        re.search(r"(?:^|\s)mode(?:\s|$)", label) or "模式" in label
+        for label in labels
+    )
+    has_explicit_package_axis = any(
+        re.search(r"(?:^|\s)(?:package|pkg)(?:\s|$)", label)
+        or "封装" in label
+        for label in labels
+    )
+    return has_mode_label and not has_explicit_package_axis
 
 
 def name_layout_to_dict(layout: NameColumnLayout) -> dict[str, object]:
@@ -654,6 +692,17 @@ def _is_generic_branch_label(value: str) -> bool:
         "packages",
         "封装",
     }
+
+
+def _is_footnote_only_branch_label(value: str) -> bool:
+    """判断名称角色删除后是否只剩脚注编号或脚注符号。
+
+    ``_normalize`` 已经删除括号、方括号和 †/‡/*，所以 ``[2]``、``(1)(2)``
+    在这里分别表现为 ``2``、``1 2``。这类值没有字母或汉字，不具备任何
+    封装身份语义，必须在名称分支分组前排除。
+    """
+
+    return not bool(re.search(r"[a-z\u4e00-\u9fff]", value))
 
 
 def _positive_span(value: str | None) -> int:
