@@ -785,7 +785,7 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
     # 如果整个批次请求失败，必须立即把该批次降级成逐表请求，避免一张
     # 超大表或一次网络超时导致同批次内其他正常表格被一起判为不提取。
     batch_size = 4
-    workers = max(1, int(os.getenv("EXTRACT_SCHEMA_WORKERS", "4")))
+    workers = max(1, int(os.getenv("EXTRACT_SCHEMA_WORKERS", "2")))
     batches = [
         remaining[start:start + batch_size]
         for start in range(0, len(remaining), batch_size)
@@ -830,6 +830,14 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
                     f"语义字段判断批次失败，改为逐表重试: {batch_error}",
                     flush=True,
                 )
+                print(
+                    "失败批次表格: "
+                    + "; ".join(
+                        format_semantic_retry_table(item)
+                        for item in batch
+                    ),
+                    flush=True,
+                )
                 # 单表重试在当前批次的结果收集阶段依次执行。每张表独立捕获
                 # 异常，确保其中一张仍然失败时不会影响后续表格继续判断。
                 single_errors = {}
@@ -846,6 +854,12 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
                             schemas[request_id] = schema
                     except Exception as single_exc:
                         single_errors[request_id] = str(single_exc)
+                        print(
+                            "语义字段判断单表失败: "
+                            f"{format_semantic_retry_table(item)}; "
+                            f"error={single_exc}",
+                            flush=True,
+                        )
             else:
                 batch_error = ""
                 single_errors = {}
@@ -942,6 +956,23 @@ def build_semantic_table_sample(
         "sampled_data_indexes": indexes,
         "header_rows": len(header_rows),
     }
+
+
+def format_semantic_retry_table(item: dict[str, Any]) -> str:
+    """压缩打印语义重试表格上下文，避免超时日志只剩 API 错误。"""
+
+    sampling = item.get("semantic_sampling") or {}
+    title = str(getattr(item.get("table"), "title", "") or "").strip()
+    title = re.sub(r"\s+", " ", title)
+    if len(title) > 80:
+        title = title[:77] + "..."
+    return (
+        f"id={item.get('table_id')}, "
+        f"title={title!r}, "
+        f"rows={sampling.get('sampled_data_rows')}/"
+        f"{sampling.get('total_data_rows')}, "
+        f"strategy={sampling.get('strategy')}"
+    )
 
 
 def evenly_spaced_indexes(start: int, end: int, count: int) -> list[int]:
@@ -1442,6 +1473,10 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
             # 已在上一阶段接管；该分支只是兼容既有字段映射。
             package_columns.append(value)
         elif field_name:
+            if field_name == "pin_name" and fields.get(field_name) and value:
+                # 多个不同名称列必须由多封装计划拆开；普通路径不能再把
+                # 不同封装/分支的名称拼成一个公开 pin_name。
+                continue
             # 同一个字段有多个列时保留原始信息，不在这里合并 pin 记录。
             fields[field_name] = merge_field_value(fields.get(field_name, ""), value)
 

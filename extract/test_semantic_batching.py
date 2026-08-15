@@ -15,11 +15,44 @@ from extract.pin_package_extractor import (
     build_semantic_table_sample,
     decide_all_tables,
 )
-from extract.semantic_classifier import classify_table_schema_batch
+from extract.semantic_classifier import call_model_json, classify_table_schema_batch
 from extract.table_header_structure import NameColumnLayout
 
 
 class SemanticBatchingTests(unittest.TestCase):
+    def test_model_json_default_timeout_is_ninety_seconds(self):
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return (
+                    b'{"choices":[{"message":{"content":"{\\"ok\\": true}"}}]}'
+                )
+
+        def fake_urlopen(request, timeout):
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "extract.semantic_classifier.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            result = call_model_json(
+                {"task": "test"},
+                api_key="test",
+                system_prompt="Return JSON.",
+                max_tokens=10,
+            )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(captured["timeout"], 90.0)
+
     def test_small_pin_table_sends_all_data_rows(self):
         rows = [["PARENT"], ["PIN"]] + [[str(index)] for index in range(30)]
 

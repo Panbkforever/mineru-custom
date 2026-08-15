@@ -17,8 +17,8 @@
 * package_rows：一个 package 控制列把数据行划分给不同封装；
 * package_sections：表内用“XXX Package”分段行切换当前封装；
 
-横向重复的 ``Pin# | Pin Name | Type`` 字段块由主流程在表格判断阶段直接
-过滤，因此不会进入本模块。
+横向重复的 ``Pin# | Pin Name | Type`` 字段块在本模块绑定为独立封装分支，
+禁止落回普通单表路径后把多个 pin_name 合并。
 
 DESCRIPTION 是只读附加字段，不是封装维度。无论其表头或数据内容是否出现
 Package/PKG/封装，本模块都不能把它作为 package 控制列。
@@ -100,6 +100,14 @@ def analyze_multi_package_table(
     # 完整多行表头必须由 table_header_structure 在进入本模块前一次性确认。
     # 本模块只消费已经冻结的 headers，禁止再把 data_rows 第一行猜成表头，
     # 否则同一张表会在两个阶段得到不同的数据起点。
+
+    field_block_plan = detect_package_specific_field_blocks(
+        headers=headers,
+        data_rows=data_rows,
+        columns=columns,
+    )
+    if field_block_plan is not None:
+        return field_block_plan
 
     package_column_plan = detect_package_specific_pin_columns(
         header_rows=header_rows,
@@ -272,6 +280,88 @@ def detect_package_specific_pin_columns(
             f"模型选中 {len(pin_columns)} 个 pin_no 列",
             "这些编号列共享一个 pin_name 列",
             "各编号列的完整表头产生了不同封装标签",
+        ),
+    )
+
+
+def detect_package_specific_field_blocks(
+    *,
+    headers: Sequence[str],
+    data_rows: Sequence[Sequence[str]],
+    columns: Sequence[ColumnLike],
+) -> MultiPackagePlan | None:
+    """识别横向重复的“封装 pin_no + 封装 pin_name”字段块。"""
+
+    pin_columns = _selected_columns(columns, "pin_no")
+    name_columns = _selected_columns(columns, "pin_name")
+    type_columns = _selected_columns(columns, "type")
+    if len(pin_columns) < 2 or len(pin_columns) != len(name_columns):
+        return None
+
+    if any(not _column_has_values(data_rows, column.index) for column in pin_columns):
+        return None
+
+    bindings: list[PackageBinding] = []
+    labels: list[str] = []
+    for index, pin_column in enumerate(pin_columns):
+        next_pin_index = (
+            pin_columns[index + 1].index
+            if index + 1 < len(pin_columns)
+            else None
+        )
+        block_name_columns = [
+            column
+            for column in name_columns
+            if (
+                column.index > pin_column.index
+                and (next_pin_index is None or column.index < next_pin_index)
+            )
+        ]
+        if len(block_name_columns) != 1:
+            return None
+
+        block_type_columns = [
+            column
+            for column in type_columns
+            if (
+                column.index > pin_column.index
+                and (next_pin_index is None or column.index < next_pin_index)
+            )
+        ]
+        if len(block_type_columns) > 1:
+            return None
+
+        label = derive_package_label_from_field_pair(
+            _column_header(headers, pin_column),
+            _column_header(headers, block_name_columns[0]),
+        )
+        if not label:
+            return None
+        labels.append(label)
+        bindings.append(
+            PackageBinding(
+                package=label,
+                pin_no_column=pin_column.index,
+                pin_name_column=block_name_columns[0].index,
+                type_column=(
+                    block_type_columns[0].index
+                    if block_type_columns
+                    else None
+                ),
+            )
+        )
+
+    if len({_normalize_text(label) for label in labels}) != len(labels):
+        return None
+
+    return MultiPackagePlan(
+        True,
+        "package_field_blocks",
+        tuple(bindings),
+        evidence=(
+            f"模型选中 {len(pin_columns)} 套 pin_no/pin_name 成对字段块",
+            "每个字段块拥有自己的物理编号列和名称列",
+            "按字段块表头提取互不相同的封装标签",
         ),
     )
 
@@ -473,6 +563,28 @@ def derive_package_labels_from_headers(headers: Sequence[str]) -> list[str]:
     return ["" if _is_generic_pin_header(label) else label for label in labels]
 
 
+def derive_package_label_from_field_pair(pin_header: str, name_header: str) -> str:
+    """从同一字段块的编号列和名称列表头中提取封装分支标签。"""
+
+    pin_label = clean_package_label(_remove_pin_number_role(pin_header))
+    name_label = clean_package_label(_remove_pin_name_role(name_header))
+    normalized_pin = _normalize_text(pin_label)
+    normalized_name = _normalize_text(name_label)
+    if normalized_pin and normalized_pin == normalized_name:
+        label = pin_label
+    else:
+        token_rows = [
+            _header_tokens(pin_label),
+            _header_tokens(name_label),
+        ]
+        common_length = _common_prefix_length(token_rows)
+        label = " ".join(token_rows[0][:common_length]).strip()
+        if not label:
+            return ""
+    label = clean_package_label(_remove_generic_pin_context(label))
+    return "" if _is_generic_pin_header(label) else label
+
+
 def clean_package_label(value: str) -> str:
     """清理封装标签的脚注和 Package 后缀，保留封装家族、编号及 pin count。"""
 
@@ -571,6 +683,23 @@ def _remove_pin_number_role(value: str) -> str:
     role = r"(?:pin|ball|terminal)\s*(?:no\.?|number|#)"
     value = re.sub(rf"^{role}\s*", "", value, flags=re.IGNORECASE)
     value = re.sub(rf"\s*{role}$", "", value, flags=re.IGNORECASE)
+    return value.strip()
+
+
+def _remove_pin_name_role(value: str) -> str:
+    """从表头首尾移除 PIN NAME/SIGNAL NAME/BALL NAME 等字段角色文字。"""
+
+    role = r"(?:(?:pin|ball|signal|terminal)\s*name|signal)"
+    value = re.sub(rf"^{role}\s*", "", value, flags=re.IGNORECASE)
+    value = re.sub(rf"\s*{role}$", "", value, flags=re.IGNORECASE)
+    return value.strip()
+
+
+def _remove_generic_pin_context(value: str) -> str:
+    """移除多层表头中只表示字段区域的 PIN 父节点。"""
+
+    value = re.sub(r"^(?:pin|ball|terminal)\s+", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s+(?:pin|ball|terminal)$", "", value, flags=re.IGNORECASE)
     return value.strip()
 
 

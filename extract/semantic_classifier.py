@@ -331,7 +331,7 @@ def call_model_json(
     request_timeout = (
         float(timeout)
         if timeout is not None
-        else float(os.getenv("DEEPSEEK_TIMEOUT", "30"))
+        else float(os.getenv("DEEPSEEK_TIMEOUT", "90"))
     )
     url = f"{base_url}/chat/completions"
 

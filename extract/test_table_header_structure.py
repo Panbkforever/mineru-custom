@@ -9,6 +9,7 @@ from extract.multi_package_extractor import (
 from extract.pin_package_extractor import (
     ColumnDecision,
     choose_header_row,
+    extract_records_from_row,
     reconcile_name_column_decisions,
 )
 from extract.table_header_structure import (
@@ -104,6 +105,69 @@ class TableHeaderStructureTest(unittest.TestCase):
                 ("Device C", "2", "CIN1"),
             ],
         )
+
+    def test_repeated_pin_name_field_blocks_form_package_plan_without_pipe(
+        self,
+    ) -> None:
+        headers = [
+            "ALV BALL #",
+            "ALV SIGNAL NAME",
+            "ALX BALL #",
+            "ALX SIGNAL NAME",
+        ]
+        data_rows = [
+            ["A2", "DDR0_DQ1", "B2", "VSS"],
+            ["A3", "DDR0_DQ0", "B3", "TDI"],
+        ]
+        decisions = [
+            ColumnDecision(0, headers[0], "pin_no"),
+            ColumnDecision(1, headers[1], "pin_name"),
+            ColumnDecision(2, headers[2], "pin_no"),
+            ColumnDecision(3, headers[3], "pin_name"),
+        ]
+
+        plan = analyze_multi_package_table(
+            title="AM243x Package Comparison Table (ALV vs. ALX)",
+            header_rows=[headers],
+            headers=headers,
+            data_rows=data_rows,
+            columns=decisions,
+        )
+
+        self.assertTrue(plan.is_multi_package)
+        self.assertEqual(plan.mode, "package_field_blocks")
+        self.assertEqual(
+            [
+                (binding.package, binding.pin_no_column, binding.pin_name_column)
+                for binding in plan.bindings
+            ],
+            [("ALV", 0, 1), ("ALX", 2, 3)],
+        )
+        self.assertEqual(
+            [
+                (row.package, row.pin_no, row.pin_name)
+                for row in iter_bound_package_rows(plan, data_rows)
+            ],
+            [
+                ("ALV", "A2", "DDR0_DQ1"),
+                ("ALV", "A3", "DDR0_DQ0"),
+                ("ALX", "B2", "VSS"),
+                ("ALX", "B3", "TDI"),
+            ],
+        )
+
+    def test_plain_row_extraction_does_not_pipe_multiple_pin_names(self) -> None:
+        records = extract_records_from_row(
+            ["A2", "DDR0_DQ1", "VSS"],
+            [
+                ColumnDecision(0, "BALL #", "pin_no"),
+                ColumnDecision(1, "ALV SIGNAL NAME", "pin_name"),
+                ColumnDecision(2, "ALX SIGNAL NAME", "pin_name"),
+            ],
+        )
+
+        self.assertEqual(records[0]["pin_name"], "DDR0_DQ1")
+        self.assertNotIn("|", records[0]["pin_name"])
 
     def test_ball_name_and_signal_name_choose_one_complete_column(self) -> None:
         rows = [
