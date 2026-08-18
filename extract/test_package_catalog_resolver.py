@@ -7,8 +7,10 @@ from extract.package_catalog_resolver import (
     PackageCatalogEntry,
     PackageCatalogTable,
     PackageTargetTable,
+    bind_target_tables,
     clean_package_name,
     find_package_catalog_candidates,
+    freeze_package_slots,
     merge_plan_package_labels,
     resolve_document_package_catalog,
 )
@@ -734,6 +736,136 @@ def test_packaging_metadata_can_establish_physical_slot_without_identity():
     assert result.entries[0].identity_name == ""
     assert result.entries[0].package_type == "VSSOP"
     assert result.declared_assignments()[0].pkg == "VSSOP"
+
+
+def test_confirmed_cross_table_drawing_becomes_public_pkg_label():
+    """同一物理封装族的跨表分支应输出已确认 drawing，而不是 VQFN1/VQFN2。"""
+
+    summary = catalog_table(
+        0,
+        "Device Information",
+        ["DEVICE", "PACKAGE", "DRAWING", "PINS"],
+        [
+            ["DEVICE", "PACKAGE", "DRAWING", "PINS"],
+            ["DEV-RGZ", "VQFN", "RGZ", "48"],
+            ["DEV-RHB", "VQFN", "RHB", "32"],
+        ],
+    )
+    targets = [
+        target_table(1, "RGZ Package Pin Functions", ["PIN NO", "PIN NAME"]),
+        target_table(2, "RHB Package Pin Functions", ["PIN NO", "PIN NAME"]),
+    ]
+
+    def classifier(table, source_name, target_tables):
+        return {
+            "is_package_summary": True,
+            "table_role": "identity_summary",
+            "header_row_index": 0,
+            "columns": [
+                {"column_index": 0, "role": "package_identity"},
+                {"column_index": 1, "role": "package_type"},
+                {"column_index": 2, "role": "package_drawing"},
+                {"column_index": 3, "role": "pin_count"},
+            ],
+        }
+
+    result = resolve_document_package_catalog(
+        all_tables=[summary],
+        target_tables=targets,
+        multi_package_plans={
+            target.table_id: MultiPackagePlan(False, "single_package")
+            for target in targets
+        },
+        use_semantic_classifier=True,
+        classifier=classifier,
+    )
+
+    assert [item.pkg for item in result.declared_assignments()] == ["RGZ", "RHB"]
+    assert result.assignment_for(1, 0).pkg == "RGZ"
+    assert result.assignment_for(2, 0).pkg == "RHB"
+    assert [entry.public_label for entry in result.entries] == ["RGZ", "RHB"]
+
+
+def test_title_symbol_package_must_link_reverses_qfn_column_binding():
+    """表题 RKP(QFN40)/RGE(QFN24) 必须覆盖本地 QFN24/QFN40 顺序。"""
+
+    entries = [
+        PackageCatalogEntry("", identity_aliases=["RKP"], public_label="RKP"),
+        PackageCatalogEntry("", identity_aliases=["RGE"], public_label="RGE"),
+    ]
+    freeze_package_slots(entries)
+    table = target_table(
+        7,
+        "Table 7-5. RKP (QFN40) and RGE (QFN24) Pin Functions",
+        ["PIN NAME", "QFN24 PIN NO", "QFN40 PIN NO"],
+    )
+    plan = MultiPackagePlan(
+        True,
+        "package_columns",
+        bindings=(
+            PackageBinding("QFN24", 1, 0, None),
+            PackageBinding("QFN40", 2, 0, None),
+        ),
+    )
+    diagnostics = []
+
+    assignments = bind_target_tables(
+        entries=entries,
+        target_tables=[table],
+        multi_package_plans={7: plan},
+        diagnostics=diagnostics,
+    )
+
+    assert assignments[(7, 0)].pkg == "RGE"
+    assert assignments[(7, 1)].pkg == "RKP"
+    resolved = [
+        item
+        for item in diagnostics
+        if item.get("stage") == "package_binding"
+    ]
+    assert [item.get("effective_label") for item in resolved] == ["RGE", "RKP"]
+    assert resolved[0]["symbol_package_link_sources"] == ["table_title"]
+
+
+def test_header_symbol_package_must_link_reverses_qfn_column_binding():
+    """表头中的 Symbol(Package) 与表题同权，可修正本地列标签。"""
+
+    entries = [
+        PackageCatalogEntry("", identity_aliases=["RKP"], public_label="RKP"),
+        PackageCatalogEntry("", identity_aliases=["RGE"], public_label="RGE"),
+    ]
+    freeze_package_slots(entries)
+    table = target_table(
+        8,
+        "Pin Functions",
+        ["PIN NAME", "RGE (QFN24) PIN NO", "RKP (QFN40) PIN NO"],
+    )
+    plan = MultiPackagePlan(
+        True,
+        "package_columns",
+        bindings=(
+            PackageBinding("QFN24", 1, 0, None),
+            PackageBinding("QFN40", 2, 0, None),
+        ),
+    )
+    diagnostics = []
+
+    assignments = bind_target_tables(
+        entries=entries,
+        target_tables=[table],
+        multi_package_plans={8: plan},
+        diagnostics=diagnostics,
+    )
+
+    assert assignments[(8, 0)].pkg == "RGE"
+    assert assignments[(8, 1)].pkg == "RKP"
+    resolved = [
+        item
+        for item in diagnostics
+        if item.get("stage") == "package_binding"
+    ]
+    assert [item.get("effective_label") for item in resolved] == ["RGE", "RKP"]
+    assert resolved[0]["symbol_package_link_sources"] == ["table_header"]
 
 
 def test_unresolved_tables_share_one_frozen_fallback_slot():

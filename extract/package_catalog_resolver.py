@@ -14,8 +14,10 @@
 3. 代码按照模型给出的列索引逐行读取原表，并结合已经严格确认的表内分支，
    确定文档中有几个相互独立的物理引脚映射空间，再冻结为
    slot:0、slot:1……。
-4. ``package_identity``（器件型号）只作为跨表关联证据；公开 ``pkg`` 只取
-   ``package_type``（SC-70、VSSOP、QFN 等物理封装名称）。
+4. ``package_identity``（器件型号）只作为跨表关联证据；公开 ``pkg`` 默认取
+   ``package_type``（SC-70、VSSOP、QFN 等物理封装名称）。只有目标引脚表的
+   表题/表头/跨表分支明确确认了短 symbol/drawing 时，才会使用该短标签作为
+   public label。
 5. 严格确认的 N 个表内分支是 N 个独立输出槽位的下限。总述表即使只找到
    一个公开封装名，也必须建立 N 个槽位并复用该名称；最终输出再追加数字
    后缀。已有严格多分支证据时，只有器件型号、没有任何物理封装元数据的
@@ -38,7 +40,7 @@
 * description 和普通正文不能参与封装绑定。
 * 一个 pkg 只能是一个字符串，禁止使用 ``|`` 拼接多个候选名称。
 * pkg 名称最长 15 个字符；超过长度的标题、描述或多个名称拼接结果直接拒绝。
-* 器件型号、订购型号和 Drawing 不能写入公开 pkg；Drawing 只用于消歧。
+* 器件型号、订购型号和未经目标引脚表确认的 Drawing 不能写入公开 pkg。
 * 不能为每张未匹配表生成 ``unresolved:table_id``，否则表数会被误当成封装数。
 * 两个槽位即使公开封装名相同也保持独立；只有建立槽位时的同一行/同一结构
   证据才能决定它们是不是同一个物理映射空间。
@@ -55,6 +57,19 @@ from extract.multi_PkgTab_extractor import (
     MultiPkgTabResolution,
     catalog_groups_confirmed_by_target_tables,
     resolve_multi_pkg_tab_structure,
+)
+
+
+PACKAGE_FAMILY_PATTERN = (
+    r"(?:HTSSOP|TSSOP|VSSOP|SSOP|HTQFP|TQFP|LQFP|QFP|"
+    r"VQFN|WQFN|QFN|DFN|SON|X2SON|HSBGA|NFBGA|LFBGA|FBGA|PBGA|"
+    r"DSBGA|BGA|FCCSP|FCBGA|WCSP|CSP|SOIC|MSOP|SOT|SC)"
+)
+
+PHYSICAL_PACKAGE_LABEL_COMPACT_RE = re.compile(
+    r"^(?:htssop|tssop|vssop|ssop|htqfp|tqfp|lqfp|qfp|"
+    r"vqfn|wqfn|qfn|dfn|son|x2son|hsbga|nfbga|lfbga|fbga|pbga|"
+    r"dsbga|bga|fccsp|fcbga|wcsp|csp|soic|msop|sot|sc)(?:\d+)?$"
 )
 
 
@@ -101,8 +116,8 @@ class PackageTargetTable:
 class PackageCatalogEntry:
     """一个已经冻结的物理封装槽位。
 
-    ``identity_name`` 是器件型号，只参与表格关联；``package_type`` 才是
-    最终 JSON 中允许公开的物理封装名称。
+    ``identity_name`` 是器件型号，只参与表格关联；``package_type`` 是物理封装
+    名称；``public_label`` 只保存目标引脚表已确认的短 symbol/drawing。
     """
 
     package_key: str
@@ -112,6 +127,7 @@ class PackageCatalogEntry:
     package_drawing: str = ""
     pin_count: str = ""
     evidence_table_ids: list[int] = field(default_factory=list)
+    public_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -140,6 +156,15 @@ class PackageAssignment:
     package_key: str
     pkg: str
     reason: str
+
+
+@dataclass(frozen=True)
+class SymbolPackageLinkResolution:
+    """表题/表头中的 Symbol(Package) must-link 解析结果。"""
+
+    effective_labels: tuple[str, ...]
+    sources_by_slot: Mapping[int, tuple[str, ...]] = field(default_factory=dict)
+    conflicts: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass
@@ -1117,6 +1142,8 @@ def merge_catalog_entry(
             existing.package_drawing = incoming.package_drawing
         if not existing.pin_count:
             existing.pin_count = incoming.pin_count
+        if not existing.public_label:
+            existing.public_label = incoming.public_label
         return
     entries.append(incoming)
 
@@ -1137,6 +1164,8 @@ def merge_physical_metadata_entry(
         for table_id in incoming.evidence_table_ids:
             if table_id not in existing.evidence_table_ids:
                 existing.evidence_table_ids.append(table_id)
+        if not existing.public_label:
+            existing.public_label = incoming.public_label
         return
     entries.append(incoming)
 
@@ -1245,6 +1274,8 @@ def merge_redundant_catalog_evidence(
     for table_id in incoming.evidence_table_ids:
         if table_id not in target.evidence_table_ids:
             target.evidence_table_ids.append(table_id)
+    if not target.public_label and incoming.public_label:
+        target.public_label = incoming.public_label
 
     # 分列字段比组合字符串更适合作为公开名称和后续匹配证据。
     target_detail = bool(target.package_drawing) + bool(target.pin_count)
@@ -1273,8 +1304,8 @@ def reconcile_multi_pkg_tab_catalog(
 
     本函数只在槽位冻结前工作：同一 Drawing/pin_count 被多张目标表明确证明
     为同一分支时，允许合并不同订购型号产生的重复目录项；目标表明确出现
-    一个目录中缺失的分支时，补建匿名槽位并把局部标签保存为内部别名。
-    公开 pkg 仍只来自 package_type，分支标签不会泄漏到最终名称。
+    一个目录中缺失的分支时，补建匿名槽位并把局部标签保存为内部别名。目标
+    表已经确认的短分支标签会额外写入 ``public_label``，供最终 ``pkg`` 使用。
     """
 
     result = list(entries)
@@ -1309,6 +1340,7 @@ def reconcile_multi_pkg_tab_catalog(
                 "identity_aliases": list(target.identity_aliases),
                 "package_drawing": target.package_drawing,
                 "pin_count": target.pin_count,
+                "public_label": target.public_label,
             }
         )
 
@@ -1332,7 +1364,10 @@ def reconcile_multi_pkg_tab_catalog(
 
         if len(matched_entries) == 1:
             entry = matched_entries[0]
-            _append_internal_binding_alias(entry, branch.label)
+            if _branch_label_can_be_public(branch.evidence_kind):
+                _record_confirmed_branch_label(entry, branch.label)
+            else:
+                _append_internal_binding_alias(entry, branch.label)
             supported_entry_ids.add(id(entry))
             diagnostics.append(
                 {
@@ -1356,6 +1391,11 @@ def reconcile_multi_pkg_tab_catalog(
                 package_key="",
                 identity_aliases=[branch.label],
                 evidence_table_ids=list(branch.table_ids),
+                public_label=(
+                    clean_public_symbol_name(branch.label)
+                    if _branch_label_can_be_public(branch.evidence_kind)
+                    else ""
+                ),
             )
             result.append(entry)
             supported_entry_ids.add(id(entry))
@@ -1393,6 +1433,7 @@ def reconcile_multi_pkg_tab_catalog(
                     "package_drawing": entry.package_drawing,
                     "pin_count": entry.pin_count,
                     "evidence_table_ids": list(entry.evidence_table_ids),
+                    "public_label": entry.public_label,
                 }
             )
         if removed:
@@ -1420,17 +1461,36 @@ def _entries_matching_exact_branch_label(
             entry.identity_name,
             *entry.identity_aliases,
             entry.package_drawing,
+            entry.public_label,
         ]
         if any(normalize_compact(value) == normalized_label for value in values):
             matches.append(entry)
     return matches
 
 
+def _record_confirmed_branch_label(
+    entry: PackageCatalogEntry,
+    label: str,
+) -> None:
+    """保存已确认分支标签，同时把安全短标签暴露给最终 pkg。"""
+
+    _append_internal_binding_alias(entry, label)
+    public_label = clean_public_symbol_name(label)
+    if public_label and not entry.public_label:
+        entry.public_label = public_label
+
+
+def _branch_label_can_be_public(evidence_kind: str) -> bool:
+    """只有明确封装分支/drawing 证据可以成为公开短标签。"""
+
+    return evidence_kind in {"package_drawing", "explicit_package_label"}
+
+
 def _append_internal_binding_alias(
     entry: PackageCatalogEntry,
     label: str,
 ) -> None:
-    """保存局部分支标签供后续表绑定使用，不改变公开 package_type。"""
+    """保存局部分支标签供后续表绑定使用。"""
 
     label = str(label or "").strip()
     if (
@@ -1686,6 +1746,210 @@ def freeze_package_slots(entries: Sequence[PackageCatalogEntry]) -> None:
         entry.package_key = f"slot:{slot_index}"
 
 
+def resolve_table_symbol_package_links(
+    table: PackageTargetTable,
+    local_labels: Sequence[str],
+    entries: Sequence[PackageCatalogEntry],
+) -> SymbolPackageLinkResolution:
+    """从表题和表头解析 Symbol(Package) 关系，修正局部分支标签。
+
+    典型场景是表内列名只有 ``QFN24/QFN40``，但表题写着
+    ``RKP (QFN40) and RGE (QFN24)``。此时真正用于绑定目录槽位的应该是
+    ``RGE/RKP``，不是局部物理封装文本本身。
+    """
+
+    if len(local_labels) < 2:
+        return SymbolPackageLinkResolution(tuple(local_labels))
+
+    link_candidates = collect_symbol_package_link_candidates(
+        table,
+        local_labels,
+        entries,
+    )
+    if not link_candidates:
+        return SymbolPackageLinkResolution(tuple(local_labels))
+
+    selected_by_slot: dict[int, tuple[str, tuple[str, ...]]] = {}
+    conflicts: list[dict[str, Any]] = []
+
+    for local_slot, local_label in enumerate(local_labels):
+        package_key = package_label_match_key(local_label)
+        if not package_key:
+            continue
+        candidates = link_candidates.get(package_key, {})
+        if not candidates:
+            continue
+
+        usable: list[tuple[str, str, tuple[str, ...]]] = []
+        for symbol_key, record in candidates.items():
+            symbol = str(record["symbol"])
+            # must-link 只有在 symbol 能唯一命中文档级槽位时才生效；否则不
+            # 替代原标签，避免把一条弱字符串关系变成硬绑定。
+            if len(_entries_matching_exact_branch_label(entries, symbol)) != 1:
+                continue
+            usable.append(
+                (
+                    symbol_key,
+                    symbol,
+                    tuple(sorted(str(source) for source in record["sources"])),
+                )
+            )
+
+        if len(usable) > 1:
+            conflicts.append(
+                {
+                    "local_slot": local_slot,
+                    "local_label": local_label,
+                    "candidate_symbols": [symbol for _key, symbol, _sources in usable],
+                    "reason": "multiple_symbols_for_package_label",
+                }
+            )
+            continue
+        if len(usable) == 1:
+            _symbol_key, symbol, sources = usable[0]
+            selected_by_slot[local_slot] = (symbol, sources)
+
+    symbol_to_slots: dict[str, list[int]] = {}
+    for local_slot, (symbol, _sources) in selected_by_slot.items():
+        symbol_to_slots.setdefault(normalize_compact(symbol), []).append(local_slot)
+    for symbol_key, slots in symbol_to_slots.items():
+        if len(slots) <= 1:
+            continue
+        conflicts.append(
+            {
+                "local_slots": slots,
+                "candidate_symbol": selected_by_slot[slots[0]][0],
+                "candidate_symbol_key": symbol_key,
+                "reason": "same_symbol_for_multiple_package_labels",
+            }
+        )
+
+    if conflicts:
+        return SymbolPackageLinkResolution(
+            tuple(local_labels),
+            conflicts=tuple(conflicts),
+        )
+
+    effective_labels = list(local_labels)
+    sources_by_slot: dict[int, tuple[str, ...]] = {}
+    for local_slot, (symbol, sources) in selected_by_slot.items():
+        effective_labels[local_slot] = symbol
+        sources_by_slot[local_slot] = sources
+
+    return SymbolPackageLinkResolution(
+        tuple(effective_labels),
+        sources_by_slot=sources_by_slot,
+    )
+
+
+def collect_symbol_package_link_candidates(
+    table: PackageTargetTable,
+    local_labels: Sequence[str],
+    entries: Sequence[PackageCatalogEntry],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """收集表题和表头中的 package label -> symbol 候选。"""
+
+    result: dict[str, dict[str, dict[str, Any]]] = {}
+    for source, text in (
+        ("table_title", table.title),
+        ("table_header", " ".join(table.headers)),
+    ):
+        for symbol, package_label in extract_symbol_package_pairs(text):
+            add_symbol_package_link_candidate(
+                result,
+                package_label=package_label,
+                symbol=symbol,
+                source=source,
+            )
+
+    # 有些 PDF 的列头写成 ``QFN24 RGE Pin No.`` 或 ``QFN24 (RGE)``，
+    # 不满足严格 Symbol(Package) 顺序。只在同一个 header 单元格内同时出现
+    # 一个局部 package label 和一个已知短 symbol 时，才补充 header must-link。
+    symbol_candidates = entry_symbol_candidates(entries)
+    for header in table.headers:
+        for local_label in local_labels:
+            if not text_contains_package_label(header, local_label):
+                continue
+            for symbol in symbol_candidates:
+                if normalize_compact(symbol) == normalize_compact(local_label):
+                    continue
+                if package_name_in_text(symbol, normalize_text(header)):
+                    add_symbol_package_link_candidate(
+                        result,
+                        package_label=local_label,
+                        symbol=symbol,
+                        source="table_header",
+                    )
+    return result
+
+
+def extract_symbol_package_pairs(text: str) -> list[tuple[str, str]]:
+    """提取 ``SYMBOL (PACKAGE)`` 形式的短标签关系。"""
+
+    pairs: list[tuple[str, str]] = []
+    for match in re.finditer(
+        r"(?<![A-Za-z0-9])(?P<symbol>[A-Za-z][A-Za-z0-9-]{0,14})"
+        r"\s*[\(（]\s*(?P<package>[^()（）]{1,40})\s*[\)）]",
+        str(text or ""),
+    ):
+        symbol = clean_public_symbol_name(match.group("symbol"))
+        package_label = clean_metadata(match.group("package"))
+        if symbol and package_label_match_key(package_label):
+            pairs.append((symbol, package_label))
+    return pairs
+
+
+def add_symbol_package_link_candidate(
+    result: dict[str, dict[str, dict[str, Any]]],
+    *,
+    package_label: str,
+    symbol: str,
+    source: str,
+) -> None:
+    """添加一个 package label -> symbol 候选，并合并来源。"""
+
+    package_key = package_label_match_key(package_label)
+    symbol = clean_public_symbol_name(symbol)
+    symbol_key = normalize_compact(symbol)
+    if not package_key or not symbol_key:
+        return
+    package_bucket = result.setdefault(package_key, {})
+    record = package_bucket.setdefault(
+        symbol_key,
+        {"symbol": symbol, "sources": set()},
+    )
+    record["sources"].add(source)
+
+
+def entry_symbol_candidates(
+    entries: Sequence[PackageCatalogEntry],
+) -> tuple[str, ...]:
+    """收集目录项中可用于表头 must-link 的短 symbol 候选。"""
+
+    result: dict[str, str] = {}
+    for entry in entries:
+        for value in [
+            entry.public_label,
+            *entry.identity_aliases,
+            entry.package_drawing,
+        ]:
+            symbol = clean_public_symbol_name(value)
+            if symbol:
+                result.setdefault(normalize_compact(symbol), symbol)
+    return tuple(result.values())
+
+
+def text_contains_package_label(text: str, package_label: str) -> bool:
+    """判断一个 header 单元格是否包含指定局部 package 标签。"""
+
+    package_key = package_label_match_key(package_label)
+    if not package_key:
+        return False
+    if package_name_in_text(package_label, normalize_text(text)):
+        return True
+    return package_label_match_key(text) == package_key
+
+
 def bind_target_tables(
     *,
     entries: Sequence[PackageCatalogEntry],
@@ -1802,7 +2066,31 @@ def bind_target_tables(
         # 多封装表必须把全部分支作为一个整体绑定。若逐个分支独立匹配，两个
         # 模糊标签可能同时落入第一个槽位，导致本应分开的 pkg 再次合并。
         if plan_creates_package_slots(plan) and len(local_labels) >= 2:
-            bound_entries = bind_multi_package_entries(entries, local_labels)
+            link_resolution = resolve_table_symbol_package_links(
+                table,
+                local_labels,
+                entries,
+            )
+            if link_resolution.conflicts:
+                for local_slot, local_label in enumerate(local_labels):
+                    append_package_binding_diagnostic(
+                        diagnostics,
+                        table=table,
+                        local_slot=local_slot,
+                        local_label=local_label,
+                        assignment=None,
+                        reason="symbol_package_link_conflict",
+                        matched_entries=[],
+                        entries=entries,
+                        link_conflicts=link_resolution.conflicts,
+                    )
+                if chapter_context_key(table) != previous_context:
+                    previous_explicit = None
+                    previous_context = ""
+                continue
+
+            effective_labels = list(link_resolution.effective_labels)
+            bound_entries = bind_multi_package_entries(entries, effective_labels)
             for local_slot, (local_label, entry) in enumerate(
                 zip(local_labels, bound_entries)
             ):
@@ -1812,16 +2100,20 @@ def bind_target_tables(
                     reason="multi_package_global_unique_binding",
                 )
                 assignments[(table.table_id, local_slot)] = assignment
-                diagnostics.append(
-                    {
-                        "stage": "package_binding",
-                        "table_id": table.table_id,
-                        "local_slot": local_slot,
-                        "local_label": local_label,
-                        "package_key": assignment.package_key,
-                        "pkg": assignment.pkg,
-                        "reason": assignment.reason,
-                    }
+                append_package_binding_diagnostic(
+                    diagnostics,
+                    table=table,
+                    local_slot=local_slot,
+                    local_label=local_label,
+                    assignment=assignment,
+                    reason=assignment.reason,
+                    matched_entries=[entry],
+                    entries=entries,
+                    effective_label=effective_labels[local_slot],
+                    link_sources=link_resolution.sources_by_slot.get(
+                        local_slot,
+                        (),
+                    ),
                 )
             # 多分支表不能成为单封装续表的继承来源。
             if chapter_context_key(table) != previous_context:
@@ -1929,6 +2221,9 @@ def append_package_binding_diagnostic(
     reason: str,
     matched_entries: Sequence[PackageCatalogEntry],
     entries: Sequence[PackageCatalogEntry],
+    effective_label: str | None = None,
+    link_sources: Sequence[str] = (),
+    link_conflicts: Sequence[dict[str, Any]] = (),
 ) -> None:
     """记录一次绑定结果；unresolved 只写诊断，不伪造 pkg assignment。"""
 
@@ -1951,6 +2246,12 @@ def append_package_binding_diagnostic(
     if assignment is not None:
         diagnostic["package_key"] = assignment.package_key
         diagnostic["pkg"] = assignment.pkg
+    if effective_label is not None and effective_label != local_label:
+        diagnostic["effective_label"] = effective_label
+    if link_sources:
+        diagnostic["symbol_package_link_sources"] = list(link_sources)
+    if link_conflicts:
+        diagnostic["symbol_package_link_conflicts"] = list(link_conflicts)
     diagnostics.append(diagnostic)
 
 
@@ -2067,7 +2368,7 @@ def multi_package_binding_score(
     label_compact = normalize_compact(local_label)
     score = 0
 
-    identities = [entry.identity_name, *entry.identity_aliases]
+    identities = [entry.identity_name, *entry.identity_aliases, entry.public_label]
     for identity in identities:
         identity_compact = normalize_compact(clean_identity_name(identity))
         if not identity_compact:
@@ -2126,6 +2427,8 @@ def match_entries_in_text(
         # 器件型号只用于内部关联；封装类型和 Drawing 也可参与绑定。若同一
         # 元数据对应多个槽位，会保持歧义，不能据此合并槽位。
         names = [entry.identity_name, *entry.identity_aliases]
+        if entry.public_label:
+            names.append(entry.public_label)
         if entry.package_type:
             names.append(entry.package_type)
         if entry.package_drawing:
@@ -2209,7 +2512,8 @@ def assignment_from_entry(
     return PackageAssignment(
         package_key=entry.package_key,
         pkg=(
-            clean_public_package_name(entry.package_type)
+            clean_public_symbol_name(entry.public_label)
+            or clean_public_package_name(entry.package_type)
             or alphabetic_slot_name(slot_index)
         ),
         reason=reason,
@@ -2265,6 +2569,39 @@ def clean_public_package_name(value: str) -> str:
     return value
 
 
+def clean_public_symbol_name(value: str) -> str:
+    """清理已确认的公开短 symbol，拒绝物理封装族和拼接结果。"""
+
+    value = re.sub(r"<[^>]+>", " ", str(value or ""))
+    value = re.sub(r"\s+", " ", value).strip(" \t\r\n,;:")
+    # 表头脚注不是 symbol 本体，例如 RKP(1) 应按 RKP 处理。
+    value = re.sub(r"\s*[\(（]\s*\d+\s*[\)）]\s*$", "", value)
+    if (
+        not value
+        or "|" in value
+        or "\n" in value
+        or len(value) > 15
+        or is_generic_package_label(value)
+        or is_physical_package_public_label(value)
+        or not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,14}", value)
+    ):
+        return ""
+    return value
+
+
+def is_physical_package_public_label(value: str) -> bool:
+    """判断短文本是否只是 QFN24/VQFN/BGA 这类物理封装标签。"""
+
+    compact = normalize_compact(value)
+    if PHYSICAL_PACKAGE_LABEL_COMPACT_RE.fullmatch(compact):
+        return True
+    package_key = package_label_match_key(value)
+    return bool(
+        package_key
+        and PHYSICAL_PACKAGE_LABEL_COMPACT_RE.fullmatch(package_key)
+    )
+
+
 def extract_public_package_name_from_metadata(value: str) -> str:
     """从长包装描述中截取明确的物理封装族名称。
 
@@ -2272,13 +2609,8 @@ def extract_public_package_name_from_metadata(value: str) -> str:
     Pb-Free 等其余文字都不会进入公开 pkg，也不会参与槽位数量判断。
     """
 
-    family = (
-        r"(?:HTSSOP|TSSOP|VSSOP|SSOP|HTQFP|TQFP|LQFP|QFP|"
-        r"VQFN|WQFN|QFN|DFN|SON|X2SON|HSBGA|LFBGA|FBGA|PBGA|"
-        r"DSBGA|BGA|WCSP|CSP|SOIC|MSOP|SOT|SC)"
-    )
     match = re.search(
-        rf"(?<![A-Za-z0-9])({family}(?:[- ]\d+)?(?:\s+E-?PAD)?)(?![A-Za-z0-9])",
+        rf"(?<![A-Za-z0-9])({PACKAGE_FAMILY_PATTERN}(?:[- ]\d+)?(?:\s+E-?PAD)?)(?![A-Za-z0-9])",
         str(value or ""),
         flags=re.IGNORECASE,
     )
@@ -2291,6 +2623,41 @@ def clean_package_name(value: str) -> str:
     """兼容旧调用名称；当前语义等同于清理公开物理封装名。"""
 
     return clean_public_package_name(value)
+
+
+def package_label_match_key(value: str) -> str:
+    """把 QFN24、QFN-24、24-pin QFN 统一成同一个比较键。"""
+
+    text = re.sub(r"<[^>]+>", " ", str(value or ""))
+    text = re.sub(
+        r"(?<![A-Za-z0-9])(?:pin|pins|package|pkg)(?![A-Za-z0-9])",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\s+", " ", text).strip(" \t\r\n,;:")
+    if not text:
+        return ""
+
+    family_match = re.search(
+        rf"(?<![A-Za-z0-9])(?P<family>{PACKAGE_FAMILY_PATTERN})"
+        r"(?:\s*[- ]?\s*(?P<count>\d{1,4}))?(?![A-Za-z0-9])",
+        text,
+        flags=re.IGNORECASE,
+    )
+    count = ""
+    if family_match:
+        count = family_match.group("count") or ""
+        if not count:
+            count_match = re.search(
+                r"(?<![A-Za-z0-9])(\d{1,4})(?![A-Za-z0-9])",
+                text,
+            )
+            count = count_match.group(1) if count_match else ""
+        return normalize_compact(f"{family_match.group('family')}{count}")
+
+    embedded_package = extract_public_package_name_from_metadata(text)
+    return normalize_compact(embedded_package or text)
 
 
 def catalog_header_hints(rows: Sequence[Sequence[str]]) -> tuple[str, ...]:

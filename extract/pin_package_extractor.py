@@ -561,6 +561,7 @@ def extract_pin_package_info_from_table_candidates(
                             "package_drawing": entry.package_drawing,
                             "pin_count": entry.pin_count,
                             "evidence_table_ids": entry.evidence_table_ids,
+                            "public_label": entry.public_label,
                         }
                         for entry in package_resolution.entries
                     ],
