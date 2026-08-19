@@ -26,7 +26,9 @@
    description 和数据行不能参与绑定。
 7. 槽位冻结后，任何未匹配表都不能创建新 pkg。单封装文档可以绑定唯一
    槽位；多封装文档中无法唯一归属的表必须标记为 unresolved，禁止默认
-   塞入第一个槽位。真实名称缺失时仅对已经确认的槽位使用 a、b、c……。
+   塞入第一个槽位。若多个目录槽位全部无法绑定且没有真实多封装分支证据，
+   按单封装误膨胀兜底收敛为一个槽位。真实名称缺失时仅对已经确认的槽位
+   使用 a、b、c……。
 8. 多封装表的全部本地分支必须一次性执行一对一绑定；禁止每个分支独立
    兜底后落入同一个 package_key。标签脚注、drawing 和 pin_count 只用于
    内部消歧，不改变任何引脚行内容。
@@ -288,13 +290,47 @@ def resolve_document_package_catalog(
     # 到这里封装数量已经确定。后续绑定只能选择这些 slot，不能增删。
     freeze_package_slots(entries)
 
+    binding_diagnostics: list[dict[str, Any]] = []
     assignments = bind_target_tables(
         entries=entries,
         target_tables=target_tables,
         multi_package_plans=multi_package_plans,
         multi_pkg_tab_resolution=multi_pkg_tab_resolution,
-        diagnostics=diagnostics,
+        diagnostics=binding_diagnostics,
     )
+    diagnostics.extend(binding_diagnostics)
+    if should_apply_all_unresolved_single_package_fallback(
+        entries=entries,
+        target_tables=target_tables,
+        multi_package_plans=multi_package_plans,
+        assignments=assignments,
+        binding_diagnostics=binding_diagnostics,
+    ):
+        fallback_before_entries = list(entries)
+        entries = [
+            select_single_package_fallback_entry(
+                entries,
+                source_name=source_name,
+                target_tables=target_tables,
+            )
+        ]
+        diagnostics.append(
+            single_package_all_unresolved_fallback_diagnostic(
+                before_entries=fallback_before_entries,
+                selected_entry=entries[0],
+                source_name=source_name,
+                target_tables=target_tables,
+                initial_binding_diagnostics=binding_diagnostics,
+            )
+        )
+        freeze_package_slots(entries)
+        assignments = bind_target_tables(
+            entries=entries,
+            target_tables=target_tables,
+            multi_package_plans=multi_package_plans,
+            multi_pkg_tab_resolution=None,
+            diagnostics=diagnostics,
+        )
     return PackageCatalogResolution(entries, assignments, diagnostics)
 
 
@@ -1744,6 +1780,212 @@ def freeze_package_slots(entries: Sequence[PackageCatalogEntry]) -> None:
 
     for slot_index, entry in enumerate(entries):
         entry.package_key = f"slot:{slot_index}"
+
+
+def should_apply_all_unresolved_single_package_fallback(
+    *,
+    entries: Sequence[PackageCatalogEntry],
+    target_tables: Sequence[PackageTargetTable],
+    multi_package_plans: Mapping[int, MultiPackagePlanLike],
+    assignments: Mapping[tuple[int, int], PackageAssignment],
+    binding_diagnostics: Sequence[dict[str, Any]],
+) -> bool:
+    """多个目录槽位全部无法绑定时，把该文档按单封装兜底处理。
+
+    该保底只覆盖原本会 0 输出的单封装误膨胀场景。若任一目标表已经绑定成功，
+    或表内存在真实多封装结构，或失败原因是明确歧义，都不在这里合并。
+    """
+
+    if len(entries) <= 1 or not target_tables or assignments:
+        return False
+    if any(
+        plan_creates_package_slots(multi_package_plans.get(table.table_id))
+        for table in target_tables
+    ):
+        return False
+
+    package_binding_diagnostics = [
+        diagnostic
+        for diagnostic in binding_diagnostics
+        if diagnostic.get("stage") == "package_binding"
+    ]
+    if not package_binding_diagnostics:
+        return False
+    return all(
+        diagnostic.get("status") == "unresolved"
+        and diagnostic.get("reason") == "package_unresolved"
+        for diagnostic in package_binding_diagnostics
+    )
+
+
+def select_single_package_fallback_entry(
+    entries: Sequence[PackageCatalogEntry],
+    *,
+    source_name: str,
+    target_tables: Sequence[PackageTargetTable],
+) -> PackageCatalogEntry:
+    """从误膨胀目录中选择一个单封装槽位，并复制为新的唯一 entry。"""
+
+    source_hint = package_hint_from_source_name(source_name)
+    selected = max(
+        enumerate(entries),
+        key=lambda item: single_package_fallback_entry_score(
+            item[1],
+            source_hint=source_hint,
+            entry_index=item[0],
+        ),
+    )[1]
+    evidence_table_ids = list(
+        dict.fromkeys(
+            [
+                *selected.evidence_table_ids,
+                *(table.table_id for table in target_tables),
+            ]
+        )
+    )
+    result = replace(
+        selected,
+        package_key="",
+        identity_aliases=list(selected.identity_aliases),
+        evidence_table_ids=evidence_table_ids,
+    )
+    hint_drawing, hint_pin_count = source_hint
+    if hint_drawing:
+        public_label = clean_public_symbol_name(hint_drawing)
+        if public_label:
+            result.public_label = public_label
+        # 文件名是单封装任务的强目标约束；只在保底收敛时允许它覆盖目录中
+        # 的历史/相邻 package drawing。
+        result.package_drawing = hint_drawing
+    if hint_pin_count and not clean_pin_count(result.pin_count):
+        result.pin_count = hint_pin_count
+    return result
+
+
+def single_package_fallback_entry_score(
+    entry: PackageCatalogEntry,
+    *,
+    source_hint: tuple[str, str],
+    entry_index: int,
+) -> int:
+    """给单封装保底候选打分；文件名 hint 优先于普通物理元数据。"""
+
+    hint_drawing, hint_pin_count = source_hint
+    score = 0
+    candidate_names = [
+        entry.public_label,
+        entry.package_drawing,
+        *entry.identity_aliases,
+        entry.package_type,
+        entry.identity_name,
+    ]
+    if hint_drawing:
+        hint_key = normalize_compact(hint_drawing)
+        if any(normalize_compact(name) == hint_key for name in candidate_names):
+            score += 10000
+        elif any(
+            package_name_in_text(hint_drawing, normalize_text(name))
+            for name in candidate_names
+        ):
+            score += 5000
+    if hint_pin_count:
+        if clean_pin_count(entry.pin_count) == hint_pin_count:
+            score += 3000
+        elif metadata_contains_pin_count(entry.package_type, hint_pin_count):
+            score += 1500
+
+    if clean_public_symbol_name(entry.public_label):
+        score += 700
+    if clean_metadata(entry.package_drawing):
+        score += 600
+    if clean_pin_count(entry.pin_count):
+        score += 400
+    if clean_public_package_name(entry.package_type):
+        score += 200
+    if re.search(
+        r"\b(?:reference|evaluation|demo|board|carrier)\b",
+        normalize_text(entry.package_type),
+    ):
+        score -= 5000
+    # 稳定打破平局：保持原目录顺序。
+    score -= entry_index
+    return score
+
+
+def package_hint_from_source_name(source_name: str) -> tuple[str, str]:
+    """从单封装文件名中提取目标 drawing/pin_count，例如 ``ZWT_361``。"""
+
+    name = re.split(r"[\\/]", str(source_name or ""))[-1]
+    name = re.sub(r"\.[A-Za-z0-9]+$", "", name)
+    match = re.search(
+        r"[-_](?P<drawing>[A-Za-z][A-Za-z0-9]{1,14})_(?P<pin_count>\d{2,4})(?:\D*$|$)",
+        name,
+    )
+    if not match:
+        return "", ""
+    drawing = clean_public_symbol_name(match.group("drawing"))
+    pin_count = clean_pin_count(match.group("pin_count"))
+    return drawing, pin_count
+
+
+def metadata_contains_pin_count(value: str, pin_count: str) -> bool:
+    """判断物理描述里是否独立出现目标 pin_count。"""
+
+    pin_count = clean_pin_count(pin_count)
+    if not pin_count:
+        return False
+    return bool(
+        re.search(
+            rf"(?<!\d){re.escape(pin_count)}(?!\d)",
+            str(value or ""),
+        )
+    )
+
+
+def single_package_all_unresolved_fallback_diagnostic(
+    *,
+    before_entries: Sequence[PackageCatalogEntry],
+    selected_entry: PackageCatalogEntry,
+    source_name: str,
+    target_tables: Sequence[PackageTargetTable],
+    initial_binding_diagnostics: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """记录单封装兜底触发原因和收敛结果。"""
+
+    hint_drawing, hint_pin_count = package_hint_from_source_name(source_name)
+    return {
+        "stage": "single_package_all_unresolved_fallback",
+        "status": "applied",
+        "reason": "all_package_bindings_unresolved",
+        "before": len(before_entries),
+        "after": 1,
+        "source_name": source_name,
+        "source_hint": {
+            "package_drawing": hint_drawing,
+            "pin_count": hint_pin_count,
+        },
+        "target_table_ids": [table.table_id for table in target_tables],
+        "initial_unresolved_tables": [
+            diagnostic.get("table_id")
+            for diagnostic in initial_binding_diagnostics
+            if diagnostic.get("stage") == "package_binding"
+        ],
+        "document_packages_before": [
+            assignment_from_entry(entry, before_entries, reason="diagnostic").pkg
+            for entry in before_entries
+        ],
+        "selected_package": assignment_from_entry(
+            selected_entry,
+            [selected_entry],
+            reason="diagnostic",
+        ).pkg,
+        "selected_entry": {
+            "package_type": selected_entry.package_type,
+            "package_drawing": selected_entry.package_drawing,
+            "pin_count": selected_entry.pin_count,
+            "public_label": selected_entry.public_label,
+        },
+    }
 
 
 def resolve_table_symbol_package_links(

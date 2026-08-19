@@ -1031,8 +1031,8 @@ def test_single_package_without_local_evidence_binds_the_only_slot():
     assert assignment.reason == "single_document_package"
 
 
-def test_multi_package_without_unique_evidence_stays_unresolved():
-    """多封装文档的无归属表不能再默认塞入第一个 pkg。"""
+def test_all_unresolved_catalog_slots_fall_back_to_single_package():
+    """多个目录槽位全都无法绑定时，按单封装兜底避免 0 输出。"""
 
     summary = catalog_table(
         0,
@@ -1057,15 +1057,64 @@ def test_multi_package_without_unique_evidence_stays_unresolved():
         classifier=identity_catalog_classifier,
     )
 
-    assert result.assignment_for(1, 0) is None
+    assert len(result.entries) == 1
+    assert result.assignment_for(1, 0).pkg == "QFN 32"
+    assert result.assignment_for(1, 0).reason == "single_document_package"
     diagnostic = next(
         item
         for item in result.diagnostics
-        if item.get("stage") == "package_binding" and item.get("table_id") == 1
+        if item.get("stage") == "single_package_all_unresolved_fallback"
     )
-    assert diagnostic["status"] == "unresolved"
-    assert diagnostic["reason"] == "package_unresolved"
-    assert diagnostic["document_packages"] == ["QFN 32", "BGA 64"]
+    assert diagnostic["before"] == 2
+    assert diagnostic["after"] == 1
+    assert diagnostic["document_packages_before"] == ["QFN 32", "BGA 64"]
+
+
+def test_all_unresolved_single_package_fallback_prefers_source_name_hint():
+    """单封装文件名中的 ZWT_361 可以从 ZCE/ZWT 目录中选择目标槽位。"""
+
+    summary = catalog_table(
+        0,
+        "Packaging Information",
+        ["DEVICE", "PACKAGE", "DRAWING", "PINS"],
+        [
+            ["DEVICE", "PACKAGE", "DRAWING", "PINS"],
+            ["AM1802EZCED3", "NFBGA", "ZCE", "361"],
+            ["AM1802EZWTD3", "NFBGA", "ZWT", "361"],
+        ],
+    )
+    target = target_table(
+        1,
+        "Table 3-3. Reset and JTAG Terminal Functions",
+        ["TERMINAL NAME", "NO.", "TYPE"],
+    )
+
+    def classifier(table, source_name, target_tables):
+        return {
+            "is_package_summary": True,
+            "table_role": "packaging_metadata",
+            "header_row_index": 0,
+            "columns": [
+                {"column_index": 0, "role": "orderable_sku"},
+                {"column_index": 1, "role": "package_type"},
+                {"column_index": 2, "role": "package_drawing"},
+                {"column_index": 3, "role": "pin_count"},
+            ],
+        }
+
+    result = resolve_document_package_catalog(
+        all_tables=[summary],
+        target_tables=[target],
+        multi_package_plans={1: MultiPackagePlan(False, "single_package")},
+        source_name="am1802-ZWT_361",
+        use_semantic_classifier=True,
+        classifier=classifier,
+    )
+
+    assert len(result.entries) == 1
+    assert result.entries[0].package_drawing == "ZWT"
+    assert result.entries[0].public_label == "ZWT"
+    assert result.assignment_for(1, 0).pkg == "ZWT"
 
 
 def test_multi_package_ambiguous_evidence_stays_unresolved():
@@ -1150,8 +1199,8 @@ def test_group_context_and_same_chapter_continuation_bind_existing_slots():
     assert result.assignment_for(2, 0).reason == "same_chapter_continuation"
 
 
-def test_full_pipeline_skips_unresolved_table_before_row_extraction():
-    """模型接受表格后，pkg 未唯一绑定时仍必须整表跳过。"""
+def test_full_pipeline_falls_back_when_all_catalog_slots_are_unresolved():
+    """模型接受表格后，全部 package_unresolved 时按单封装继续抽取。"""
 
     summary = TableCandidate(
         html=(
@@ -1198,9 +1247,28 @@ def test_full_pipeline_skips_unresolved_table_before_row_extraction():
             include_debug=True,
         )
 
-    assert all(not package["group_list"] for package in result)
+    assert result[0]["pkg"] == "QFN 32"
+    assert result[0]["group_list"][0]["pin_list"] == [
+        {
+            "pin_no": "1",
+            "pin_name": "VDD",
+            "type": "P",
+            "source": "generic-document",
+            "source_page": 2,
+        }
+    ]
     debug = pin_extractor.get_last_extraction_debug()
-    skipped = next(item for item in debug if item.get("table_id") == 1)
-    assert skipped["status"] == "skipped"
-    assert skipped["skip_reason"] == "package_unresolved"
-    assert skipped["package_binding"]["unresolved_local_slots"] == [0]
+    extracted = next(item for item in debug if item.get("table_id") == 1)
+    assert extracted["status"] == "extracted"
+    assert extracted["package_assignments"] == [
+        {"local_slot": 0, "pkg": "QFN 32", "reason": "single_document_package"}
+    ]
+    catalog = next(item for item in debug if item.get("table_id") == 0)[
+        "package_catalog"
+    ]
+    fallback = next(
+        item
+        for item in catalog["diagnostics"]
+        if item.get("stage") == "single_package_all_unresolved_fallback"
+    )
+    assert fallback["status"] == "applied"
