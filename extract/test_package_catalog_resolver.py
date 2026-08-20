@@ -1070,6 +1070,41 @@ def test_all_unresolved_catalog_slots_fall_back_to_single_package():
     assert diagnostic["document_packages_before"] == ["QFN 32", "BGA 64"]
 
 
+def test_multi_count_source_name_blocks_all_unresolved_single_package_fallback():
+    """文件名有多个 pin_count 时，不能把全 unresolved 多目标任务压成单封装。"""
+
+    summary = catalog_table(
+        0,
+        "Device Information",
+        ["DEVICE", "PACKAGE"],
+        [
+            ["DEVICE", "PACKAGE"],
+            ["DEV-A", "QFN 36"],
+            ["DEV-B", "BGA 36"],
+        ],
+    )
+    target = target_table(
+        1,
+        "Pin Functions",
+        ["PIN NO", "PIN NAME", "TYPE"],
+    )
+    result = resolve_document_package_catalog(
+        all_tables=[summary],
+        target_tables=[target],
+        multi_package_plans={1: MultiPackagePlan(False, "single_package")},
+        source_name="CC1110Fx CC1111Fx_36_36",
+        use_semantic_classifier=True,
+        classifier=identity_catalog_classifier,
+    )
+
+    assert len(result.entries) == 2
+    assert result.assignment_for(1, 0) is None
+    assert not any(
+        item.get("stage") == "single_package_all_unresolved_fallback"
+        for item in result.diagnostics
+    )
+
+
 def test_all_unresolved_single_package_fallback_prefers_source_name_hint():
     """单封装文件名中的 ZWT_361 可以从 ZCE/ZWT 目录中选择目标槽位。"""
 

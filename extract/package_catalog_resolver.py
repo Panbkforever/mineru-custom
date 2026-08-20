@@ -26,9 +26,9 @@
    description 和数据行不能参与绑定。
 7. 槽位冻结后，任何未匹配表都不能创建新 pkg。单封装文档可以绑定唯一
    槽位；多封装文档中无法唯一归属的表必须标记为 unresolved，禁止默认
-   塞入第一个槽位。若多个目录槽位全部无法绑定且没有真实多封装分支证据，
-   按单封装误膨胀兜底收敛为一个槽位。真实名称缺失时仅对已经确认的槽位
-   使用 a、b、c……。
+   塞入第一个槽位。若多个目录槽位全部无法绑定、没有真实多封装分支证据，
+   且文件名不是多个 pin_count 目标，才按单封装误膨胀兜底收敛为一个槽位。
+   真实名称缺失时仅对已经确认的槽位使用 a、b、c……。
 8. 多封装表的全部本地分支必须一次性执行一对一绑定；禁止每个分支独立
    兜底后落入同一个 package_key。标签脚注、drawing 和 pin_count 只用于
    内部消歧，不改变任何引脚行内容。
@@ -300,6 +300,7 @@ def resolve_document_package_catalog(
     )
     diagnostics.extend(binding_diagnostics)
     if should_apply_all_unresolved_single_package_fallback(
+        source_name=source_name,
         entries=entries,
         target_tables=target_tables,
         multi_package_plans=multi_package_plans,
@@ -1784,6 +1785,7 @@ def freeze_package_slots(entries: Sequence[PackageCatalogEntry]) -> None:
 
 def should_apply_all_unresolved_single_package_fallback(
     *,
+    source_name: str,
     entries: Sequence[PackageCatalogEntry],
     target_tables: Sequence[PackageTargetTable],
     multi_package_plans: Mapping[int, MultiPackagePlanLike],
@@ -1797,6 +1799,8 @@ def should_apply_all_unresolved_single_package_fallback(
     """
 
     if len(entries) <= 1 or not target_tables or assignments:
+        return False
+    if source_name_has_multiple_trailing_pin_counts(source_name):
         return False
     if any(
         plan_creates_package_slots(multi_package_plans.get(table.table_id))
@@ -1816,6 +1820,23 @@ def should_apply_all_unresolved_single_package_fallback(
         and diagnostic.get("reason") == "package_unresolved"
         for diagnostic in package_binding_diagnostics
     )
+
+
+def source_name_has_multiple_trailing_pin_counts(source_name: str) -> bool:
+    """文件名末尾含多个 ``_pin_count`` 段时，视为多目标任务。
+
+    例如 ``CC430F514x_64_48``、``CC1310_32_32_48`` 和
+    ``CC1110Fx_36_36`` 都不能触发单封装兜底；``am1802-ZWT_361``
+    仍是单一目标。
+    """
+
+    name = re.split(r"[\\/]", str(source_name or ""))[-1]
+    name = re.sub(r"\.[A-Za-z0-9]+$", "", name)
+    match = re.search(r"(?P<count_suffix>(?:_\d{2,4}){2,})(?:\D*$|$)", name)
+    if not match:
+        return False
+    counts = re.findall(r"\d{2,4}", match.group("count_suffix"))
+    return len(counts) >= 2
 
 
 def select_single_package_fallback_entry(
