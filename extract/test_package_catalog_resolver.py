@@ -11,6 +11,7 @@ from extract.package_catalog_resolver import (
     clean_package_name,
     find_package_catalog_candidates,
     freeze_package_slots,
+    match_entries_in_text,
     merge_plan_package_labels,
     resolve_document_package_catalog,
 )
@@ -1328,6 +1329,98 @@ def test_multi_package_ambiguous_evidence_stays_unresolved():
     )
     assert diagnostic["reason"] == "ambiguous_package_evidence"
     assert diagnostic["matched_packages"] == ["BGA 64", "BGA 100"]
+
+
+def test_package_context_pin_count_filters_generic_package_matches():
+    """VQFN (20) 这类图题上下文应使用 pin_count 消除 VQFN 泛化歧义。"""
+
+    entries = [
+        PackageCatalogEntry(
+            package_key="slot:0",
+            identity_name="DRV8242-Q1",
+            package_type="VQFN",
+            pin_count="20",
+        ),
+        PackageCatalogEntry(
+            package_key="slot:1",
+            identity_name="DRV8243-Q1",
+            package_type="VQFN",
+            pin_count="14",
+        ),
+        PackageCatalogEntry(
+            package_key="slot:2",
+            identity_name="DRV8244-Q1",
+            package_type="VQFN",
+            pin_count="16",
+        ),
+    ]
+
+    matches = match_entries_in_text(
+        entries,
+        "Figure 6-1. DRV8242H-Q1 HW variant in VQFN (20) package",
+    )
+
+    assert [entry.package_key for entry in matches] == ["slot:0"]
+
+
+def test_package_context_parenthesized_suffix_pin_count_filters_matches():
+    """VQFN-HR (14) 和 HVSSOP (28) 也应被识别成明确封装 pin_count。"""
+
+    entries = [
+        PackageCatalogEntry(
+            package_key="slot:0",
+            identity_name="DRV8143-Q1",
+            package_type="VQFN",
+            pin_count="14",
+        ),
+        PackageCatalogEntry(
+            package_key="slot:1",
+            identity_name="DRV8144-Q1",
+            package_type="VQFN",
+            pin_count="16",
+        ),
+        PackageCatalogEntry(
+            package_key="slot:2",
+            identity_name="DRV8143P-Q1",
+            package_type="HVSSOP",
+            pin_count="28",
+        ),
+    ]
+
+    vqfn_matches = match_entries_in_text(
+        entries,
+        "图 6-1. 采用 VQFN-HR (14) 封装的 DRV8143H-Q1 HW 型号",
+    )
+    hvssop_matches = match_entries_in_text(
+        entries,
+        "图 6-2. 采用 HVSSOP (28)封装的 DRV8143P-Q1 SPI (P)型号",
+    )
+
+    assert [entry.package_key for entry in vqfn_matches] == ["slot:0"]
+    assert [entry.package_key for entry in hvssop_matches] == ["slot:2"]
+
+
+def test_generic_package_without_pin_count_stays_ambiguous():
+    """没有明确 pin_count 时，原有 VQFN 泛化匹配仍保持歧义。"""
+
+    entries = [
+        PackageCatalogEntry(
+            package_key="slot:0",
+            identity_name="DEV-A",
+            package_type="VQFN",
+            pin_count="20",
+        ),
+        PackageCatalogEntry(
+            package_key="slot:1",
+            identity_name="DEV-B",
+            package_type="VQFN",
+            pin_count="14",
+        ),
+    ]
+
+    matches = match_entries_in_text(entries, "Figure 1. VQFN package")
+
+    assert [entry.package_key for entry in matches] == ["slot:0", "slot:1"]
 
 
 def test_group_context_and_same_chapter_continuation_bind_existing_slots():

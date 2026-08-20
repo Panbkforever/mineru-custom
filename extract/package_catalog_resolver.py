@@ -2967,6 +2967,7 @@ def match_entries_in_text(
     """按完整名称边界匹配目录，不执行编辑距离或前缀猜测。"""
 
     normalized_text = normalize_text(text)
+    text_pin_counts = explicit_package_pin_counts_from_text(text)
     matches = []
     for entry in entries:
         # 器件型号只用于内部关联；封装类型和 Drawing 也可参与绑定。若同一
@@ -2983,8 +2984,53 @@ def match_entries_in_text(
         if entry.package_drawing:
             names.append(entry.package_drawing)
         if any(package_name_in_text(name, normalized_text) for name in names):
+            entry_pin_counts = explicit_package_pin_counts_from_entry(entry)
+            if text_pin_counts and text_pin_counts.isdisjoint(entry_pin_counts):
+                continue
             matches.append(entry)
     return matches
+
+
+def explicit_package_pin_counts_from_entry(entry: PackageCatalogEntry) -> set[str]:
+    """收集目录项物理元数据中明确写出的 pin_count。"""
+
+    result: set[str] = set()
+    pin_count = clean_pin_count(entry.pin_count)
+    if pin_count:
+        result.add(pin_count)
+    for value in (
+        entry.public_label,
+        entry.package_type,
+        entry.package_drawing,
+    ):
+        result.update(explicit_package_pin_counts_from_text(value))
+    return result
+
+
+def explicit_package_pin_counts_from_text(value: str) -> set[str]:
+    """从封装上下文中提取明确跟封装名绑定的 pin_count。"""
+
+    text = str(value or "")
+    result: set[str] = set()
+    package_pattern = PACKAGE_FAMILY_PATTERN
+    patterns = [
+        # VQFN (20), VQFN-HR (14), HVSSOP (28)
+        rf"(?<![A-Za-z0-9]){package_pattern}(?:[- ][A-Za-z0-9]+)?\s*[\(（]\s*(\d{{1,4}})\s*[\)）]",
+        # 20-Pin VQFN, 20 pin VQFN
+        rf"(?<![A-Za-z0-9])(\d{{1,4}})\s*[- ]?\s*pin(?:s)?\s+{package_pattern}(?![A-Za-z0-9])",
+        # VQFN 20-pin, VQFN 20 pin
+        rf"(?<![A-Za-z0-9]){package_pattern}(?:[- ][A-Za-z0-9]+)?\s+(\d{{1,4}})\s*[- ]?\s*pin(?:s)?(?![A-Za-z0-9])",
+        # QFN 32 Pin Functions, BGA 64 package
+        rf"(?<![A-Za-z0-9]){package_pattern}\s+(\d{{1,4}})\s+(?:pin|pins|package|pkg)(?![A-Za-z0-9])",
+        # QFN 32, BGA 64
+        rf"(?<![A-Za-z0-9]){package_pattern}\s+(\d{{1,4}})(?![A-Za-z0-9])",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            pin_count = clean_pin_count(match.group(1))
+            if pin_count:
+                result.add(pin_count)
+    return result
 
 
 def identity_name_in_text(name: str, text: str) -> bool:
