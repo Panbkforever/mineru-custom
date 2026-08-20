@@ -1424,6 +1424,7 @@ def update_entry_metadata(
         entry.pin_count = pin_count
     if evidence_table_id not in entry.evidence_table_ids:
         entry.evidence_table_ids.append(evidence_table_id)
+    normalize_catalog_entry_metadata(entry)
 
 
 def merge_catalog_entry(
@@ -1432,11 +1433,13 @@ def merge_catalog_entry(
 ) -> None:
     """只按器件身份或明确别名合并，不按封装类型猜测。"""
 
+    normalize_catalog_entry_metadata(incoming)
     incoming_names = {
         normalize_compact(incoming.identity_name),
         *(normalize_compact(alias) for alias in incoming.identity_aliases),
     }
     for existing in entries:
+        normalize_catalog_entry_metadata(existing)
         existing_names = {
             normalize_compact(existing.identity_name),
             *(normalize_compact(alias) for alias in existing.identity_aliases),
@@ -1463,6 +1466,12 @@ def merge_catalog_entry(
             existing.pin_count = incoming.pin_count
         if not existing.public_label:
             existing.public_label = incoming.public_label
+        normalize_catalog_entry_metadata(existing)
+        return
+    physical_alias_target = find_physical_alias_target(entries, incoming)
+    if physical_alias_target is not None:
+        merge_redundant_catalog_evidence(physical_alias_target, incoming)
+        normalize_catalog_entry_metadata(physical_alias_target)
         return
     entries.append(incoming)
 
@@ -1476,8 +1485,10 @@ def merge_physical_metadata_entry(
     package_type 相同但 drawing 或 pin_count 不同，仍保留为不同槽位。
     """
 
+    normalize_catalog_entry_metadata(incoming)
     incoming_key = physical_metadata_key(incoming)
     for existing in entries:
+        normalize_catalog_entry_metadata(existing)
         if physical_metadata_key(existing) != incoming_key:
             continue
         for table_id in incoming.evidence_table_ids:
@@ -1492,11 +1503,122 @@ def merge_physical_metadata_entry(
 def physical_metadata_key(entry: PackageCatalogEntry) -> tuple[str, str, str]:
     """生成包装表槽位去重键，避免仅凭一个 QFN 字符串错误归并。"""
 
+    normalize_catalog_entry_metadata(entry)
     return (
         normalize_compact(entry.package_type),
         normalize_compact(entry.package_drawing),
         clean_pin_count(entry.pin_count),
     )
+
+
+def normalize_catalog_entry_metadata(entry: PackageCatalogEntry) -> None:
+    """把 ``64 RGC`` 这类组合 drawing 字段拆成 drawing/pin_count。"""
+
+    drawing, pin_count = split_combined_pin_count_and_drawing(
+        entry.package_drawing
+    )
+    if not drawing or not pin_count:
+        return
+    existing_pin_count = clean_pin_count(entry.pin_count)
+    if existing_pin_count and existing_pin_count != pin_count:
+        return
+    entry.package_drawing = drawing
+    if not existing_pin_count:
+        entry.pin_count = pin_count
+
+
+def split_combined_pin_count_and_drawing(value: str) -> tuple[str, str]:
+    """识别 ``64 RGC`` / ``RGC 64`` 这种混合封装列值。"""
+
+    text = clean_metadata(value)
+    if not text:
+        return "", ""
+    leading = re.fullmatch(
+        r"(?P<count>\d{2,4})\s*[-/ ]\s*(?P<drawing>[A-Za-z][A-Za-z0-9]{1,14})",
+        text,
+    )
+    if leading:
+        return clean_metadata(leading.group("drawing")), leading.group("count")
+    trailing = re.fullmatch(
+        r"(?P<drawing>[A-Za-z][A-Za-z0-9]{1,14})\s*[-/ ]\s*(?P<count>\d{2,4})",
+        text,
+    )
+    if trailing:
+        return clean_metadata(trailing.group("drawing")), trailing.group("count")
+    return "", ""
+
+
+def find_physical_alias_target(
+    entries: Sequence[PackageCatalogEntry],
+    incoming: PackageCatalogEntry,
+) -> PackageCatalogEntry | None:
+    """把同 drawing/pin_count 的弱 identity 合入已有强槽。
+
+    该规则只在 drawing 和 pin_count 都明确时启用；只有 VQFN/16 这类
+    缺少 drawing 的泛化物理信息仍保持独立，避免误合并不同 pinout。
+    """
+
+    incoming_signature = canonical_physical_metadata(incoming)
+    incoming_type, incoming_drawing, incoming_pin_count = incoming_signature
+    if not incoming_drawing or not incoming_pin_count:
+        return None
+
+    candidates: list[PackageCatalogEntry] = []
+    for existing in entries:
+        existing_type, existing_drawing, existing_pin_count = (
+            canonical_physical_metadata(existing)
+        )
+        if (
+            existing_drawing != incoming_drawing
+            or existing_pin_count != incoming_pin_count
+        ):
+            continue
+        if (
+            incoming_type
+            and existing_type
+            and incoming_type != existing_type
+        ):
+            continue
+        if not catalog_identities_share_family(existing, incoming):
+            continue
+        candidates.append(existing)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def catalog_identities_share_family(
+    left: PackageCatalogEntry,
+    right: PackageCatalogEntry,
+) -> bool:
+    """判断两个目录项的身份是否像同一器件家族的不同订购/成员型号。"""
+
+    left_values = [
+        normalize_compact(value)
+        for value in [left.identity_name, *left.identity_aliases]
+        if normalize_compact(value)
+    ]
+    right_values = [
+        normalize_compact(value)
+        for value in [right.identity_name, *right.identity_aliases]
+        if normalize_compact(value)
+    ]
+    if not left_values or not right_values:
+        return True
+    return any(
+        common_identity_prefix_length(left_value, right_value) >= 5
+        for left_value in left_values
+        for right_value in right_values
+    )
+
+
+def common_identity_prefix_length(left: str, right: str) -> int:
+    """返回两个规范化型号的公共前缀长度。"""
+
+    count = 0
+    for left_char, right_char in zip(left, right):
+        if left_char != right_char:
+            break
+        count += 1
+    return count
 
 
 def deduplicate_redundant_catalog_entries(
