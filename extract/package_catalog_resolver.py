@@ -280,12 +280,22 @@ def resolve_document_package_catalog(
         diagnostics=diagnostics,
     )
     if not entries and target_tables:
-        entries = [
-            PackageCatalogEntry(
-                package_key="",
-                evidence_table_ids=[target_tables[0].table_id],
+        if source_name_has_multiple_trailing_pin_counts(source_name):
+            diagnostics.append(
+                {
+                    "stage": "package_catalog_anonymous_slot_guard",
+                    "status": "blocked",
+                    "reason": "multi_count_source_without_catalog",
+                    "source_name": source_name,
+                }
             )
-        ]
+        else:
+            entries = [
+                PackageCatalogEntry(
+                    package_key="",
+                    evidence_table_ids=[target_tables[0].table_id],
+                )
+            ]
 
     # 到这里封装数量已经确定。后续绑定只能选择这些 slot，不能增删。
     freeze_package_slots(entries)
@@ -605,6 +615,12 @@ def classify_package_catalog_candidates(
         diagnostics,
         target_tables=target_tables,
     )
+    if not entries:
+        entries = infer_standard_catalog_entries_from_tables(
+            tables,
+            diagnostics=diagnostics,
+            target_tables=target_tables,
+        )
     return entries, diagnostics
 
 
@@ -679,7 +695,7 @@ def package_catalog_decision_from_response(
     ) or (
         table_role == "packaging_metadata" and "orderable_sku" in roles
     )
-    return PackageCatalogDecision(
+    decision = PackageCatalogDecision(
         is_package_summary=(
             bool(response.get("is_package_summary")) and structurally_valid
         ),
@@ -687,6 +703,272 @@ def package_catalog_decision_from_response(
         header_row_index=header_row_index,
         columns=tuple(columns),
     )
+    if decision.is_package_summary:
+        decision = repair_catalog_header_row_index(table, decision)
+    return decision
+
+
+def repair_catalog_header_row_index(
+    table: PackageCatalogTable,
+    decision: PackageCatalogDecision,
+) -> PackageCatalogDecision:
+    """纠正模型把第一条数据行误判为 catalog 表头的情况。"""
+
+    if not table.rows or not decision.columns:
+        return decision
+    best_index = best_catalog_header_row_index(table)
+    if best_index == decision.header_row_index:
+        return decision
+    current_score = catalog_header_row_score(table.rows[decision.header_row_index])
+    best_score = catalog_header_row_score(table.rows[best_index])
+    if best_score < 3 or best_score <= current_score:
+        return decision
+    return PackageCatalogDecision(
+        is_package_summary=decision.is_package_summary,
+        table_role=decision.table_role,
+        header_row_index=best_index,
+        columns=with_catalog_column_headers(table, decision.columns, best_index),
+    )
+
+
+def with_catalog_column_headers(
+    table: PackageCatalogTable,
+    columns: Sequence[PackageColumnRole],
+    header_row_index: int,
+) -> tuple[PackageColumnRole, ...]:
+    """按修正后的表头行重建列角色对象中的 header 文本。"""
+
+    header_row = table.rows[header_row_index] if table.rows else ()
+    return tuple(
+        PackageColumnRole(
+            column_index=column.column_index,
+            role=column.role,
+            header=(
+                str(header_row[column.column_index])
+                if column.column_index < len(header_row)
+                else table.headers[column.column_index]
+                if column.column_index < len(table.headers)
+                else f"column_{column.column_index + 1}"
+            ),
+        )
+        for column in columns
+    )
+
+
+def best_catalog_header_row_index(table: PackageCatalogTable) -> int:
+    """从表格前几行确定最像封装/器件 catalog 表头的行。"""
+
+    candidates = list(enumerate(table.rows[: min(5, len(table.rows))]))
+    if not candidates:
+        return 0
+    return max(
+        candidates,
+        key=lambda item: (catalog_header_row_score(item[1]), -item[0]),
+    )[0]
+
+
+def catalog_header_row_score(row: Sequence[str]) -> int:
+    """给一行 catalog 表头打分；数据行通常得分为 0。"""
+
+    roles: set[str] = set()
+    for cell in row:
+        roles.update(catalog_header_roles_for_cell(cell))
+    if not roles:
+        return 0
+    score = len(roles)
+    if {"package_identity", "orderable_sku"} & roles:
+        score += 1
+    if {"package_type", "package_drawing"} & roles:
+        score += 1
+    if "pin_count" in roles:
+        score += 1
+    return score
+
+
+def catalog_header_roles_for_cell(value: str) -> set[str]:
+    """识别标准 TI catalog 表头单元格可能对应的结构角色。"""
+
+    normalized = normalize_text(value)
+    compact = normalize_compact(value)
+    roles: set[str] = set()
+    if not normalized:
+        return roles
+    if (
+        "orderable device" in normalized
+        or "orderable part" in normalized
+        or "ordering code" in normalized
+        or normalized in {"sku", "orderable"}
+    ):
+        roles.add("orderable_sku")
+    if (
+        normalized in {"device", "part number", "part no", "part"}
+        or "器件型号" in normalized
+        or "device number" in normalized
+    ):
+        roles.add("package_identity")
+    if (
+        "package drawing" in normalized
+        or "drawing" == normalized
+        or "package name" in normalized
+        or "封装代号" in normalized
+    ):
+        roles.add("package_drawing")
+    if (
+        "package type" in normalized
+        or normalized in {"package", "packages"}
+        or compact == "封装"
+    ):
+        roles.add("package_type")
+    if (
+        normalized in {"pins", "pin count", "pin counts", "terminals"}
+        or normalized.startswith("pins ")
+        or "引脚数" in normalized
+    ):
+        roles.add("pin_count")
+    return roles
+
+
+def infer_standard_catalog_entries_from_tables(
+    tables: Sequence[PackageCatalogTable],
+    *,
+    diagnostics: list[dict[str, Any]],
+    target_tables: Sequence[PackageTargetTable],
+) -> list[PackageCatalogEntry]:
+    """模型未建立 catalog 时，用 TI 标准表头确定性兜底。"""
+
+    priority_tables = [
+        table for table in tables if _has_priority_catalog_title(table.title)
+    ]
+    for selected_tables, scope in (
+        (priority_tables, "priority_title"),
+        (list(tables), "all_candidates"),
+    ):
+        decisions = standard_catalog_decisions_from_tables(selected_tables)
+        if not decisions:
+            continue
+        local_diagnostics: list[dict[str, Any]] = []
+        entries = build_catalog_entries_from_decisions(
+            decisions,
+            local_diagnostics,
+            target_tables=target_tables,
+        )
+        if not entries:
+            continue
+        diagnostics.append(
+            {
+                "stage": "package_catalog_standard_fallback",
+                "status": "applied",
+                "scope": scope,
+                "table_ids": [table.table_id for _, table, _ in decisions],
+                "reason": "empty_model_catalog",
+            }
+        )
+        diagnostics.extend(local_diagnostics)
+        return entries
+    return []
+
+
+def standard_catalog_decisions_from_tables(
+    tables: Sequence[PackageCatalogTable],
+) -> list[tuple[int, PackageCatalogTable, PackageCatalogDecision]]:
+    """从强标准表头中构造等价于第二次模型返回的结构判断。"""
+
+    decisions: list[tuple[int, PackageCatalogTable, PackageCatalogDecision]] = []
+    for table in tables:
+        decision = standard_catalog_decision_from_table(table)
+        if decision is None:
+            continue
+        decisions.append((table.table_id, table, decision))
+    return decisions
+
+
+def standard_catalog_decision_from_table(
+    table: PackageCatalogTable,
+) -> PackageCatalogDecision | None:
+    """识别常见 TI 器件/封装/订购信息表，不依赖模型输出。"""
+
+    if not table.rows:
+        return None
+    header_row_index = best_catalog_header_row_index(table)
+    header_row = table.rows[header_row_index]
+    column_role_hints = [
+        catalog_header_roles_for_cell(cell)
+        for cell in header_row
+    ]
+    has_orderable = any("orderable_sku" in roles for roles in column_role_hints)
+    has_identity = any("package_identity" in roles for roles in column_role_hints)
+    has_package_type = any("package_type" in roles for roles in column_role_hints)
+    has_package_drawing = any(
+        "package_drawing" in roles for roles in column_role_hints
+    )
+    has_pin_count = any("pin_count" in roles for roles in column_role_hints)
+
+    if has_orderable or (
+        has_identity and has_package_type and has_package_drawing and has_pin_count
+    ):
+        table_role = "packaging_metadata"
+    elif has_identity and has_package_type:
+        table_role = "identity_summary"
+    else:
+        return None
+
+    columns: list[PackageColumnRole] = []
+    for column_index, roles in enumerate(column_role_hints):
+        role = standard_catalog_role_for_column(
+            roles,
+            table_role=table_role,
+        )
+        if not role:
+            continue
+        columns.append(
+            PackageColumnRole(
+                column_index=column_index,
+                role=role,
+                header=str(header_row[column_index]),
+            )
+        )
+    role_names = {column.role for column in columns}
+    structurally_valid = (
+        table_role == "identity_summary"
+        and "package_identity" in role_names
+        and "package_type" in role_names
+    ) or (
+        table_role == "packaging_metadata"
+        and "orderable_sku" in role_names
+        and (
+            "package_type" in role_names
+            or "package_drawing" in role_names
+        )
+    )
+    if not structurally_valid:
+        return None
+    return PackageCatalogDecision(
+        is_package_summary=True,
+        table_role=table_role,
+        header_row_index=header_row_index,
+        columns=tuple(columns),
+    )
+
+
+def standard_catalog_role_for_column(
+    roles: set[str],
+    *,
+    table_role: str,
+) -> str:
+    """根据整表角色把泛化的 Device/Package 表头落到具体列角色。"""
+
+    if "orderable_sku" in roles:
+        return "orderable_sku"
+    if "package_identity" in roles:
+        return (
+            "orderable_sku"
+            if table_role == "packaging_metadata"
+            else "package_identity"
+        )
+    for role in ("package_drawing", "package_type", "pin_count"):
+        if role in roles:
+            return role
+    return ""
 
 
 def build_catalog_entries_from_decisions(
@@ -2689,7 +2971,11 @@ def match_entries_in_text(
     for entry in entries:
         # 器件型号只用于内部关联；封装类型和 Drawing 也可参与绑定。若同一
         # 元数据对应多个槽位，会保持歧义，不能据此合并槽位。
-        names = [entry.identity_name, *entry.identity_aliases]
+        identity_names = [entry.identity_name, *entry.identity_aliases]
+        if any(identity_name_in_text(name, text) for name in identity_names):
+            matches.append(entry)
+            continue
+        names = []
         if entry.public_label:
             names.append(entry.public_label)
         if entry.package_type:
@@ -2699,6 +2985,35 @@ def match_entries_in_text(
         if any(package_name_in_text(name, normalized_text) for name in names):
             matches.append(entry)
     return matches
+
+
+def identity_name_in_text(name: str, text: str) -> bool:
+    """匹配器件身份；额外支持 ``CC430F614x`` 这类 family wildcard。"""
+
+    normalized_text = normalize_text(text)
+    if package_name_in_text(name, normalized_text):
+        return True
+    return identity_family_wildcard_in_text(name, text)
+
+
+def identity_family_wildcard_in_text(name: str, text: str) -> bool:
+    """判断局部标题中的 ``...x`` family token 是否覆盖具体型号。"""
+
+    identity = normalize_compact(clean_identity_name(name))
+    if not identity:
+        identity = normalize_compact(name)
+    if not identity:
+        return False
+    for token in re.findall(
+        r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9-]{3,20}[xX])(?![A-Za-z0-9])",
+        str(text or ""),
+    ):
+        prefix = normalize_compact(token[:-1])
+        if len(prefix) < 4:
+            continue
+        if len(identity) > len(prefix) and identity.startswith(prefix):
+            return True
+    return False
 
 
 def package_name_in_text(name: str, normalized_text: str) -> bool:

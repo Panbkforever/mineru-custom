@@ -738,6 +738,124 @@ def test_packaging_metadata_can_establish_physical_slot_without_identity():
     assert result.declared_assignments()[0].pkg == "VSSOP"
 
 
+def test_catalog_header_repair_restores_first_data_row():
+    """模型把第一条数据行当表头时，应回退到真实标准表头。"""
+
+    packaging = catalog_table(
+        0,
+        "Packaging Information",
+        ["Device", "Package Name", "Package Type", "Pins"],
+        [
+            ["Device", "Package Name", "Package Type", "Pins"],
+            ["CC1110F16RHHR", "RHH", "VQFN", "36"],
+            ["CC1111F32RSP", "RSP", "VQFNP", "36"],
+        ],
+    )
+
+    def classifier(table, source_name, target_tables):
+        return {
+            "is_package_summary": True,
+            "table_role": "packaging_metadata",
+            # 模拟 DeepSeek 把第一条数据行误报为 header。
+            "header_row_index": 1,
+            "columns": [
+                {"column_index": 0, "role": "orderable_sku"},
+                {"column_index": 1, "role": "package_drawing"},
+                {"column_index": 2, "role": "package_type"},
+                {"column_index": 3, "role": "pin_count"},
+            ],
+        }
+
+    result = resolve_document_package_catalog(
+        all_tables=[packaging],
+        target_tables=[],
+        multi_package_plans={},
+        use_semantic_classifier=True,
+        classifier=classifier,
+    )
+
+    assert [
+        (entry.package_type, entry.package_drawing, entry.pin_count)
+        for entry in result.entries
+    ] == [
+        ("VQFN", "RHH", "36"),
+        ("VQFNP", "RSP", "36"),
+    ]
+    accepted = next(
+        item
+        for item in result.diagnostics
+        if item.get("stage") == "package_catalog"
+        and item.get("status") == "structure_accepted"
+    )
+    assert accepted["header_row_index"] == 0
+
+
+def test_standard_catalog_fallback_and_family_wildcard_bind_cc430_tables():
+    """模型无返回时，标准 TI 表兜底；标题 CC430F614x 可绑定具体型号槽位。"""
+
+    device_info = catalog_table(
+        0,
+        "器件信息",
+        ["器件型号", "封装", "封装尺寸"],
+        [
+            ["器件型号", "封装", "封装尺寸"],
+            ["CC430F6147IRGC", "VQFN (64)", "9mm x 9mm"],
+            ["CC430F5147IRGZ", "VQFN (48)", "7mm x 7mm"],
+        ],
+    )
+    packaging = catalog_table(
+        10,
+        "PACKAGING INFORMATION",
+        ["Orderable Device", "Status", "Package Type", "Package Drawing", "Pins"],
+        [
+            ["Orderable Device", "Status", "Package Type", "Package Drawing", "Pins"],
+            ["CC430F5147IRGZR", "ACTIVE", "VQFN", "RGZ", "48"],
+            ["CC430F6147IRGCR", "ACTIVE", "VQFN", "RGC", "64"],
+        ],
+    )
+    f614 = target_table(
+        2,
+        "Table 4-1. CC430F614x Terminal Functions",
+        ["TERMINAL NAME", "TERMINAL NO.", "I/O", "DESCRIPTION"],
+    )
+    f514 = target_table(
+        4,
+        "Table 4-2. CC430F514x and CC430F512x Terminal Functions",
+        ["TERMINAL NAME", "TERMINAL NO.", "I/O", "DESCRIPTION"],
+    )
+
+    def classifier(table, source_name, target_tables):
+        raise RuntimeError("DeepSeek returned empty message content")
+
+    result = resolve_document_package_catalog(
+        all_tables=[device_info, packaging],
+        target_tables=[f614, f514],
+        multi_package_plans={
+            2: MultiPackagePlan(False, "single_package"),
+            4: MultiPackagePlan(False, "single_package"),
+        },
+        source_name="CC430F514x_CC430F614x_64_48",
+        use_semantic_classifier=True,
+        classifier=classifier,
+    )
+
+    assert [
+        (entry.identity_name, entry.package_drawing, entry.pin_count)
+        for entry in result.entries
+    ] == [
+        ("CC430F6147IRGC", "RGC", "64"),
+        ("CC430F5147IRGZ", "RGZ", "48"),
+    ]
+    assert result.assignment_for(2, 0).package_key == "slot:0"
+    assert result.assignment_for(4, 0).package_key == "slot:1"
+    assert result.assignment_for(2, 0).reason == "cross_table_package_branch"
+    assert any(
+        item.get("stage") == "package_catalog_standard_fallback"
+        and item.get("status") == "applied"
+        for item in result.diagnostics
+    )
+
+
 def test_confirmed_cross_table_drawing_becomes_public_pkg_label():
     """同一物理封装族的跨表分支应输出已确认 drawing，而不是 VQFN1/VQFN2。"""
 
@@ -1101,6 +1219,30 @@ def test_multi_count_source_name_blocks_all_unresolved_single_package_fallback()
     assert result.assignment_for(1, 0) is None
     assert not any(
         item.get("stage") == "single_package_all_unresolved_fallback"
+        for item in result.diagnostics
+    )
+
+
+def test_multi_count_source_without_catalog_does_not_create_anonymous_slot():
+    """多目标文件 catalog 全空时，不再创建会吞并全部表的匿名单槽位。"""
+
+    target = target_table(
+        1,
+        "Pin Functions",
+        ["PIN NO", "PIN NAME", "TYPE"],
+    )
+    result = resolve_document_package_catalog(
+        all_tables=[],
+        target_tables=[target],
+        multi_package_plans={1: MultiPackagePlan(False, "single_package")},
+        source_name="CC430F514x_CC430F614x_64_48",
+    )
+
+    assert result.entries == []
+    assert result.assignment_for(1, 0) is None
+    assert any(
+        item.get("stage") == "package_catalog_anonymous_slot_guard"
+        and item.get("status") == "blocked"
         for item in result.diagnostics
     )
 

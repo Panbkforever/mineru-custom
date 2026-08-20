@@ -457,7 +457,7 @@ def _matches_by_identity(
     result = []
     for index, entry in enumerate(entries):
         names = [entry.identity_name, *entry.identity_aliases]
-        if any(_token_in_text(str(name or ""), text) for name in names):
+        if any(_identity_token_in_text(str(name or ""), text) for name in names):
             result.append(index)
     return tuple(result)
 
@@ -513,13 +513,28 @@ def _group_identity_matches(
     grouped: dict[str, list[int]] = {}
     labels: dict[str, str] = {}
     for index in indexes:
-        identity = str(entries[index].identity_name or "").strip()
+        identity = _identity_display_label(entries[index])
         key = _normalize_compact(identity)
         if not key:
             continue
         grouped.setdefault(key, []).append(index)
         labels.setdefault(key, identity)
     return [(labels[key], tuple(grouped[key])) for key in grouped]
+
+
+def _identity_display_label(entry: CatalogEntryLike) -> str:
+    """优先使用真实 identity；无 identity 时使用确定性兜底收集的别名。"""
+
+    if str(entry.identity_name or "").strip():
+        return str(entry.identity_name or "").strip()
+    return next(
+        (
+            str(alias or "").strip()
+            for alias in entry.identity_aliases
+            if str(alias or "").strip()
+        ),
+        "",
+    )
 
 
 def _catalog_matches_are_one_physical_branch(
@@ -603,6 +618,28 @@ def _token_in_text(token: str, text: str) -> bool:
             flags=re.IGNORECASE,
         )
     )
+
+
+def _identity_token_in_text(token: str, text: str) -> bool:
+    """器件身份匹配；支持标题里的 ``CC430F614x`` family 写法。"""
+
+    if _token_in_text(token, text):
+        return True
+    identity = _normalize_compact(token)
+    if not identity:
+        return False
+    for family_token in re.findall(
+        r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9-]{3,20}[xX])(?![A-Za-z0-9])",
+        str(text or ""),
+    ):
+        prefix = _normalize_compact(family_token[:-1])
+        if (
+            len(prefix) >= 4
+            and len(identity) > len(prefix)
+            and identity.startswith(prefix)
+        ):
+            return True
+    return False
 
 
 def _plan_creates_package_slots(plan: MultiPackagePlanLike | None) -> bool:
