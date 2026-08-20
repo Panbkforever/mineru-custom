@@ -1528,6 +1528,7 @@ def split_pin_numbers(value: str) -> list[str]:
     """拆分 pin_no 的显式列表、连字符范围和方括号范围。
 
     例如 ``A1-A5`` 会展开为 A1、A2、A3、A4、A5；
+    ``1-5`` 会展开为 1、2、3、4、5；
     ``L[7:12]`` 会展开为 L7、L8、L9、L10、L11、L12；
     ``A1-C3`` 前后字母前缀不同，不满足范围规则，会保留原值。
     """
@@ -1542,7 +1543,7 @@ def split_pin_numbers(value: str) -> list[str]:
         return [value]
 
     # 先保护带空格的范围，避免普通空格分隔逻辑把
-    # A1 - A5 或 L[7 : 12] 拆成多个无意义片段。
+    # 1 - 5、A1 - A5 或 L[7 : 12] 拆成多个无意义片段。
     protected_ranges: list[str] = []
 
     def protect_range(match: re.Match[str]) -> str:
@@ -1554,7 +1555,8 @@ def split_pin_numbers(value: str) -> list[str]:
     protected_value = re.sub(
         (
             r"(?<![A-Za-z0-9_])(?:"
-            r"[A-Za-z]+\s*\d+\s*-\s*[A-Za-z]+\s*\d+"
+            r"\d+\s*-\s*\d+"
+            r"|[A-Za-z]+\s*\d+\s*-\s*[A-Za-z]+\s*\d+"
             r"|[A-Za-z]+\s*\[\s*\d+\s*:\s*\d+\s*\]"
             r")(?![A-Za-z0-9_])"
         ),
@@ -1574,12 +1576,14 @@ def split_pin_numbers(value: str) -> list[str]:
             else part
         )
         # 每个 token 只进入一种范围解析器。方括号语法优先判断，
-        # 未命中时再沿用原有的 A1-A5 连字符范围逻辑。
+        # 其次处理纯数字范围，最后沿用原有的 A1-A5 连字符范围逻辑。
         if re.fullmatch(
             r"[A-Za-z]+\s*\[\s*\d+\s*:\s*\d+\s*\]",
             original_part,
         ):
             expanded.extend(expand_bracketed_pin_range(original_part))
+        elif re.fullmatch(r"\d+\s*-\s*\d+", original_part):
+            expanded.extend(expand_numeric_pin_range(original_part))
         else:
             expanded.extend(expand_same_prefix_pin_range(original_part))
     return expanded
@@ -1610,6 +1614,32 @@ def expand_bracketed_pin_range(value: str) -> list[str]:
     return [
         f"{prefix}{str(number).zfill(width) if preserve_width else number}"
         for number in range(start, end + step, step)
+    ]
+
+
+def expand_numeric_pin_range(value: str) -> list[str]:
+    """展开形如 1-5 的纯数字引脚范围，其他文本保持原样。"""
+
+    match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", value.strip())
+    if not match:
+        return [value]
+
+    start_number, end_number = match.groups()
+    start = int(start_number)
+    end = int(end_number)
+    if end < start:
+        return [value]
+
+    # 防止异常文本触发超大范围展开。
+    if end - start > 1000:
+        return [value]
+
+    # 端点带前导零时保留原宽度，例如 01-03 -> 01、02、03。
+    width = max(len(start_number), len(end_number))
+    preserve_width = start_number.startswith("0") or end_number.startswith("0")
+    return [
+        str(number).zfill(width) if preserve_width else str(number)
+        for number in range(start, end + 1)
     ]
 
 
