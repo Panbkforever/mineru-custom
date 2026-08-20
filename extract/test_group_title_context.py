@@ -181,6 +181,62 @@ def test_only_table_title_is_written_to_final_extraction_group():
     assert len(result[0]["group_list"][0]["pin_list"]) == 2
 
 
+def test_broad_pin_table_group_includes_recent_figure_title():
+    html = (
+        "<table>"
+        "<tr><td>PIN NO.</td><td>PIN NAME</td><td>TYPE</td></tr>"
+        "<tr><td>1</td><td>VDD</td><td>Power</td></tr>"
+        "</table>"
+    )
+
+    result = extract_pin_package_info_from_table_candidates(
+        [
+            TableCandidate(
+                html=html,
+                page_idx=0,
+                title="Pin Functions",
+                group_context=(
+                    "6 Pin Configuration and Functions\n"
+                    "Pin Functions\n"
+                    "Figure 6-1. DRV8242-Q1 20-Pin VQFN Package"
+                ),
+                current_chapter_titles=("6 Pin Configuration and Functions",),
+                figure_context_title="Figure 6-1. DRV8242-Q1 20-Pin VQFN Package",
+            )
+        ]
+    )
+
+    assert result[0]["group_list"][0]["group"] == (
+        "Pin Functions\nFigure 6-1. DRV8242-Q1 20-Pin VQFN Package"
+    )
+
+
+def test_specific_pin_table_group_does_not_append_figure_title():
+    html = (
+        "<table>"
+        "<tr><td>PIN NO.</td><td>PIN NAME</td><td>TYPE</td></tr>"
+        "<tr><td>1</td><td>VDD</td><td>Power</td></tr>"
+        "</table>"
+    )
+
+    result = extract_pin_package_info_from_table_candidates(
+        [
+            TableCandidate(
+                html=html,
+                page_idx=0,
+                title="Pin Functions—DRV8343H",
+                group_context=(
+                    "Pin Functions—DRV8343H\n"
+                    "Figure 6-1. DRV8343H 48-Pin HTQFP Package"
+                ),
+                figure_context_title="Figure 6-1. DRV8343H 48-Pin HTQFP Package",
+            )
+        ]
+    )
+
+    assert result[0]["group_list"][0]["group"] == "Pin Functions—DRV8343H"
+
+
 def test_unnumbered_local_title_replaces_previous_numbered_table_title():
     markdown = """
 # 5 Device Comparison
@@ -301,3 +357,43 @@ def test_middle_json_reader_uses_local_unnumbered_title_after_section_change():
     assert len(candidates) == 2
     assert candidates[1].title == "Pin Functions"
     assert "Table 5-1. Device Comparison" not in candidates[1].group_context
+
+
+def test_middle_json_reader_attaches_recent_figure_to_broad_pin_title():
+    middle_json = {
+        "pdf_info": [
+            {
+                "page_idx": 0,
+                "blocks": [
+                    {"content": "6 Pin Configuration and Functions"},
+                    {"content": "Figure 6-1. DRV8242-Q1 20-Pin VQFN Package"},
+                    {"content": "Pin Functions"},
+                    {
+                        "html": (
+                            "<table><tr><td>PIN NO.</td>"
+                            "<td>PIN NAME</td></tr></table>"
+                        )
+                    },
+                    {"content": "Figure 6-2. Unrelated Package"},
+                    {"content": "Pin Functions—DRV8242H"},
+                    {
+                        "html": (
+                            "<table><tr><td>PIN NO.</td>"
+                            "<td>PIN NAME</td></tr></table>"
+                        )
+                    },
+                ],
+            }
+        ]
+    }
+
+    candidates = iter_table_candidates(middle_json)
+
+    assert candidates[0].figure_context_title == (
+        "Figure 6-1. DRV8242-Q1 20-Pin VQFN Package"
+    )
+    assert candidates[0].group_context.endswith(
+        "Pin Functions\nFigure 6-1. DRV8242-Q1 20-Pin VQFN Package"
+    )
+    assert candidates[1].title == "Pin Functions—DRV8242H"
+    assert candidates[1].figure_context_title == ""

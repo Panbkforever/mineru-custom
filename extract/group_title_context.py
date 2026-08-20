@@ -204,6 +204,13 @@ def extract_numbered_table_title(value: str) -> str:
     return text if _NUMBERED_TABLE_TITLE_RE.match(text) else ""
 
 
+def extract_figure_title(value: str) -> str:
+    """识别 Figure/Fig./图 开头的图片标题。"""
+
+    text = clean_group_title_line(value)
+    return text if _FIGURE_TITLE_RE.match(text) else ""
+
+
 def parse_section_heading(
     value: str,
     *,

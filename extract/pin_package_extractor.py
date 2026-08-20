@@ -146,6 +146,7 @@ from extract.multi_package_extractor import (
 )
 from extract.group_title_context import (
     GroupTitleContextTracker,
+    extract_figure_title,
     extract_numbered_table_title,
     join_group_titles,
     resolve_table_title,
@@ -185,6 +186,8 @@ class TableCandidate:
     # 两组标题分别保存，封装判断只能读取当前章；上一章仍只用于 group。
     previous_chapter_titles: tuple[str, ...] = ()
     current_chapter_titles: tuple[str, ...] = ()
+    # 宽泛表题（例如 Pin Functions）可借助最近的图片标题绑定具体封装图。
+    figure_context_title: str = ""
 
 
 @dataclass
@@ -630,13 +633,20 @@ def extract_pin_package_info_from_table_candidates(
             skip(debug, "package_unresolved")
             continue
 
-        # 最终 group 只取当前表格表题。章节上下文仍保存在 TableCandidate
-        # 中供语义判断和封装绑定使用，不能在这里写入最终 JSON。
-        group_name = clean_group_name(
+        # 最终 group 默认只取当前表格表题。若表题只是 Pin Functions /
+        # 引脚功能这类宽泛标题，并且表前存在最近图片标题，则把该图题一并
+        # 写入 group，保留“这张引脚表对应哪张封装图”的关系。
+        base_group_name = (
             infer_group_name(item["table"].title)
             or table_decision.group
             or infer_group_name_from_headers(item["headers"])
             or "Pin/Package Table"
+        )
+        group_name = clean_group_name(
+            build_public_group_name(
+                base_group_name,
+                item["table"].figure_context_title,
+            )
         )
 
         extracted_count = 0
@@ -1844,6 +1854,41 @@ def clean_group_name(value: str) -> str:
     return join_group_titles(value)
 
 
+def build_public_group_name(table_title: str, figure_title: str = "") -> str:
+    """宽泛 Pin Functions 表输出 group 时附带最近封装图题。"""
+
+    if figure_title and is_broad_pin_table_title(table_title):
+        return join_group_titles(table_title, figure_title)
+    return table_title
+
+
+def is_broad_pin_table_title(value: str) -> bool:
+    """判断表题是否只是无法区分封装/器件的宽泛引脚表题。"""
+
+    text = clean_group_name(value)
+    text = re.sub(
+        r"^(?:table|表格?|表)\s*"
+        r"[\w一二三四五六七八九十百千万]+"
+        r"(?:[.\-][\w一二三四五六七八九十百千万]+)*"
+        r"\s*[.:：\-–—]?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    normalized = normalize_header(text)
+    compact = normalized.replace(" ", "")
+    return normalized in {
+        "pin function",
+        "pin functions",
+        "terminal function",
+        "terminal functions",
+    } or compact in {
+        "引脚功能",
+        "端子功能",
+        "管脚功能",
+    }
+
+
 def local_package_index_for_bound_row(
     plan: MultiPackagePlan,
     bound_row: BoundPackageRow,
@@ -2002,14 +2047,22 @@ def iter_table_candidates(middle_json: dict[str, Any]) -> list[TableCandidate]:
                     pending_texts,
                     previous_table_title,
                 )
+                figure_title = figure_context_for_table(
+                    table_title,
+                    pending_texts,
+                )
+                group_context = title_context.build_group_context(table_title)
+                if figure_title:
+                    group_context = join_group_titles(group_context, figure_title)
                 result.append(
                     TableCandidate(
                         html,
                         page_idx if isinstance(page_idx, int) else None,
                         table_title,
-                        title_context.build_group_context(table_title),
+                        group_context,
                         tuple(title_context.previous_chapter_titles),
                         tuple(title_context.current_chapter_titles),
+                        figure_title,
                     )
                 )
                 previous_table_title = table_title
@@ -2020,6 +2073,18 @@ def iter_table_candidates(middle_json: dict[str, Any]) -> list[TableCandidate]:
                 title_context.observe(text)
                 pending_texts.append(text)
     return result
+
+
+def figure_context_for_table(table_title: str, pending_texts: Sequence[str]) -> str:
+    """宽泛引脚表使用局部窗口中最近的图片标题作为额外上下文。"""
+
+    if not is_broad_pin_table_title(table_title):
+        return ""
+    for text in reversed(list(pending_texts)):
+        figure_title = extract_figure_title(text)
+        if figure_title:
+            return figure_title
+    return ""
 
 
 def iter_table_candidates_from_markdown(markdown: str) -> list[TableCandidate]:
@@ -2042,14 +2107,19 @@ def iter_table_candidates_from_markdown(markdown: str) -> list[TableCandidate]:
             # 或正文中的数字开头句子错误收进章节上下文。
             title_context.observe(text, require_markdown_heading=True)
         table_title = resolve_table_title(texts, previous_table_title)
+        figure_title = figure_context_for_table(table_title, texts)
+        group_context = title_context.build_group_context(table_title)
+        if figure_title:
+            group_context = join_group_titles(group_context, figure_title)
         result.append(
             TableCandidate(
                 match.group(0),
                 None,
                 table_title,
-                title_context.build_group_context(table_title),
+                group_context,
                 tuple(title_context.previous_chapter_titles),
                 tuple(title_context.current_chapter_titles),
+                figure_title,
             )
         )
         previous_table_title = table_title
