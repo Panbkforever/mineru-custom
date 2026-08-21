@@ -2154,7 +2154,7 @@ def add_target_figure_variant_catalog_entries(
     if variant_source is None:
         return list(entries)
 
-    variant_evidence: dict[str, dict[str, Any]] = {}
+    variant_evidence: dict[tuple[str, str, str], dict[str, Any]] = {}
     for table in target_tables:
         context = "\n".join(
             value
@@ -2169,8 +2169,14 @@ def add_target_figure_variant_catalog_entries(
         if not variant_identity:
             continue
 
+        package_type, pin_count = package_metadata_from_variant_context(context)
+        evidence_key = target_figure_variant_evidence_key(
+            identity_name=variant_identity,
+            package_type=package_type,
+            pin_count=pin_count,
+        )
         evidence = variant_evidence.setdefault(
-            normalize_compact(variant_identity),
+            evidence_key,
             {
                 "identity_name": variant_identity,
                 "table_ids": [],
@@ -2181,7 +2187,6 @@ def add_target_figure_variant_catalog_entries(
         if table.table_id not in evidence["table_ids"]:
             evidence["table_ids"].append(table.table_id)
 
-        package_type, pin_count = package_metadata_from_variant_context(context)
         if package_type and not evidence["package_type"]:
             evidence["package_type"] = package_type
         if pin_count and not evidence["pin_count"]:
@@ -2207,7 +2212,7 @@ def add_target_figure_variant_catalog_entries(
         derived_entries=derived_entries,
     )
     for incoming in derived_entries:
-        merge_catalog_entry(result, incoming)
+        merge_target_figure_variant_catalog_entry(result, incoming)
 
     if diagnostics is not None:
         diagnostics.append(
@@ -2223,6 +2228,45 @@ def add_target_figure_variant_catalog_entries(
             }
         )
     return result
+
+
+def target_figure_variant_evidence_key(
+    *,
+    identity_name: str,
+    package_type: str,
+    pin_count: str,
+) -> tuple[str, str, str]:
+    """目标图题派生槽按 identity + package + pin_count 保持独立。"""
+
+    return (
+        normalize_compact(identity_name),
+        package_label_match_key(package_type),
+        clean_pin_count(pin_count),
+    )
+
+
+def merge_target_figure_variant_catalog_entry(
+    entries: list[PackageCatalogEntry],
+    incoming: PackageCatalogEntry,
+) -> None:
+    """合并目标图题派生项，但不合并同 identity 的不同封装映射。"""
+
+    incoming_key = target_figure_variant_evidence_key(
+        identity_name=incoming.identity_name,
+        package_type=incoming.package_type,
+        pin_count=incoming.pin_count,
+    )
+    for existing in entries:
+        existing_key = target_figure_variant_evidence_key(
+            identity_name=existing.identity_name,
+            package_type=existing.package_type,
+            pin_count=existing.pin_count,
+        )
+        if existing_key != incoming_key:
+            continue
+        merge_redundant_catalog_evidence(existing, incoming)
+        return
+    entries.append(incoming)
 
 
 def base_identity_from_source_name(source_name: str) -> str:
@@ -3216,7 +3260,11 @@ def match_entries_in_text(
         if any(identity_name_in_text(name, text) for name in identity_names):
             identity_matches.append(entry)
     if identity_matches:
-        return identity_matches
+        return filter_identity_matches_by_package_context(
+            identity_matches,
+            text,
+            text_pin_counts=text_pin_counts,
+        )
 
     matches = []
     for entry in entries:
@@ -3233,6 +3281,42 @@ def match_entries_in_text(
                 continue
             matches.append(entry)
     return matches
+
+
+def filter_identity_matches_by_package_context(
+    matches: Sequence[PackageCatalogEntry],
+    text: str,
+    *,
+    text_pin_counts: set[str],
+) -> list[PackageCatalogEntry]:
+    """identity 命中多个槽时，用同一文本中的封装/引脚数消歧。"""
+
+    result = list(matches)
+    mentioned_package_keys = {
+        package_label_match_key(package_type)
+        for package_type, _pin_count in explicit_package_mentions_from_text(text)
+        if package_label_match_key(package_type)
+    }
+    if mentioned_package_keys:
+        package_filtered = [
+            entry
+            for entry in result
+            if package_label_match_key(entry.package_type) in mentioned_package_keys
+        ]
+        if package_filtered:
+            result = package_filtered
+
+    if text_pin_counts:
+        pin_filtered = [
+            entry
+            for entry in result
+            if not text_pin_counts.isdisjoint(
+                explicit_package_pin_counts_from_entry(entry)
+            )
+        ]
+        if pin_filtered:
+            result = pin_filtered
+    return result
 
 
 def explicit_package_pin_counts_from_entry(entry: PackageCatalogEntry) -> set[str]:

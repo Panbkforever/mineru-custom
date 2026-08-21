@@ -1533,6 +1533,59 @@ def test_target_figure_variant_supports_spaced_suffix_identity():
     ] == ["slot:0", "slot:1", "slot:2"]
 
 
+def test_target_figure_variant_keeps_same_identity_different_packages_separate():
+    """同一变体身份下不同封装/引脚数必须保持独立槽位。"""
+
+    targets = [
+        PackageTargetTable(
+            table_id=1,
+            page_idx=1,
+            title="表 6-1. 引脚功能",
+            group_context="表 6-1. 引脚功能\n图 6-1. 采用 VQFN-HR (16) 封装的 DRV8145H-Q1 HW 型号",
+            current_chapter_titles=("引脚配置和功能",),
+            headers=("引脚 编号", "引脚 名称"),
+        ),
+        PackageTargetTable(
+            table_id=2,
+            page_idx=2,
+            title="表 6-2. 引脚功能",
+            group_context="表 6-2. 引脚功能\n图 6-2. 采用 HTSSOP (28) 封装的 DRV8145S-Q1 SPI 型号",
+            current_chapter_titles=("引脚配置和功能",),
+            headers=("引脚 编号", "引脚 名称"),
+        ),
+        PackageTargetTable(
+            table_id=3,
+            page_idx=3,
+            title="表 6-3. 引脚功能",
+            group_context="表 6-3. 引脚功能\n图 6-3. 采用 VQFN-HR(16) 封装的 DRV8145S-Q1 SPI 型号",
+            current_chapter_titles=("引脚配置和功能",),
+            headers=("引脚 编号", "引脚 名称"),
+        ),
+    ]
+
+    result = resolve_document_package_catalog(
+        all_tables=[],
+        target_tables=targets,
+        multi_package_plans={
+            target.table_id: MultiPackagePlan(False, "single_package")
+            for target in targets
+        },
+        source_name="DRV8145-Q1_16_28.pdf",
+    )
+
+    assert [
+        (entry.identity_name, entry.package_type, entry.pin_count)
+        for entry in result.entries
+    ] == [
+        ("DRV8145H-Q1", "VQFN", "16"),
+        ("DRV8145S-Q1", "HTSSOP", "28"),
+        ("DRV8145S-Q1", "VQFN", "16"),
+    ]
+    assert [
+        result.assignment_for(table.table_id, 0).package_key for table in targets
+    ] == ["slot:0", "slot:1", "slot:2"]
+
+
 def test_generic_package_without_pin_count_stays_ambiguous():
     """没有明确 pin_count 时，原有 VQFN 泛化匹配仍保持歧义。"""
 
