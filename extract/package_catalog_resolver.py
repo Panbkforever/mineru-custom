@@ -63,13 +63,13 @@ from extract.multi_PkgTab_extractor import (
 
 
 PACKAGE_FAMILY_PATTERN = (
-    r"(?:HTSSOP|TSSOP|VSSOP|SSOP|HTQFP|TQFP|LQFP|QFP|"
+    r"(?:HTSSOP|HVSSOP|TSSOP|VSSOP|SSOP|HTQFP|TQFP|LQFP|QFP|"
     r"VQFN|WQFN|QFN|DFN|SON|X2SON|HSBGA|NFBGA|LFBGA|FBGA|PBGA|"
     r"DSBGA|BGA|FCCSP|FCBGA|WCSP|CSP|SOIC|MSOP|SOT|SC)"
 )
 
 PHYSICAL_PACKAGE_LABEL_COMPACT_RE = re.compile(
-    r"^(?:htssop|tssop|vssop|ssop|htqfp|tqfp|lqfp|qfp|"
+    r"^(?:htssop|hvssop|tssop|vssop|ssop|htqfp|tqfp|lqfp|qfp|"
     r"vqfn|wqfn|qfn|dfn|son|x2son|hsbga|nfbga|lfbga|fbga|pbga|"
     r"dsbga|bga|fccsp|fcbga|wcsp|csp|soic|msop|sot|sc)(?:\d+)?$"
 )
@@ -277,6 +277,12 @@ def resolve_document_package_catalog(
         entries,
         target_tables=target_tables,
         multi_package_plans=multi_package_plans,
+        diagnostics=diagnostics,
+    )
+    entries = add_target_figure_variant_catalog_entries(
+        entries,
+        target_tables=target_tables,
+        source_name=source_name,
         diagnostics=diagnostics,
     )
     if not entries and target_tables:
@@ -2121,6 +2127,240 @@ def source_name_has_multiple_trailing_pin_counts(source_name: str) -> bool:
     return len(counts) >= 2
 
 
+def add_target_figure_variant_catalog_entries(
+    entries: Sequence[PackageCatalogEntry],
+    *,
+    target_tables: Sequence[PackageTargetTable],
+    source_name: str,
+    diagnostics: list[dict[str, Any]] | None = None,
+) -> list[PackageCatalogEntry]:
+    """从目标引脚表局部图题/表题中补全 H/S/P 等变体槽位。
+
+    第二次模型经常只返回 ``DRV8242-Q1 / VQFN / 20`` 这样的 family 目录，
+    但目标表上方图题已经明确写着 ``DRV8242H-Q1``、``DRV8242S-Q1``。
+    在多 pin-count 文件中，局部图题是比物理封装名更强的映射证据，因此
+    冻结 slot 前把这些变体补成独立目录项；后续绑定仍走统一的 identity
+    匹配流程。
+    """
+
+    if (
+        not target_tables
+        or not source_name_has_multiple_trailing_pin_counts(source_name)
+    ):
+        return list(entries)
+
+    base_identity = base_identity_from_source_name(source_name)
+    variant_source = variant_identity_source_from_base(base_identity)
+    if variant_source is None:
+        return list(entries)
+
+    variant_evidence: dict[str, dict[str, Any]] = {}
+    for table in target_tables:
+        context = "\n".join(
+            value
+            for value in (table.title, table.group_context, " ".join(table.headers))
+            if value
+        )
+        variant_identity = extract_variant_identity_from_text(
+            context,
+            prefix=variant_source[0],
+            suffix=variant_source[1],
+        )
+        if not variant_identity:
+            continue
+
+        evidence = variant_evidence.setdefault(
+            normalize_compact(variant_identity),
+            {
+                "identity_name": variant_identity,
+                "table_ids": [],
+                "package_type": "",
+                "pin_count": "",
+            },
+        )
+        if table.table_id not in evidence["table_ids"]:
+            evidence["table_ids"].append(table.table_id)
+
+        package_type, pin_count = package_metadata_from_variant_context(context)
+        if package_type and not evidence["package_type"]:
+            evidence["package_type"] = package_type
+        if pin_count and not evidence["pin_count"]:
+            evidence["pin_count"] = pin_count
+
+    if len(variant_evidence) < 2:
+        return list(entries)
+
+    derived_entries = [
+        PackageCatalogEntry(
+            package_key="",
+            identity_name=str(evidence["identity_name"]),
+            package_type=str(evidence["package_type"]),
+            pin_count=str(evidence["pin_count"]),
+            evidence_table_ids=list(evidence["table_ids"]),
+        )
+        for evidence in variant_evidence.values()
+    ]
+
+    result = entries_without_umbrella_family_slots(
+        list(entries),
+        base_identity=base_identity,
+        derived_entries=derived_entries,
+    )
+    for incoming in derived_entries:
+        merge_catalog_entry(result, incoming)
+
+    if diagnostics is not None:
+        diagnostics.append(
+            {
+                "stage": "target_figure_variant_catalog_entries",
+                "status": "applied",
+                "base_identity": base_identity,
+                "created_identities": [
+                    entry.identity_name for entry in derived_entries
+                ],
+                "before": len(entries),
+                "after": len(result),
+            }
+        )
+    return result
+
+
+def base_identity_from_source_name(source_name: str) -> str:
+    """从文件名去掉末尾多个 pin_count，得到基础器件型号。"""
+
+    name = re.split(r"[\\/]", str(source_name or ""))[-1]
+    name = re.sub(r"\.[A-Za-z0-9]+$", "", name)
+    name = re.sub(r"(?:_\d{2,4}){2,}\D*$", "", name)
+    return clean_identity_name(name)
+
+
+def variant_identity_source_from_base(base_identity: str) -> tuple[str, str] | None:
+    """只支持 ``DRV8242-Q1`` -> ``DRV8242H-Q1`` 这类保守变体。"""
+
+    match = re.fullmatch(
+        r"(?P<prefix>[A-Za-z][A-Za-z0-9]{3,20})-(?P<suffix>[A-Za-z0-9]{1,8})",
+        str(base_identity or ""),
+    )
+    if not match:
+        return None
+    return match.group("prefix"), match.group("suffix")
+
+
+def extract_variant_identity_from_text(
+    text: str,
+    *,
+    prefix: str,
+    suffix: str,
+) -> str:
+    """从局部文本中提取 ``prefix + 单字母 + -suffix`` 变体型号。"""
+
+    pattern = (
+        rf"(?<![A-Za-z0-9])"
+        rf"{re.escape(prefix)}(?P<variant>[A-Z])\s*[-–—]\s*{re.escape(suffix)}"
+        rf"(?![A-Za-z0-9])"
+    )
+    matches = {
+        f"{prefix}{match.group('variant')}-{suffix}"
+        for match in re.finditer(pattern, str(text or ""), flags=re.IGNORECASE)
+    }
+    return next(iter(matches)) if len(matches) == 1 else ""
+
+
+def package_metadata_from_variant_context(text: str) -> tuple[str, str]:
+    """从同一局部文本中抽取封装族和 pin_count。"""
+
+    package_type = ""
+    pin_count = ""
+    for candidate_package, candidate_count in explicit_package_mentions_from_text(text):
+        if candidate_package and not package_type:
+            package_type = clean_public_package_name(candidate_package)
+        if candidate_count and not pin_count:
+            pin_count = clean_pin_count(candidate_count)
+        if package_type and pin_count:
+            break
+    if not pin_count:
+        counts = explicit_package_pin_counts_from_text(text)
+        if len(counts) == 1:
+            pin_count = next(iter(counts))
+    if not package_type:
+        package_type = clean_public_package_name(text)
+    return package_type, pin_count
+
+
+def explicit_package_mentions_from_text(text: str) -> list[tuple[str, str]]:
+    """返回局部文本中明确互相绑定的 ``(package_type, pin_count)``。"""
+
+    value = str(text or "")
+    package_pattern = PACKAGE_FAMILY_PATTERN
+    patterns = [
+        # VQFN (20), VQFN-HR (14), HVSSOP (28)
+        rf"(?<![A-Za-z0-9])(?P<pkg>{package_pattern}(?:[- ][A-Za-z0-9]+)?)\s*[\(（]\s*(?P<count>\d{{1,4}})\s*[\)）]",
+        # 20-Pin VQFN, 20 pin VQFN
+        rf"(?<![A-Za-z0-9])(?P<count>\d{{1,4}})\s*[- ]?\s*pin(?:s)?\s+(?P<pkg>{package_pattern}(?:[- ][A-Za-z0-9]+)?)(?![A-Za-z0-9])",
+        # VQFN 20-pin, VQFN 20 pin
+        rf"(?<![A-Za-z0-9])(?P<pkg>{package_pattern}(?:[- ][A-Za-z0-9]+)?)\s+(?P<count>\d{{1,4}})\s*[- ]?\s*pin(?:s)?(?![A-Za-z0-9])",
+        # QFN 32 Pin Functions, BGA 64 package
+        rf"(?<![A-Za-z0-9])(?P<pkg>{package_pattern})\s+(?P<count>\d{{1,4}})\s+(?:pin|pins|package|pkg)(?![A-Za-z0-9])",
+        # QFN 32, BGA 64
+        rf"(?<![A-Za-z0-9])(?P<pkg>{package_pattern})\s+(?P<count>\d{{1,4}})(?![A-Za-z0-9])",
+    ]
+    result: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, value, flags=re.IGNORECASE):
+            item = (
+                re.sub(r"\s+", " ", match.group("pkg")).strip(),
+                clean_pin_count(match.group("count")),
+            )
+            if item not in seen:
+                seen.add(item)
+                result.append(item)
+    return result
+
+
+def entries_without_umbrella_family_slots(
+    entries: Sequence[PackageCatalogEntry],
+    *,
+    base_identity: str,
+    derived_entries: Sequence[PackageCatalogEntry],
+) -> list[PackageCatalogEntry]:
+    """派生变体已覆盖目标表时，移除原 family/匿名物理 umbrella 槽。"""
+
+    derived_pin_counts = {
+        pin_count
+        for entry in derived_entries
+        for pin_count in explicit_package_pin_counts_from_entry(entry)
+    }
+    derived_package_keys = {
+        package_label_match_key(entry.package_type)
+        for entry in derived_entries
+        if package_label_match_key(entry.package_type)
+    }
+    base_key = normalize_compact(base_identity)
+
+    result = []
+    for entry in entries:
+        identity_key = normalize_compact(entry.identity_name)
+        entry_pin_counts = explicit_package_pin_counts_from_entry(entry)
+        entry_package_key = package_label_match_key(entry.package_type)
+        is_base_identity = bool(base_key and identity_key == base_key)
+        is_anonymous_physical = not identity_key and bool(entry_package_key)
+        overlaps_derived_pin_count = bool(
+            derived_pin_counts
+            and entry_pin_counts
+            and not entry_pin_counts.isdisjoint(derived_pin_counts)
+        )
+        overlaps_derived_package = bool(
+            entry_package_key and entry_package_key in derived_package_keys
+        )
+        if (is_base_identity or is_anonymous_physical) and (
+            overlaps_derived_pin_count or overlaps_derived_package
+        ):
+            continue
+        result.append(entry)
+    return result
+
+
 def select_single_package_fallback_entry(
     entries: Sequence[PackageCatalogEntry],
     *,
@@ -2968,14 +3208,18 @@ def match_entries_in_text(
 
     normalized_text = normalize_text(text)
     text_pin_counts = explicit_package_pin_counts_from_text(text)
-    matches = []
+    identity_matches = []
     for entry in entries:
         # 器件型号只用于内部关联；封装类型和 Drawing 也可参与绑定。若同一
         # 元数据对应多个槽位，会保持歧义，不能据此合并槽位。
         identity_names = [entry.identity_name, *entry.identity_aliases]
         if any(identity_name_in_text(name, text) for name in identity_names):
-            matches.append(entry)
-            continue
+            identity_matches.append(entry)
+    if identity_matches:
+        return identity_matches
+
+    matches = []
+    for entry in entries:
         names = []
         if entry.public_label:
             names.append(entry.public_label)

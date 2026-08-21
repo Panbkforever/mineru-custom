@@ -1400,6 +1400,139 @@ def test_package_context_parenthesized_suffix_pin_count_filters_matches():
     assert [entry.package_key for entry in hvssop_matches] == ["slot:2"]
 
 
+def test_target_figure_variant_identities_create_independent_slots():
+    """图题里的 H/S/P 变体应从 family 目录派生为独立槽位。"""
+
+    summary = catalog_table(
+        0,
+        "Device Information",
+        ["DEVICE", "PACKAGE", "PINS"],
+        [
+            ["DEVICE", "PACKAGE", "PINS"],
+            ["DRV8242-Q1", "VQFN", "20"],
+        ],
+    )
+    targets = [
+        PackageTargetTable(
+            table_id=1,
+            page_idx=1,
+            title="Table 6-1. Pin Functions",
+            group_context="Table 6-1. Pin Functions\nFigure 6-1. DRV8242H-Q1 VQFN (20)",
+            current_chapter_titles=("Pin Functions",),
+            headers=("PIN", "NAME"),
+        ),
+        PackageTargetTable(
+            table_id=2,
+            page_idx=2,
+            title="Table 6-2. Pin Functions",
+            group_context="Table 6-2. Pin Functions\nFigure 6-2. DRV8242S-Q1 VQFN (20)",
+            current_chapter_titles=("Pin Functions",),
+            headers=("PIN", "NAME"),
+        ),
+        PackageTargetTable(
+            table_id=3,
+            page_idx=3,
+            title="Table 6-3. Pin Functions",
+            group_context="Table 6-3. Pin Functions\nFigure 6-3. DRV8242P-Q1 VQFN (20)",
+            current_chapter_titles=("Pin Functions",),
+            headers=("PIN", "NAME"),
+        ),
+    ]
+
+    def classifier(table, source_name, target_tables):
+        return {
+            "is_package_summary": True,
+            "table_role": "identity_summary",
+            "header_row_index": 0,
+            "columns": [
+                {"column_index": 0, "role": "package_identity"},
+                {"column_index": 1, "role": "package_type"},
+                {"column_index": 2, "role": "pin_count"},
+            ],
+        }
+
+    result = resolve_document_package_catalog(
+        all_tables=[summary],
+        target_tables=targets,
+        multi_package_plans={
+            target.table_id: MultiPackagePlan(False, "single_package")
+            for target in targets
+        },
+        source_name="DRV8242-Q1_20_20_20.pdf",
+        use_semantic_classifier=True,
+        classifier=classifier,
+    )
+
+    assert [entry.identity_name for entry in result.entries] == [
+        "DRV8242H-Q1",
+        "DRV8242S-Q1",
+        "DRV8242P-Q1",
+    ]
+    assert [(entry.package_type, entry.pin_count) for entry in result.entries] == [
+        ("VQFN", "20"),
+        ("VQFN", "20"),
+        ("VQFN", "20"),
+    ]
+    assert [
+        result.assignment_for(table.table_id, 0).package_key for table in targets
+    ] == ["slot:0", "slot:1", "slot:2"]
+
+
+def test_target_figure_variant_supports_spaced_suffix_identity():
+    """PDF 中的 ``DRV8143P -Q1`` 应规范成 ``DRV8143P-Q1``。"""
+
+    targets = [
+        PackageTargetTable(
+            table_id=1,
+            page_idx=1,
+            title="表 6-1. 引脚功能",
+            group_context="表 6-1. 引脚功能\n图 6-1. 采用 VQFN-HR (14) 封装的 DRV8143H-Q1 HW 型号",
+            current_chapter_titles=("引脚功能",),
+            headers=("引脚", "名称"),
+        ),
+        PackageTargetTable(
+            table_id=2,
+            page_idx=2,
+            title="表 6-2. 引脚功能",
+            group_context="表 6-2. 引脚功能\n图 6-2. 采用 HVSSOP (28)封装的 DRV8143P -Q1 SPI (P)型号",
+            current_chapter_titles=("引脚功能",),
+            headers=("引脚", "名称"),
+        ),
+        PackageTargetTable(
+            table_id=3,
+            page_idx=3,
+            title="表 6-3. 引脚功能",
+            group_context="表 6-3. 引脚功能\n图 6-3. 采用 VQFN-HR (14) 封装的 DRV8143S-Q1 SPI 型号",
+            current_chapter_titles=("引脚功能",),
+            headers=("引脚", "名称"),
+        ),
+    ]
+
+    result = resolve_document_package_catalog(
+        all_tables=[],
+        target_tables=targets,
+        multi_package_plans={
+            target.table_id: MultiPackagePlan(False, "single_package")
+            for target in targets
+        },
+        source_name="DRV8143-Q1_14_28_14.pdf",
+    )
+
+    assert [entry.identity_name for entry in result.entries] == [
+        "DRV8143H-Q1",
+        "DRV8143P-Q1",
+        "DRV8143S-Q1",
+    ]
+    assert [(entry.package_type, entry.pin_count) for entry in result.entries] == [
+        ("VQFN", "14"),
+        ("HVSSOP", "28"),
+        ("VQFN", "14"),
+    ]
+    assert [
+        result.assignment_for(table.table_id, 0).package_key for table in targets
+    ] == ["slot:0", "slot:1", "slot:2"]
+
+
 def test_generic_package_without_pin_count_stays_ambiguous():
     """没有明确 pin_count 时，原有 VQFN 泛化匹配仍保持歧义。"""
 
