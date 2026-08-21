@@ -10,11 +10,48 @@ from extract.special_table_handlers import (
     find_special_table_match,
     mii_rmii_rgmii_pin_mux_table_filter,
     register_word_pin_affected_table_filter,
+    unused_pins_connection_table_filter,
 )
 
 
 class SpecialTableHandlersTest(unittest.TestCase):
     """验证特殊规则的严格命中条件和普通表保护边界。"""
+
+    def test_unused_pins_connection_table_is_rejected(self) -> None:
+        """Connections for Unused Pins 表必须在模型前直接过滤。"""
+
+        match = unused_pins_connection_table_filter(
+            "Table 7-3. Connections for Unused Pins – RGZ Package",
+            ["Pin", "Signal", "Connection Requirements"],
+            [["3", "NC", "Tie to ground"]],
+        )
+
+        self.assertIsNotNone(match)
+        self.assertFalse(match.should_extract)
+        self.assertEqual(match.handler_name, "unused_pins_connection_table_filter")
+
+        table = TableCandidate(
+            html=(
+                "<table>"
+                "<tr><td>Pin</td><td>Signal</td><td>Connection Requirements</td></tr>"
+                "<tr><td>3</td><td>NC</td><td>Tie to ground</td></tr>"
+                "</table>"
+            ),
+            page_idx=0,
+            title="Table 7-4. Connection for Unused Pins and Modules – RKP Package",
+        )
+        self.assertEqual(extract_pin_package_info_from_table_candidates([table]), [])
+
+    def test_unused_word_without_connection_title_does_not_match(self) -> None:
+        """普通 unused 说明标题不能被扩大过滤。"""
+
+        match = find_special_table_match(
+            "Table 7-1. Signal Descriptions – RGZ Package",
+            ["Pin", "Signal", "Description"],
+            [["3", "GPIO", "Unused by default"]],
+        )
+
+        self.assertIsNone(match)
 
     def test_mii_rmii_rgmii_pin_mux_table_is_rejected(self) -> None:
         """固定六列表头的以太网复用矩阵必须在模型前直接过滤。"""

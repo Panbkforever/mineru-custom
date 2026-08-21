@@ -5,6 +5,10 @@
 
 当前特殊情况：
 
+* ``unused_pins_connection_table_filter``：处理
+  ``Connections for Unused Pins`` / ``Connection for Unused Pins and Modules``
+  这类未使用引脚连接建议表；整表直接过滤，禁止把板级连接建议并入正式
+  物理 pin list。
 * ``mii_rmii_rgmii_pin_mux_table_filter``：处理表头固定为 ``Pin No.``、
   ``MII MAC``、``MII PHY``、``RMII MAC``、``RMII PHY``、``RGMII`` 的
   以太网接口复用矩阵；整表直接过滤，禁止把编号列误当成独立引脚清单。
@@ -53,6 +57,7 @@ def find_special_table_match(
     """依次调用每一种特殊处理函数，返回第一个完整命中的结果。"""
 
     handlers = (
+        unused_pins_connection_table_filter,
         mii_rmii_rgmii_pin_mux_table_filter,
         register_word_pin_affected_table_filter,
         reserved_pin_table_handler,
@@ -61,6 +66,39 @@ def find_special_table_match(
         match = handler(title, headers, data_rows)
         if match is not None:
             return match
+    return None
+
+
+def unused_pins_connection_table_filter(
+    title: str,
+    headers: list[str],
+    data_rows: list[list[str]],
+) -> SpecialTableMatch | None:
+    """过滤未使用引脚连接建议表。
+
+    ``Connections for Unused Pins`` 这类表描述的是未用引脚在板级设计中如何
+    连接，不是器件完整物理引脚定义。它经常有 Pin/Name/Connection 表头，
+    容易被字段模型误判为正式 pin table，因此在模型前直接拒绝。
+
+    该规则只依赖明确表题，不靠表头猜测，避免误伤普通引脚功能表。
+    """
+
+    normalized_title = normalize_text(title)
+    if not normalized_title:
+        return None
+    if re.search(
+        r"\bconnections?\s+for\s+unused\s+pins?(?:\s+and\s+modules)?\b",
+        normalized_title,
+    ) or re.search(
+        r"\bunused\s+pins?(?:\s+and\s+modules)?\s+connections?\b",
+        normalized_title,
+    ):
+        return SpecialTableMatch(
+            handler_name="unused_pins_connection_table_filter",
+            columns=(),
+            included_row_indexes=frozenset(),
+            should_extract=False,
+        )
     return None
 
 
