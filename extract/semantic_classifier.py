@@ -133,7 +133,7 @@ def classify_package_catalog_table(
     request_id = str(getattr(table, "table_id", 0))
     return classify_package_catalog_tables(
         [(request_id, table)],
-        source_name=source_name,
+        source_name="",
         target_tables=target_tables,
     )[request_id]
 
@@ -176,7 +176,7 @@ def classify_package_catalog_tables(
             "Return irrelevant when the table neither establishes identities nor supplies packaging metadata.",
             "This task does not identify pin_no, pin_name, type, group names or row values.",
         ],
-        "document": {"source_name": source_name},
+        "document": {},
         "tables": [
             {
                 "request_id": request_id,

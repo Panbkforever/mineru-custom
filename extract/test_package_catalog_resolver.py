@@ -1189,8 +1189,8 @@ def test_all_unresolved_catalog_slots_fall_back_to_single_package():
     assert diagnostic["document_packages_before"] == ["QFN 32", "BGA 64"]
 
 
-def test_multi_count_source_name_blocks_all_unresolved_single_package_fallback():
-    """文件名有多个 pin_count 时，不能把全 unresolved 多目标任务压成单封装。"""
+def test_multiple_target_context_blocks_all_unresolved_single_package_fallback():
+    """目标表局部上下文有多个封装目标时，不能把全 unresolved 压成单封装。"""
 
     summary = catalog_table(
         0,
@@ -1198,58 +1198,77 @@ def test_multi_count_source_name_blocks_all_unresolved_single_package_fallback()
         ["DEVICE", "PACKAGE"],
         [
             ["DEVICE", "PACKAGE"],
-            ["DEV-A", "QFN 36"],
-            ["DEV-B", "BGA 36"],
+            ["DEV-A", "QFN 64"],
+            ["DEV-B", "BGA 64"],
         ],
     )
-    target = target_table(
+    target_a = target_table(
         1,
-        "Pin Functions",
+        "36-Pin Pin Functions",
+        ["PIN NO", "PIN NAME", "TYPE"],
+    )
+    target_b = target_table(
+        2,
+        "48-Pin Pin Functions",
         ["PIN NO", "PIN NAME", "TYPE"],
     )
     result = resolve_document_package_catalog(
         all_tables=[summary],
-        target_tables=[target],
-        multi_package_plans={1: MultiPackagePlan(False, "single_package")},
-        source_name="CC1110Fx CC1111Fx_36_36",
+        target_tables=[target_a, target_b],
+        multi_package_plans={
+            1: MultiPackagePlan(False, "single_package"),
+            2: MultiPackagePlan(False, "single_package"),
+        },
+        source_name="single-target-name",
         use_semantic_classifier=True,
         classifier=identity_catalog_classifier,
     )
 
     assert len(result.entries) == 2
     assert result.assignment_for(1, 0) is None
+    assert result.assignment_for(2, 0) is None
     assert not any(
         item.get("stage") == "single_package_all_unresolved_fallback"
         for item in result.diagnostics
     )
 
 
-def test_multi_count_source_without_catalog_does_not_create_anonymous_slot():
-    """多目标文件 catalog 全空时，不再创建会吞并全部表的匿名单槽位。"""
+def test_multiple_target_context_without_catalog_does_not_create_anonymous_slot():
+    """目标表局部上下文有多目标证据时，catalog 全空也不创建匿名单槽位。"""
 
-    target = target_table(
+    target_a = target_table(
         1,
-        "Pin Functions",
+        "QFN 64 Pin Functions",
+        ["PIN NO", "PIN NAME", "TYPE"],
+    )
+    target_b = target_table(
+        2,
+        "QFN 48 Pin Functions",
         ["PIN NO", "PIN NAME", "TYPE"],
     )
     result = resolve_document_package_catalog(
         all_tables=[],
-        target_tables=[target],
-        multi_package_plans={1: MultiPackagePlan(False, "single_package")},
-        source_name="CC430F514x_CC430F614x_64_48",
+        target_tables=[target_a, target_b],
+        multi_package_plans={
+            1: MultiPackagePlan(False, "single_package"),
+            2: MultiPackagePlan(False, "single_package"),
+        },
+        source_name="single-target-name",
     )
 
     assert result.entries == []
     assert result.assignment_for(1, 0) is None
+    assert result.assignment_for(2, 0) is None
     assert any(
         item.get("stage") == "package_catalog_anonymous_slot_guard"
         and item.get("status") == "blocked"
+        and item.get("reason") == "multi_target_context_without_catalog"
         for item in result.diagnostics
     )
 
 
-def test_all_unresolved_single_package_fallback_prefers_source_name_hint():
-    """单封装文件名中的 ZWT_361 可以从 ZCE/ZWT 目录中选择目标槽位。"""
+def test_all_unresolved_single_package_fallback_ignores_source_name_hint():
+    """单封装兜底不能用文件名中的 ZWT_361 覆盖目录顺序或公开名称。"""
 
     summary = catalog_table(
         0,
@@ -1290,9 +1309,9 @@ def test_all_unresolved_single_package_fallback_prefers_source_name_hint():
     )
 
     assert len(result.entries) == 1
-    assert result.entries[0].package_drawing == "ZWT"
-    assert result.entries[0].public_label == "ZWT"
-    assert result.assignment_for(1, 0).pkg == "ZWT"
+    assert result.entries[0].package_drawing == "ZCE"
+    assert result.entries[0].public_label == ""
+    assert result.assignment_for(1, 0).pkg == "NFBGA"
 
 
 def test_multi_package_ambiguous_evidence_stays_unresolved():
@@ -1458,7 +1477,7 @@ def test_target_figure_variant_identities_create_independent_slots():
             target.table_id: MultiPackagePlan(False, "single_package")
             for target in targets
         },
-        source_name="DRV8242-Q1_20_20_20.pdf",
+        source_name="unrelated-input-name.pdf",
         use_semantic_classifier=True,
         classifier=classifier,
     )
@@ -1515,7 +1534,7 @@ def test_target_figure_variant_supports_spaced_suffix_identity():
             target.table_id: MultiPackagePlan(False, "single_package")
             for target in targets
         },
-        source_name="DRV8143-Q1_14_28_14.pdf",
+        source_name="unrelated-input-name.pdf",
     )
 
     assert [entry.identity_name for entry in result.entries] == [
@@ -1570,7 +1589,7 @@ def test_target_figure_variant_keeps_same_identity_different_packages_separate()
             target.table_id: MultiPackagePlan(False, "single_package")
             for target in targets
         },
-        source_name="DRV8145-Q1_16_28.pdf",
+        source_name="unrelated-input-name.pdf",
     )
 
     assert [

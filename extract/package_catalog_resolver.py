@@ -27,8 +27,8 @@
 7. 槽位冻结后，任何未匹配表都不能创建新 pkg。单封装文档可以绑定唯一
    槽位；多封装文档中无法唯一归属的表必须标记为 unresolved，禁止默认
    塞入第一个槽位。若多个目录槽位全部无法绑定、没有真实多封装分支证据，
-   且文件名不是多个 pin_count 目标，才按单封装误膨胀兜底收敛为一个槽位。
-   真实名称缺失时仅对已经确认的槽位使用 a、b、c……。
+   且目标表局部上下文没有多目标封装证据，才按单封装误膨胀兜底收敛为
+   一个槽位。真实名称缺失时仅对已经确认的槽位使用 a、b、c……。
 8. 多封装表的全部本地分支必须一次性执行一对一绑定；禁止每个分支独立
    兜底后落入同一个 package_key。标签脚注、drawing 和 pin_count 只用于
    内部消歧，不改变任何引脚行内容。
@@ -235,7 +235,7 @@ def resolve_document_package_catalog(
     if use_semantic_classifier or classifier is not None:
         entries, semantic_diagnostics = classify_package_catalog_candidates(
             catalog_candidates,
-            source_name=source_name,
+            source_name="",
             target_tables=target_tables,
             classifier=classifier,
         )
@@ -282,17 +282,15 @@ def resolve_document_package_catalog(
     entries = add_target_figure_variant_catalog_entries(
         entries,
         target_tables=target_tables,
-        source_name=source_name,
         diagnostics=diagnostics,
     )
     if not entries and target_tables:
-        if source_name_has_multiple_trailing_pin_counts(source_name):
+        if target_tables_have_multiple_package_contexts(target_tables):
             diagnostics.append(
                 {
                     "stage": "package_catalog_anonymous_slot_guard",
                     "status": "blocked",
-                    "reason": "multi_count_source_without_catalog",
-                    "source_name": source_name,
+                    "reason": "multi_target_context_without_catalog",
                 }
             )
         else:
@@ -316,7 +314,6 @@ def resolve_document_package_catalog(
     )
     diagnostics.extend(binding_diagnostics)
     if should_apply_all_unresolved_single_package_fallback(
-        source_name=source_name,
         entries=entries,
         target_tables=target_tables,
         multi_package_plans=multi_package_plans,
@@ -327,7 +324,6 @@ def resolve_document_package_catalog(
         entries = [
             select_single_package_fallback_entry(
                 entries,
-                source_name=source_name,
                 target_tables=target_tables,
             )
         ]
@@ -335,7 +331,6 @@ def resolve_document_package_catalog(
             single_package_all_unresolved_fallback_diagnostic(
                 before_entries=fallback_before_entries,
                 selected_entry=entries[0],
-                source_name=source_name,
                 target_tables=target_tables,
                 initial_binding_diagnostics=binding_diagnostics,
             )
@@ -518,7 +513,7 @@ def classify_package_catalog_candidates(
                         (str(table.table_id), table)
                         for _, table in batch
                     ],
-                    source_name=source_name,
+                    source_name="",
                     target_tables=target_tables,
                 ): batch
                 for batch in batches
@@ -558,7 +553,7 @@ def classify_package_catalog_candidates(
                 executor.submit(
                     classifier,
                     table,
-                    source_name,
+                    "",
                     target_tables,
                 ): (order, table)
                 for order, table in enumerate(tables)
@@ -2073,7 +2068,6 @@ def freeze_package_slots(entries: Sequence[PackageCatalogEntry]) -> None:
 
 def should_apply_all_unresolved_single_package_fallback(
     *,
-    source_name: str,
     entries: Sequence[PackageCatalogEntry],
     target_tables: Sequence[PackageTargetTable],
     multi_package_plans: Mapping[int, MultiPackagePlanLike],
@@ -2088,7 +2082,7 @@ def should_apply_all_unresolved_single_package_fallback(
 
     if len(entries) <= 1 or not target_tables or assignments:
         return False
-    if source_name_has_multiple_trailing_pin_counts(source_name):
+    if target_tables_have_multiple_package_contexts(target_tables):
         return False
     if any(
         plan_creates_package_slots(multi_package_plans.get(table.table_id))
@@ -2110,28 +2104,66 @@ def should_apply_all_unresolved_single_package_fallback(
     )
 
 
-def source_name_has_multiple_trailing_pin_counts(source_name: str) -> bool:
-    """文件名末尾含多个 ``_pin_count`` 段时，视为多目标任务。
+def target_tables_have_multiple_package_contexts(
+    target_tables: Sequence[PackageTargetTable],
+) -> bool:
+    """目标表局部文本明确出现多个封装目标时，禁止单封装兜底。
 
-    例如 ``CC430F514x_64_48``、``CC1310_32_32_48`` 和
-    ``CC1110Fx_36_36`` 都不能触发单封装兜底；``am1802-ZWT_361``
-    仍是单一目标。
+    这里只读取 PDF 正文中已经绑定到目标表附近的表题、上方图题、章节标题
+    和表头；不读取文件名。证据包括完整变体型号（DRV8145H-Q1）、明确
+    package+pin_count（VQFN-HR (16)）以及独立 pin_count（16-pin）。
     """
 
-    name = re.split(r"[\\/]", str(source_name or ""))[-1]
-    name = re.sub(r"\.[A-Za-z0-9]+$", "", name)
-    match = re.search(r"(?P<count_suffix>(?:_\d{2,4}){2,})(?:\D*$|$)", name)
-    if not match:
-        return False
-    counts = re.findall(r"\d{2,4}", match.group("count_suffix"))
-    return len(counts) >= 2
+    context_keys: set[tuple[str, str]] = set()
+    for table in target_tables:
+        context_keys.update(package_context_keys_from_target_table(table))
+        if len(context_keys) >= 2:
+            return True
+    return False
+
+
+def package_context_keys_from_target_table(
+    table: PackageTargetTable,
+) -> set[tuple[str, str]]:
+    """从单张目标表上下文中提取封装目标 key。"""
+
+    context = target_table_package_context_text(table)
+    keys: set[tuple[str, str]] = set()
+    for identity in extract_variant_identities_from_text(context):
+        keys.add(("identity", normalize_compact(identity)))
+    for package_type, pin_count in explicit_package_mentions_from_text(context):
+        package_key = package_label_match_key(package_type)
+        count = clean_pin_count(pin_count)
+        if package_key and count:
+            keys.add(("package_pin_count", f"{package_key}:{count}"))
+    if not keys:
+        for count in explicit_package_pin_counts_from_text(context):
+            keys.add(("pin_count", count))
+    if not keys:
+        for count in standalone_pin_count_mentions_from_text(context):
+            keys.add(("pin_count", count))
+    return keys
+
+
+def target_table_package_context_text(table: PackageTargetTable) -> str:
+    """拼接目标表附近可用于封装绑定的局部文本。"""
+
+    return "\n".join(
+        value
+        for value in (
+            table.title,
+            table.group_context,
+            *table.current_chapter_titles,
+            " ".join(table.headers),
+        )
+        if value
+    )
 
 
 def add_target_figure_variant_catalog_entries(
     entries: Sequence[PackageCatalogEntry],
     *,
     target_tables: Sequence[PackageTargetTable],
-    source_name: str,
     diagnostics: list[dict[str, Any]] | None = None,
 ) -> list[PackageCatalogEntry]:
     """从目标引脚表局部图题/表题中补全 H/S/P 等变体槽位。
@@ -2143,31 +2175,16 @@ def add_target_figure_variant_catalog_entries(
     匹配流程。
     """
 
-    if (
-        not target_tables
-        or not source_name_has_multiple_trailing_pin_counts(source_name)
-    ):
-        return list(entries)
-
-    base_identity = base_identity_from_source_name(source_name)
-    variant_source = variant_identity_source_from_base(base_identity)
-    if variant_source is None:
+    if not target_tables:
         return list(entries)
 
     variant_evidence: dict[tuple[str, str, str], dict[str, Any]] = {}
     for table in target_tables:
-        context = "\n".join(
-            value
-            for value in (table.title, table.group_context, " ".join(table.headers))
-            if value
-        )
-        variant_identity = extract_variant_identity_from_text(
-            context,
-            prefix=variant_source[0],
-            suffix=variant_source[1],
-        )
-        if not variant_identity:
+        context = target_table_package_context_text(table)
+        variant_identities = extract_variant_identities_from_text(context)
+        if len(variant_identities) != 1:
             continue
+        variant_identity = variant_identities[0]
 
         package_type, pin_count = package_metadata_from_variant_context(context)
         evidence_key = target_figure_variant_evidence_key(
@@ -2205,10 +2222,16 @@ def add_target_figure_variant_catalog_entries(
         )
         for evidence in variant_evidence.values()
     ]
+    base_identities = {
+        base_identity
+        for entry in derived_entries
+        for base_identity in [variant_base_identity_from_identity(entry.identity_name)]
+        if base_identity
+    }
 
     result = entries_without_umbrella_family_slots(
         list(entries),
-        base_identity=base_identity,
+        base_identities=base_identities,
         derived_entries=derived_entries,
     )
     for incoming in derived_entries:
@@ -2219,7 +2242,7 @@ def add_target_figure_variant_catalog_entries(
             {
                 "stage": "target_figure_variant_catalog_entries",
                 "status": "applied",
-                "base_identity": base_identity,
+                "base_identities": sorted(base_identities),
                 "created_identities": [
                     entry.identity_name for entry in derived_entries
                 ],
@@ -2269,45 +2292,47 @@ def merge_target_figure_variant_catalog_entry(
     entries.append(incoming)
 
 
-def base_identity_from_source_name(source_name: str) -> str:
-    """从文件名去掉末尾多个 pin_count，得到基础器件型号。"""
+def extract_variant_identities_from_text(text: str) -> list[str]:
+    """从目标表局部文本中直接提取 ``基础型号+单字母变体-后缀``。
 
-    name = re.split(r"[\\/]", str(source_name or ""))[-1]
-    name = re.sub(r"\.[A-Za-z0-9]+$", "", name)
-    name = re.sub(r"(?:_\d{2,4}){2,}\D*$", "", name)
-    return clean_identity_name(name)
+    例：``DRV8145H-Q1``、``DRV8145S -Q1``。基础型号来自 PDF 文本本身，
+    不是文件名；只有前缀以数字结尾且变体为单个大写字母时才接受，避免把
+    普通型号误拆成变体。
+    """
+
+    result: list[str] = []
+    seen: set[str] = set()
+    pattern = (
+        r"(?<![A-Za-z0-9])"
+        r"(?P<prefix>[A-Za-z][A-Za-z0-9]{2,20}\d)"
+        r"(?P<variant>[A-Z])\s*[-–—]\s*"
+        r"(?P<suffix>[A-Za-z0-9]{1,8})"
+        r"(?![A-Za-z0-9])"
+    )
+    for match in re.finditer(pattern, str(text or "")):
+        identity = (
+            f"{match.group('prefix')}{match.group('variant')}-"
+            f"{match.group('suffix')}"
+        )
+        identity = clean_identity_name(identity)
+        key = normalize_compact(identity)
+        if identity and key not in seen:
+            seen.add(key)
+            result.append(identity)
+    return result
 
 
-def variant_identity_source_from_base(base_identity: str) -> tuple[str, str] | None:
-    """只支持 ``DRV8242-Q1`` -> ``DRV8242H-Q1`` 这类保守变体。"""
+def variant_base_identity_from_identity(identity_name: str) -> str:
+    """把 ``DRV8145H-Q1`` 还原成 family umbrella ``DRV8145-Q1``。"""
 
     match = re.fullmatch(
-        r"(?P<prefix>[A-Za-z][A-Za-z0-9]{3,20})-(?P<suffix>[A-Za-z0-9]{1,8})",
-        str(base_identity or ""),
+        r"(?P<prefix>[A-Za-z][A-Za-z0-9]{2,20}\d)"
+        r"(?P<variant>[A-Z])-(?P<suffix>[A-Za-z0-9]{1,8})",
+        str(identity_name or ""),
     )
     if not match:
-        return None
-    return match.group("prefix"), match.group("suffix")
-
-
-def extract_variant_identity_from_text(
-    text: str,
-    *,
-    prefix: str,
-    suffix: str,
-) -> str:
-    """从局部文本中提取 ``prefix + 单字母 + -suffix`` 变体型号。"""
-
-    pattern = (
-        rf"(?<![A-Za-z0-9])"
-        rf"{re.escape(prefix)}(?P<variant>[A-Z])\s*[-–—]\s*{re.escape(suffix)}"
-        rf"(?![A-Za-z0-9])"
-    )
-    matches = {
-        f"{prefix}{match.group('variant')}-{suffix}"
-        for match in re.finditer(pattern, str(text or ""), flags=re.IGNORECASE)
-    }
-    return next(iter(matches)) if len(matches) == 1 else ""
+        return ""
+    return clean_identity_name(f"{match.group('prefix')}-{match.group('suffix')}")
 
 
 def package_metadata_from_variant_context(text: str) -> tuple[str, str]:
@@ -2362,10 +2387,25 @@ def explicit_package_mentions_from_text(text: str) -> list[tuple[str, str]]:
     return result
 
 
+def standalone_pin_count_mentions_from_text(text: str) -> set[str]:
+    """提取局部标题中明确写成 ``36-pin`` / ``36 pin`` 的 pin_count。"""
+
+    result: set[str] = set()
+    for match in re.finditer(
+        r"(?<![A-Za-z0-9])(?P<count>\d{1,4})\s*[- ]\s*pins?(?![A-Za-z0-9])",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    ):
+        count = clean_pin_count(match.group("count"))
+        if count:
+            result.add(count)
+    return result
+
+
 def entries_without_umbrella_family_slots(
     entries: Sequence[PackageCatalogEntry],
     *,
-    base_identity: str,
+    base_identities: set[str],
     derived_entries: Sequence[PackageCatalogEntry],
 ) -> list[PackageCatalogEntry]:
     """派生变体已覆盖目标表时，移除原 family/匿名物理 umbrella 槽。"""
@@ -2380,14 +2420,18 @@ def entries_without_umbrella_family_slots(
         for entry in derived_entries
         if package_label_match_key(entry.package_type)
     }
-    base_key = normalize_compact(base_identity)
+    base_keys = {
+        normalize_compact(base_identity)
+        for base_identity in base_identities
+        if normalize_compact(base_identity)
+    }
 
     result = []
     for entry in entries:
         identity_key = normalize_compact(entry.identity_name)
         entry_pin_counts = explicit_package_pin_counts_from_entry(entry)
         entry_package_key = package_label_match_key(entry.package_type)
-        is_base_identity = bool(base_key and identity_key == base_key)
+        is_base_identity = bool(identity_key and identity_key in base_keys)
         is_anonymous_physical = not identity_key and bool(entry_package_key)
         overlaps_derived_pin_count = bool(
             derived_pin_counts
@@ -2408,17 +2452,14 @@ def entries_without_umbrella_family_slots(
 def select_single_package_fallback_entry(
     entries: Sequence[PackageCatalogEntry],
     *,
-    source_name: str,
     target_tables: Sequence[PackageTargetTable],
 ) -> PackageCatalogEntry:
     """从误膨胀目录中选择一个单封装槽位，并复制为新的唯一 entry。"""
 
-    source_hint = package_hint_from_source_name(source_name)
     selected = max(
         enumerate(entries),
         key=lambda item: single_package_fallback_entry_score(
             item[1],
-            source_hint=source_hint,
             entry_index=item[0],
         ),
     )[1]
@@ -2436,51 +2477,17 @@ def select_single_package_fallback_entry(
         identity_aliases=list(selected.identity_aliases),
         evidence_table_ids=evidence_table_ids,
     )
-    hint_drawing, hint_pin_count = source_hint
-    if hint_drawing:
-        public_label = clean_public_symbol_name(hint_drawing)
-        if public_label:
-            result.public_label = public_label
-        # 文件名是单封装任务的强目标约束；只在保底收敛时允许它覆盖目录中
-        # 的历史/相邻 package drawing。
-        result.package_drawing = hint_drawing
-    if hint_pin_count and not clean_pin_count(result.pin_count):
-        result.pin_count = hint_pin_count
     return result
 
 
 def single_package_fallback_entry_score(
     entry: PackageCatalogEntry,
     *,
-    source_hint: tuple[str, str],
     entry_index: int,
 ) -> int:
-    """给单封装保底候选打分；文件名 hint 优先于普通物理元数据。"""
+    """给单封装保底候选打分；只使用目录项自身元数据。"""
 
-    hint_drawing, hint_pin_count = source_hint
     score = 0
-    candidate_names = [
-        entry.public_label,
-        entry.package_drawing,
-        *entry.identity_aliases,
-        entry.package_type,
-        entry.identity_name,
-    ]
-    if hint_drawing:
-        hint_key = normalize_compact(hint_drawing)
-        if any(normalize_compact(name) == hint_key for name in candidate_names):
-            score += 10000
-        elif any(
-            package_name_in_text(hint_drawing, normalize_text(name))
-            for name in candidate_names
-        ):
-            score += 5000
-    if hint_pin_count:
-        if clean_pin_count(entry.pin_count) == hint_pin_count:
-            score += 3000
-        elif metadata_contains_pin_count(entry.package_type, hint_pin_count):
-            score += 1500
-
     if clean_public_symbol_name(entry.public_label):
         score += 700
     if clean_metadata(entry.package_drawing):
@@ -2497,22 +2504,6 @@ def single_package_fallback_entry_score(
     # 稳定打破平局：保持原目录顺序。
     score -= entry_index
     return score
-
-
-def package_hint_from_source_name(source_name: str) -> tuple[str, str]:
-    """从单封装文件名中提取目标 drawing/pin_count，例如 ``ZWT_361``。"""
-
-    name = re.split(r"[\\/]", str(source_name or ""))[-1]
-    name = re.sub(r"\.[A-Za-z0-9]+$", "", name)
-    match = re.search(
-        r"[-_](?P<drawing>[A-Za-z][A-Za-z0-9]{1,14})_(?P<pin_count>\d{2,4})(?:\D*$|$)",
-        name,
-    )
-    if not match:
-        return "", ""
-    drawing = clean_public_symbol_name(match.group("drawing"))
-    pin_count = clean_pin_count(match.group("pin_count"))
-    return drawing, pin_count
 
 
 def metadata_contains_pin_count(value: str, pin_count: str) -> bool:
@@ -2533,24 +2524,17 @@ def single_package_all_unresolved_fallback_diagnostic(
     *,
     before_entries: Sequence[PackageCatalogEntry],
     selected_entry: PackageCatalogEntry,
-    source_name: str,
     target_tables: Sequence[PackageTargetTable],
     initial_binding_diagnostics: Sequence[dict[str, Any]],
 ) -> dict[str, Any]:
     """记录单封装兜底触发原因和收敛结果。"""
 
-    hint_drawing, hint_pin_count = package_hint_from_source_name(source_name)
     return {
         "stage": "single_package_all_unresolved_fallback",
         "status": "applied",
         "reason": "all_package_bindings_unresolved",
         "before": len(before_entries),
         "after": 1,
-        "source_name": source_name,
-        "source_hint": {
-            "package_drawing": hint_drawing,
-            "pin_count": hint_pin_count,
-        },
         "target_table_ids": [table.table_id for table in target_tables],
         "initial_unresolved_tables": [
             diagnostic.get("table_id")
