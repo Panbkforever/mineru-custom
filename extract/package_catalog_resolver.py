@@ -284,6 +284,16 @@ def resolve_document_package_catalog(
         target_tables=target_tables,
         diagnostics=diagnostics,
     )
+    entries = add_target_figure_physical_catalog_entries(
+        entries,
+        target_tables=target_tables,
+        diagnostics=diagnostics,
+    )
+    entries = consolidate_target_physical_catalog_entries(
+        entries,
+        target_tables=target_tables,
+        diagnostics=diagnostics,
+    )
     if not entries and target_tables:
         if target_tables_have_multiple_package_contexts(target_tables):
             diagnostics.append(
@@ -2292,6 +2302,320 @@ def merge_target_figure_variant_catalog_entry(
     entries.append(incoming)
 
 
+def add_target_figure_physical_catalog_entries(
+    entries: Sequence[PackageCatalogEntry],
+    *,
+    target_tables: Sequence[PackageTargetTable],
+    diagnostics: list[dict[str, Any]] | None = None,
+) -> list[PackageCatalogEntry]:
+    """从目标表上方封装图题补建物理槽位。
+
+    这只处理 ``DGS Package / 10-Pin VSSOP``、``YZF Package9-Pin DSBGA``
+    这类图题证据。它不依赖 PDF 文件名；且必须至少在目标表中形成两个
+    不同物理槽位，才会覆盖第二次模型给出的可疑目录。
+    """
+
+    if not target_tables:
+        return list(entries)
+
+    evidence_by_signature: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for table in target_tables:
+        mentions = target_physical_metadata_mentions_from_text(
+            target_table_package_context_text(table)
+        )
+        # 只有当前目标表自身能唯一指向一个封装图题时才作为 must-link。
+        if len(mentions) != 1:
+            continue
+        package_type, package_drawing, pin_count = mentions[0]
+        if not (package_type and package_drawing and pin_count):
+            continue
+        signature = (
+            package_label_match_key(package_type),
+            normalize_compact(package_drawing),
+            clean_pin_count(pin_count),
+        )
+        if not all(signature):
+            continue
+        evidence = evidence_by_signature.setdefault(
+            signature,
+            {
+                "package_type": package_type,
+                "package_drawing": package_drawing,
+                "pin_count": pin_count,
+                "table_ids": [],
+            },
+        )
+        if table.table_id not in evidence["table_ids"]:
+            evidence["table_ids"].append(table.table_id)
+
+    if len(evidence_by_signature) < 2:
+        return list(entries)
+
+    derived_entries = [
+        PackageCatalogEntry(
+            package_key="",
+            package_type=str(evidence["package_type"]),
+            package_drawing=str(evidence["package_drawing"]),
+            pin_count=str(evidence["pin_count"]),
+            evidence_table_ids=list(evidence["table_ids"]),
+        )
+        for evidence in evidence_by_signature.values()
+    ]
+
+    result = entries_without_conflicting_target_physical_slots(
+        list(entries),
+        derived_entries=derived_entries,
+    )
+    for incoming in derived_entries:
+        merge_target_physical_catalog_entry(result, incoming)
+
+    if diagnostics is not None:
+        diagnostics.append(
+            {
+                "stage": "target_figure_physical_catalog_entries",
+                "status": "applied",
+                "before": len(entries),
+                "after": len(result),
+                "created_physical_slots": [
+                    {
+                        "package_type": entry.package_type,
+                        "package_drawing": entry.package_drawing,
+                        "pin_count": entry.pin_count,
+                        "evidence_table_ids": list(entry.evidence_table_ids),
+                    }
+                    for entry in derived_entries
+                ],
+            }
+        )
+    return result
+
+
+def target_physical_metadata_mentions_from_text(
+    text: str,
+) -> list[tuple[str, str, str]]:
+    """提取目标图题中的 ``(package_type, drawing, pin_count)``。"""
+
+    value = re.sub(r"\s+", " ", str(text or ""))
+    package_pattern = PACKAGE_FAMILY_PATTERN
+    patterns = [
+        # YZF Package9-Pin DSBGA, DGS Package 10-Pin VSSOP
+        rf"(?<![A-Za-z0-9])"
+        rf"(?P<drawing>[A-Z0-9]{{2,8}})[ \t]+Package[ \t]*"
+        rf"(?P<count>\d{{1,4}})[ \t]*[- ]?[ \t]*pin(?:s)?[ \t]+"
+        rf"(?P<pkg>{package_pattern}(?:[- ][A-Za-z0-9]+)?)(?![A-Za-z0-9])",
+    ]
+    result: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, value, flags=re.IGNORECASE):
+            item = (
+                clean_public_package_name(match.group("pkg")),
+                clean_metadata(match.group("drawing")),
+                clean_pin_count(match.group("count")),
+            )
+            key = (
+                package_label_match_key(item[0]),
+                normalize_compact(item[1]),
+                item[2],
+            )
+            if all(key) and key not in seen:
+                seen.add(key)
+                result.append(item)
+    return result
+
+
+def entries_without_conflicting_target_physical_slots(
+    entries: Sequence[PackageCatalogEntry],
+    *,
+    derived_entries: Sequence[PackageCatalogEntry],
+) -> list[PackageCatalogEntry]:
+    """目标图题已形成 must-link 时，移除与其冲突的旧物理目录项。"""
+
+    result: list[PackageCatalogEntry] = []
+    for entry in entries:
+        if any(
+            target_physical_slot_conflicts(entry, derived)
+            for derived in derived_entries
+        ):
+            continue
+        result.append(entry)
+    return result
+
+
+def target_physical_slot_conflicts(
+    entry: PackageCatalogEntry,
+    derived: PackageCatalogEntry,
+) -> bool:
+    """两项至少两项物理字段相同但整体不同，说明旧目录项被错配。"""
+
+    entry_signature = canonical_physical_metadata(entry)
+    derived_signature = canonical_physical_metadata(derived)
+    if not all(derived_signature):
+        return False
+    if entry_signature == derived_signature:
+        return False
+    equal_fields = sum(
+        1
+        for entry_value, derived_value in zip(entry_signature, derived_signature)
+        if entry_value and derived_value and entry_value == derived_value
+    )
+    return equal_fields >= 2
+
+
+def merge_target_physical_catalog_entry(
+    entries: list[PackageCatalogEntry],
+    incoming: PackageCatalogEntry,
+) -> None:
+    """按完整物理签名合并目标图题派生槽位。"""
+
+    incoming_signature = canonical_physical_metadata(incoming)
+    for existing in entries:
+        if canonical_physical_metadata(existing) != incoming_signature:
+            continue
+        merge_redundant_catalog_evidence(existing, incoming)
+        return
+    entries.append(incoming)
+
+
+def consolidate_target_physical_catalog_entries(
+    entries: Sequence[PackageCatalogEntry],
+    *,
+    target_tables: Sequence[PackageTargetTable],
+    diagnostics: list[dict[str, Any]] | None = None,
+) -> list[PackageCatalogEntry]:
+    """合并订购型号造成的重复物理槽，并删除被强槽覆盖的弱槽。"""
+
+    if not entries:
+        return []
+
+    target_context = "\n".join(
+        target_table_package_context_text(table) for table in target_tables
+    )
+    groups: dict[tuple[str, str, str], list[PackageCatalogEntry]] = {}
+    for entry in entries:
+        signature = canonical_physical_metadata(entry)
+        if all(signature):
+            groups.setdefault(signature, []).append(entry)
+
+    skipped_entry_ids: set[int] = set()
+    merged_signatures: list[tuple[str, str, str]] = []
+    for signature, group in groups.items():
+        if len(group) < 2:
+            continue
+        if should_keep_duplicate_physical_slots(group, target_context):
+            continue
+        representative = group[0]
+        for incoming in group[1:]:
+            merge_redundant_catalog_evidence(representative, incoming)
+            skipped_entry_ids.add(id(incoming))
+        merged_signatures.append(signature)
+
+    strong_entries = [
+        entry
+        for entry in entries
+        if id(entry) not in skipped_entry_ids
+        and all(canonical_physical_metadata(entry))
+    ]
+    removed_weak_entries: list[dict[str, Any]] = []
+    result: list[PackageCatalogEntry] = []
+    for entry in entries:
+        if id(entry) in skipped_entry_ids:
+            continue
+        if (
+            not all(canonical_physical_metadata(entry))
+            and weak_entry_is_covered_by_strong_physical_slot(entry, strong_entries)
+            and not catalog_entry_identity_is_mentioned(entry, target_context)
+        ):
+            removed_weak_entries.append(catalog_entry_debug_dict(entry))
+            continue
+        result.append(entry)
+
+    if diagnostics is not None and (
+        merged_signatures or removed_weak_entries or len(result) != len(entries)
+    ):
+        diagnostics.append(
+            {
+                "stage": "target_physical_catalog_consolidation",
+                "status": "applied",
+                "before": len(entries),
+                "after": len(result),
+                "merged_physical_signatures": [
+                    list(signature) for signature in merged_signatures
+                ],
+                "removed_weak_entries": removed_weak_entries,
+            }
+        )
+    return result
+
+
+def should_keep_duplicate_physical_slots(
+    entries: Sequence[PackageCatalogEntry],
+    target_context: str,
+) -> bool:
+    """同物理封装只有在目标表明确提到多个身份时才保留多个映射槽。"""
+
+    mentioned_identity_keys = {
+        normalize_compact(name)
+        for entry in entries
+        for name in [entry.identity_name, *entry.identity_aliases]
+        if name and identity_name_in_text(name, target_context)
+    }
+    return len(mentioned_identity_keys) >= 2
+
+
+def weak_entry_is_covered_by_strong_physical_slot(
+    entry: PackageCatalogEntry,
+    strong_entries: Sequence[PackageCatalogEntry],
+) -> bool:
+    """弱目录项的已知物理字段完全落在某个强目录项内时可删除。"""
+
+    package_key, drawing_key, pin_count = canonical_physical_metadata(entry)
+    if not package_key:
+        return False
+    known_fields = [
+        (0, package_key),
+        (1, drawing_key),
+        (2, pin_count),
+    ]
+    known_fields = [(index, value) for index, value in known_fields if value]
+    if not known_fields:
+        return False
+    for strong_entry in strong_entries:
+        strong_signature = canonical_physical_metadata(strong_entry)
+        if not all(strong_signature):
+            continue
+        if all(strong_signature[index] == value for index, value in known_fields):
+            return True
+    return False
+
+
+def catalog_entry_identity_is_mentioned(
+    entry: PackageCatalogEntry,
+    text: str,
+) -> bool:
+    """判断目录项身份或别名是否在目标表局部文本中出现。"""
+
+    return any(
+        identity_name_in_text(name, text)
+        for name in [entry.identity_name, *entry.identity_aliases]
+        if name
+    )
+
+
+def catalog_entry_debug_dict(entry: PackageCatalogEntry) -> dict[str, Any]:
+    """用于诊断输出的精简目录项。"""
+
+    return {
+        "identity_name": entry.identity_name,
+        "identity_aliases": list(entry.identity_aliases),
+        "package_type": entry.package_type,
+        "package_drawing": entry.package_drawing,
+        "pin_count": entry.pin_count,
+        "public_label": entry.public_label,
+        "evidence_table_ids": list(entry.evidence_table_ids),
+    }
+
+
 def extract_variant_identities_from_text(text: str) -> list[str]:
     """从目标表局部文本中直接提取 ``基础型号+单字母变体-后缀``。
 
@@ -3236,6 +3560,7 @@ def match_entries_in_text(
 
     normalized_text = normalize_text(text)
     text_pin_counts = explicit_package_pin_counts_from_text(text)
+    text_pin_counts.update(standalone_pin_count_mentions_from_text(text))
     identity_matches = []
     for entry in entries:
         # 器件型号只用于内部关联；封装类型和 Drawing 也可参与绑定。若同一
@@ -3264,7 +3589,18 @@ def match_entries_in_text(
             if text_pin_counts and text_pin_counts.isdisjoint(entry_pin_counts):
                 continue
             matches.append(entry)
-    return matches
+    if matches:
+        return matches
+
+    if text_pin_counts:
+        return [
+            entry
+            for entry in entries
+            if not text_pin_counts.isdisjoint(
+                explicit_package_pin_counts_from_entry(entry)
+            )
+        ]
+    return []
 
 
 def filter_identity_matches_by_package_context(

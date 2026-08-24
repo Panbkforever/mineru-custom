@@ -168,6 +168,19 @@ def resolve_table_title(
     if not raw_lines:
         return clean_group_title_line(previous_title)
 
+    # ``Pin Functions`` 这类无编号局部标题若紧贴表格，优先级高于更早的
+    # 编号表题。否则修订历史或目录中的 ``Table 2 ...`` 会错误挂到真正的
+    # pin 表上。
+    for raw_line in reversed(raw_lines):
+        cleaned_line = clean_group_title_line(raw_line)
+        if not cleaned_line:
+            continue
+        if _is_page_noise(cleaned_line):
+            continue
+        if _looks_like_priority_local_table_title(raw_line):
+            return cleaned_line
+        break
+
     # 编号表题可能与表格之间夹有少量说明文字，因此在整个局部窗口中
     # 反向查找最近一条，而不是只检查最后一行。
     for raw_line in reversed(raw_lines):
@@ -319,6 +332,27 @@ def _looks_like_local_table_title(value: str) -> bool:
     if re.search(r"[A-Za-z]", text) and len(text.split()) > 18:
         return False
     return True
+
+
+def _looks_like_priority_local_table_title(value: str) -> bool:
+    """紧邻表格的宽泛引脚表题优先于窗口中更早的编号表题。"""
+
+    if not _looks_like_local_table_title(value):
+        return False
+    normalized = re.sub(
+        r"[^a-z0-9\u4e00-\u9fff]+",
+        "",
+        clean_group_title_line(value).lower(),
+    )
+    return normalized in {
+        "pinfunction",
+        "pinfunctions",
+        "terminalfunction",
+        "terminalfunctions",
+        "引脚功能",
+        "端子功能",
+        "管脚功能",
+    }
 
 
 def _is_page_noise(value: str) -> bool:

@@ -1889,6 +1889,52 @@ def is_broad_pin_table_title(value: str) -> bool:
     }
 
 
+PACKAGE_FIGURE_TITLE_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?:[A-Z0-9]{2,8}\s+Package\s*)?"
+    r"\d{1,4}\s*[- ]?\s*pin(?:s)?\s+"
+    r"(?:HTSSOP|HVSSOP|TSSOP|VSSOP|SSOP|HTQFP|TQFP|LQFP|QFP|"
+    r"VQFN|WQFN|QFN|DFN|SON|X2SON|HSBGA|NFBGA|LFBGA|FBGA|PBGA|"
+    r"DSBGA|BGA|FCCSP|FCBGA|WCSP|CSP|SOIC|MSOP|SOT|SC)"
+    r"(?![A-Za-z0-9])",
+    flags=re.IGNORECASE,
+)
+
+
+def extract_package_figure_title(value: str) -> str:
+    """识别不带 Figure 编号、但明确描述封装图的标题。"""
+
+    text = clean_group_name(value)
+    if not text:
+        return ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for width in (1, 2, 3):
+        for start in range(0, len(lines) - width + 1):
+            end = start + width
+            segment = join_group_titles(*lines[start:end])
+            one_line = re.sub(r"\s+", " ", segment)
+            if not PACKAGE_FIGURE_TITLE_RE.search(one_line):
+                continue
+            if (
+                width == 1
+                and start > 0
+                and re.fullmatch(
+                    r"[A-Z0-9]{2,8}\s+Package",
+                    lines[start - 1],
+                    flags=re.IGNORECASE,
+                )
+            ):
+                start -= 1
+            while end < len(lines) and re.fullmatch(
+                r"[\(（]?\s*Top\s+View\s*[\)）]?",
+                lines[end],
+                flags=re.IGNORECASE,
+            ):
+                end += 1
+            return join_group_titles(*lines[start:end])
+    return ""
+
+
 def local_package_index_for_bound_row(
     plan: MultiPackagePlan,
     bound_row: BoundPackageRow,
@@ -2080,10 +2126,21 @@ def figure_context_for_table(table_title: str, pending_texts: Sequence[str]) -> 
 
     if not is_broad_pin_table_title(table_title):
         return ""
-    for text in reversed(list(pending_texts)):
+    texts = list(pending_texts)
+    for index in range(len(texts) - 1, -1, -1):
+        text = texts[index]
         figure_title = extract_figure_title(text)
         if figure_title:
             return figure_title
+        # 很多 TI 文档的封装图题没有 Figure 编号，并且可能被 Markdown
+        # 拆成相邻两行：``DGS Package`` / ``10-Pin VSSOP``。用最多三行
+        # 局部窗口恢复完整图题，仍只在宽泛 Pin Functions 表上启用。
+        for start in range(max(0, index - 2), index + 1):
+            package_figure_title = extract_package_figure_title(
+                join_group_titles(*texts[start : index + 1])
+            )
+            if package_figure_title:
+                return package_figure_title
     return ""
 
 
