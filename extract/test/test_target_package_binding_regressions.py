@@ -64,6 +64,9 @@ def test_broad_pin_functions_uses_nearby_package_figure_title_window():
             "DGS Package",
             "10-Pin VSSOP",
             "(Top View)",
+            "![](images/package.jpg)",
+            "Not to scale",
+            "Pin Functions",
         ],
     )
 

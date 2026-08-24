@@ -1935,6 +1935,24 @@ def extract_package_figure_title(value: str) -> str:
     return ""
 
 
+def is_package_figure_context_noise_line(value: str, table_title: str) -> bool:
+    """找封装图题时跳过图片链接、比例说明和当前表题自身。"""
+
+    text = clean_group_name(value)
+    if not text:
+        return True
+    if is_broad_pin_table_title(text) and clean_group_name(text) == clean_group_name(
+        table_title
+    ):
+        return True
+    if re.fullmatch(r"!\[[^]]*]\([^)]+\)", text):
+        return True
+    return normalize_header(text) in {
+        "not to scale",
+        "not drawn to scale",
+    }
+
+
 def local_package_index_for_bound_row(
     plan: MultiPackagePlan,
     bound_row: BoundPackageRow,
@@ -2126,7 +2144,11 @@ def figure_context_for_table(table_title: str, pending_texts: Sequence[str]) -> 
 
     if not is_broad_pin_table_title(table_title):
         return ""
-    texts = list(pending_texts)
+    texts = [
+        text
+        for text in pending_texts
+        if not is_package_figure_context_noise_line(text, table_title)
+    ]
     for index in range(len(texts) - 1, -1, -1):
         text = texts[index]
         figure_title = extract_figure_title(text)
