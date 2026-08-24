@@ -2363,15 +2363,15 @@ def explicit_package_mentions_from_text(text: str) -> list[tuple[str, str]]:
     package_pattern = PACKAGE_FAMILY_PATTERN
     patterns = [
         # VQFN (20), VQFN-HR (14), HVSSOP (28)
-        rf"(?<![A-Za-z0-9])(?P<pkg>{package_pattern}(?:[- ][A-Za-z0-9]+)?)\s*[\(（]\s*(?P<count>\d{{1,4}})\s*[\)）]",
+        rf"(?<![A-Za-z0-9])(?P<pkg>{package_pattern}(?:[- ][A-Za-z0-9]+)?)[ \t]*[\(（][ \t]*(?P<count>\d{{1,4}})[ \t]*[\)）]",
         # 20-Pin VQFN, 20 pin VQFN
-        rf"(?<![A-Za-z0-9])(?P<count>\d{{1,4}})\s*[- ]?\s*pin(?:s)?\s+(?P<pkg>{package_pattern}(?:[- ][A-Za-z0-9]+)?)(?![A-Za-z0-9])",
+        rf"(?<![A-Za-z0-9])(?P<count>\d{{1,4}})[ \t]*[- ]?[ \t]*pin(?:s)?[ \t]+(?P<pkg>{package_pattern}(?:[- ][A-Za-z0-9]+)?)(?![A-Za-z0-9])",
         # VQFN 20-pin, VQFN 20 pin
-        rf"(?<![A-Za-z0-9])(?P<pkg>{package_pattern}(?:[- ][A-Za-z0-9]+)?)\s+(?P<count>\d{{1,4}})\s*[- ]?\s*pin(?:s)?(?![A-Za-z0-9])",
+        rf"(?<![A-Za-z0-9])(?P<pkg>{package_pattern}(?:[- ][A-Za-z0-9]+)?)[ \t]+(?P<count>\d{{1,4}})[ \t]*[- ]?[ \t]*pin(?:s)?(?![A-Za-z0-9])",
         # QFN 32 Pin Functions, BGA 64 package
-        rf"(?<![A-Za-z0-9])(?P<pkg>{package_pattern})\s+(?P<count>\d{{1,4}})\s+(?:pin|pins|package|pkg)(?![A-Za-z0-9])",
+        rf"(?<![A-Za-z0-9])(?P<pkg>{package_pattern})[ \t]+(?P<count>\d{{1,4}})[ \t]+(?:pin|pins|package|pkg)(?![A-Za-z0-9])",
         # QFN 32, BGA 64
-        rf"(?<![A-Za-z0-9])(?P<pkg>{package_pattern})\s+(?P<count>\d{{1,4}})(?![A-Za-z0-9])",
+        rf"(?<![A-Za-z0-9])(?P<pkg>{package_pattern})[ \t]+(?P<count>\d{{1,4}})(?![A-Za-z0-9])",
     ]
     result: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -3327,15 +3327,15 @@ def explicit_package_pin_counts_from_text(value: str) -> set[str]:
     package_pattern = PACKAGE_FAMILY_PATTERN
     patterns = [
         # VQFN (20), VQFN-HR (14), HVSSOP (28)
-        rf"(?<![A-Za-z0-9]){package_pattern}(?:[- ][A-Za-z0-9]+)?\s*[\(（]\s*(\d{{1,4}})\s*[\)）]",
+        rf"(?<![A-Za-z0-9]){package_pattern}(?:[- ][A-Za-z0-9]+)?[ \t]*[\(（][ \t]*(\d{{1,4}})[ \t]*[\)）]",
         # 20-Pin VQFN, 20 pin VQFN
-        rf"(?<![A-Za-z0-9])(\d{{1,4}})\s*[- ]?\s*pin(?:s)?\s+{package_pattern}(?![A-Za-z0-9])",
+        rf"(?<![A-Za-z0-9])(\d{{1,4}})[ \t]*[- ]?[ \t]*pin(?:s)?[ \t]+{package_pattern}(?![A-Za-z0-9])",
         # VQFN 20-pin, VQFN 20 pin
-        rf"(?<![A-Za-z0-9]){package_pattern}(?:[- ][A-Za-z0-9]+)?\s+(\d{{1,4}})\s*[- ]?\s*pin(?:s)?(?![A-Za-z0-9])",
+        rf"(?<![A-Za-z0-9]){package_pattern}(?:[- ][A-Za-z0-9]+)?[ \t]+(\d{{1,4}})[ \t]*[- ]?[ \t]*pin(?:s)?(?![A-Za-z0-9])",
         # QFN 32 Pin Functions, BGA 64 package
-        rf"(?<![A-Za-z0-9]){package_pattern}\s+(\d{{1,4}})\s+(?:pin|pins|package|pkg)(?![A-Za-z0-9])",
+        rf"(?<![A-Za-z0-9]){package_pattern}[ \t]+(\d{{1,4}})[ \t]+(?:pin|pins|package|pkg)(?![A-Za-z0-9])",
         # QFN 32, BGA 64
-        rf"(?<![A-Za-z0-9]){package_pattern}\s+(\d{{1,4}})(?![A-Za-z0-9])",
+        rf"(?<![A-Za-z0-9]){package_pattern}[ \t]+(\d{{1,4}})(?![A-Za-z0-9])",
     ]
     for pattern in patterns:
         for match in re.finditer(pattern, text, flags=re.IGNORECASE):
