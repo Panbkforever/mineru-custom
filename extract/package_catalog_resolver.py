@@ -3227,6 +3227,36 @@ def bind_target_tables(
                 continue
 
             effective_labels = list(link_resolution.effective_labels)
+            if len(entries) < len(effective_labels):
+                # 这张表已经被确认有多个局部分支，但文档级目录槽位不足以做
+                # 一对一绑定。这里必须保守跳过该表，不能硬崩批量任务，也不能
+                # 复用槽位误绑到错误 pkg。
+                for local_slot, local_label in enumerate(local_labels):
+                    effective_label = (
+                        effective_labels[local_slot]
+                        if local_slot < len(effective_labels)
+                        else None
+                    )
+                    append_package_binding_diagnostic(
+                        diagnostics,
+                        table=table,
+                        local_slot=local_slot,
+                        local_label=local_label,
+                        assignment=None,
+                        reason="package_catalog_slot_shortage",
+                        matched_entries=[],
+                        entries=entries,
+                        effective_label=effective_label,
+                        link_sources=link_resolution.sources_by_slot.get(
+                            local_slot,
+                            (),
+                        ),
+                    )
+                if chapter_context_key(table) != previous_context:
+                    previous_explicit = None
+                    previous_context = ""
+                continue
+
             bound_entries = bind_multi_package_entries(entries, effective_labels)
             for local_slot, (local_label, entry) in enumerate(
                 zip(local_labels, bound_entries)
@@ -3404,9 +3434,7 @@ def bind_multi_package_entries(
     """
 
     if len(entries) < len(local_labels):
-        raise ValueError(
-            "package catalog has fewer slots than confirmed table branches"
-        )
+        return []
 
     score_matrix = [
         [

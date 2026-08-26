@@ -42,6 +42,19 @@ def target_table(
     )
 
 
+class DummyBinding:
+    def __init__(self, package: str):
+        self.package = package
+
+
+class DummyPlan:
+    is_multi_package = True
+    mode = "package_columns"
+
+    def __init__(self, packages):
+        self.bindings = tuple(DummyBinding(package) for package in packages)
+
+
 def identity_summary_classifier(_table, _source_name, _target_tables):
     return {
         "is_package_summary": True,
@@ -157,3 +170,48 @@ def test_target_package_figure_physical_slots_override_bad_catalog_mix():
     ] == [("DSBGA", "YZF", "9"), ("VSSOP", "DGS", "10")]
     assert resolution.assignment_for(201, 0).pkg == "DSBGA"
     assert resolution.assignment_for(202, 0).pkg == "VSSOP"
+
+
+def test_multi_package_slot_shortage_is_unresolved_not_crash():
+    entries = [
+        PackageCatalogEntry(package_key="", package_type="FCCSP", package_drawing="CBP"),
+        PackageCatalogEntry(package_key="", package_type="FCCSP", package_drawing="CBC"),
+    ]
+    freeze_package_slots(entries)
+    table = target_table(
+        301,
+        "Pin Functions",
+        "Pin Functions",
+        headers=(
+            "Signal Name",
+            "Description",
+            "Pkg A Pin",
+            "Pkg B Pin",
+            "Pkg C Pin",
+        ),
+    )
+    diagnostics = []
+
+    assignments = bind_target_tables(
+        entries=entries,
+        target_tables=[table],
+        multi_package_plans={
+            301: DummyPlan(
+                [
+                    "Pkg A",
+                    "Pkg B",
+                    "Pkg C",
+                ]
+            )
+        },
+        multi_pkg_tab_resolution=None,
+        diagnostics=diagnostics,
+    )
+
+    assert assignments == {}
+    shortage = [
+        item for item in diagnostics
+        if item.get("reason") == "package_catalog_slot_shortage"
+    ]
+    assert len(shortage) == 3
+    assert {item["status"] for item in shortage} == {"unresolved"}
