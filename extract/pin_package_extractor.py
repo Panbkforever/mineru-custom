@@ -127,7 +127,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from extract.special_table_handlers import find_special_table_match
 from extract.parallel_cell_splitter import (
@@ -508,6 +508,11 @@ def extract_pin_package_info_from_table_candidates(
         )
         multi_package_plans[item["table_id"]] = plan
         item["debug"]["multi_package_plan"] = plan_to_debug(plan)
+        item["debug"]["target_local_slots"] = build_target_local_slots_debug(
+            table=item["table"],
+            headers=item["headers"],
+            plan=plan,
+        )
 
     # 第四阶段：使用全文表格冻结物理封装槽位，并为每张已确认的引脚表
     # 绑定已有槽位。封装判断与行提取保持分离，此处仍不创建 pin 记录。
@@ -1860,6 +1865,283 @@ def build_public_group_name(table_title: str, figure_title: str = "") -> str:
     if figure_title and is_broad_pin_table_title(table_title):
         return join_group_titles(table_title, figure_title)
     return table_title
+
+
+LOCAL_SLOT_PACKAGE_FAMILY_PATTERN = (
+    r"(?:HTSSOP|HVSSOP|TSSOP|VSSOP|SSOP|HTQFP|TQFP|LQFP|QFP|"
+    r"VQFN|WQFN|QFN|DFN|WSON|SON|X2SON|HSBGA|NFBGA|LFBGA|FBGA|PBGA|"
+    r"DSBGA|BGA|FCCSP|FCBGA|WCSP|CSP|SOIC|MSOP|SOT|SC|s-PBGA|PBGA)"
+)
+
+
+def build_target_local_slots_debug(
+    *,
+    table: TableCandidate,
+    headers: Sequence[str],
+    plan: MultiPackagePlan,
+) -> list[dict[str, Any]]:
+    """构建每张目标表自己的局部封装槽调试信息，不参与最终绑定。
+
+    这一步只用于观察混合 PDF 中“当前表自身有几个槽、槽证据来自哪里”。
+    输出结果不会反向修改 ``multi_package_plan``、package catalog 或最终 JSON。
+    """
+
+    context = target_local_slot_context_text(table, headers)
+    mentions = target_local_physical_mentions_from_text(context)
+    identities = target_local_identity_candidates_from_text(context)
+
+    if plan.is_multi_package:
+        labels = [binding.package for binding in plan.bindings]
+        mode = plan.mode
+    else:
+        labels = [single_local_slot_label_from_context(context)]
+        mode = "single_package"
+
+    result: list[dict[str, Any]] = []
+    for local_slot, label in enumerate(labels):
+        slot = {
+            "local_slot": local_slot,
+            "local_label": label,
+            "mode": mode,
+            "identity_name": "",
+            "package_type": "",
+            "package_drawing": "",
+            "pin_count": "",
+            "sources": [],
+        }
+        if label:
+            slot["sources"].append("multi_package_plan" if plan.is_multi_package else "table_context")
+
+        matched_mentions = [
+            mention
+            for mention in mentions
+            if local_slot_label_matches_text(label, mention.get("text", ""))
+        ]
+        if not matched_mentions and len(mentions) == 1:
+            matched_mentions = mentions
+
+        for key in ("package_type", "package_drawing", "pin_count"):
+            value = unique_slot_metadata_value(matched_mentions, key)
+            if not value:
+                value = unique_slot_metadata_value(mentions, key)
+            if value:
+                slot[key] = value
+                if "table_context" not in slot["sources"]:
+                    slot["sources"].append("table_context")
+
+        identity = identity_for_local_slot(label, identities, matched_mentions)
+        if identity:
+            slot["identity_name"] = identity
+            if "identity_text" not in slot["sources"]:
+                slot["sources"].append("identity_text")
+
+        slot["sources"] = sorted(dict.fromkeys(slot["sources"]))
+        result.append(slot)
+    return result
+
+
+def target_local_slot_context_text(
+    table: TableCandidate,
+    headers: Sequence[str],
+) -> str:
+    """拼接仅供 local slots debug 使用的表级上下文。"""
+
+    return join_group_titles(
+        table.title,
+        table.group_context,
+        table.figure_context_title,
+        *table.current_chapter_titles,
+        " ".join(str(header or "") for header in headers),
+    )
+
+
+def target_local_physical_mentions_from_text(text: str) -> list[dict[str, str]]:
+    """从表题/图题/章节/表头中抽取局部物理封装证据。"""
+
+    value = re.sub(r"\s+", " ", str(text or ""))
+    package_pattern = LOCAL_SLOT_PACKAGE_FAMILY_PATTERN
+    patterns = [
+        # DRV8320H RTV Package 32-Pin WQFN
+        rf"(?<![A-Za-z0-9])"
+        rf"(?:(?P<identity>[A-Za-z][A-Za-z0-9]{{2,24}}\d[A-Za-z0-9]*"
+        rf"(?:[-–—]\s*[A-Za-z0-9]{{1,8}})?)\s+)?"
+        rf"(?P<drawing>[A-Z0-9]{{2,8}})\s+Package\s+"
+        rf"(?P<count>\d{{1,4}})\s*[- ]?\s*pin(?:s)?\s+"
+        rf"(?P<package_type>{package_pattern})(?![A-Za-z0-9])",
+        # VQFN (RVJ) 56-Pin Package / HTQFP (PHP) 48-Pin
+        rf"(?<![A-Za-z0-9])(?P<package_type>{package_pattern})\s*"
+        rf"[\(（](?P<drawing>[A-Z0-9]{{2,8}})[\)）]\s*"
+        rf"(?P<count>\d{{1,4}})\s*[- ]?\s*pin(?:s)?",
+        # DSG Package 8-Pin WSON
+        rf"(?<![A-Za-z0-9])(?P<drawing>[A-Z0-9]{{2,8}})\s+Package\s+"
+        rf"(?P<count>\d{{1,4}})\s*[- ]?\s*pin(?:s)?\s+"
+        rf"(?P<package_type>{package_pattern})(?![A-Za-z0-9])",
+        # 32-Pin WQFN / 8-Pin WSON
+        rf"(?<![A-Za-z0-9])(?P<count>\d{{1,4}})\s*[- ]?\s*pin(?:s)?\s+"
+        rf"(?P<package_type>{package_pattern})(?![A-Za-z0-9])",
+        # CBP Pkg. / CBC Package / CUS package
+        rf"(?<![A-Za-z0-9])(?P<drawing>[A-Z]{{2,4}})\s+Pkg\.?(?![A-Za-z0-9])",
+        rf"(?<![A-Za-z0-9])(?P<drawing>[A-Z]{{2,4}})\s+Package(?![A-Za-z0-9])",
+    ]
+    result: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str, str, str]] = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, value, flags=re.IGNORECASE):
+            mention = {
+                "text": match.group(0),
+                "identity_name": clean_local_identity(match.groupdict().get("identity", "")),
+                "package_type": clean_local_package_type(match.groupdict().get("package_type", "")),
+                "package_drawing": clean_local_package_drawing(match.groupdict().get("drawing", "")),
+                "pin_count": clean_local_pin_count(match.groupdict().get("count", "")),
+            }
+            key = (
+                normalize_header(mention["text"]),
+                normalize_header(mention["identity_name"]),
+                normalize_header(mention["package_type"]),
+                normalize_header(mention["package_drawing"]),
+                mention["pin_count"],
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(mention)
+    return result
+
+
+def target_local_identity_candidates_from_text(text: str) -> list[str]:
+    """提取表级上下文中可能代表 symbol/器件变体的 identity。"""
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for token in re.findall(
+        r"(?<![A-Za-z0-9])"
+        r"([A-Za-z][A-Za-z0-9]{2,24}\d[A-Za-z0-9]*"
+        r"(?:\s*[-–—]\s*[A-Za-z0-9]{1,8})?)"
+        r"(?![A-Za-z0-9])",
+        str(text or ""),
+    ):
+        identity = clean_local_identity(token)
+        key = normalize_header(identity)
+        if not identity or key in seen:
+            continue
+        if is_local_generic_identity(identity):
+            continue
+        seen.add(key)
+        result.append(identity)
+    return result
+
+
+def single_local_slot_label_from_context(context: str) -> str:
+    """单封装表 debug 中尽量给出一个局部标签。"""
+
+    for mention in target_local_physical_mentions_from_text(context):
+        for key in ("package_drawing", "identity_name", "package_type"):
+            value = mention.get(key, "")
+            if value:
+                return value
+    return ""
+
+
+def local_slot_label_matches_text(label: str, text: str) -> bool:
+    """判断 local label 是否在某段证据文本中独立出现。"""
+
+    label_key = normalize_header(label)
+    text_key = normalize_header(text)
+    return bool(label_key and label_key in text_key)
+
+
+def unique_slot_metadata_value(
+    mentions: Sequence[dict[str, str]],
+    key: str,
+) -> str:
+    """返回 mentions 中唯一非空元数据；不唯一则留空。"""
+
+    values = [
+        str(mention.get(key, "") or "")
+        for mention in mentions
+        if str(mention.get(key, "") or "")
+    ]
+    unique = list(dict.fromkeys(values))
+    return unique[0] if len(unique) == 1 else ""
+
+
+def identity_for_local_slot(
+    label: str,
+    identities: Sequence[str],
+    mentions: Sequence[dict[str, str]],
+) -> str:
+    """为 debug local slot 选择最可信的 identity。"""
+
+    label = clean_local_identity(label)
+    if label and identity_like_token(label):
+        return label
+
+    mention_identity = unique_slot_metadata_value(mentions, "identity_name")
+    if mention_identity:
+        return mention_identity
+
+    matching_identities = [
+        identity
+        for identity in identities
+        if local_slot_label_matches_text(label, identity)
+    ]
+    unique = list(dict.fromkeys(matching_identities))
+    if len(unique) == 1:
+        return unique[0]
+    return ""
+
+
+def clean_local_identity(value: Any) -> str:
+    """清理 local slot debug 中的 identity。"""
+
+    value = re.sub(r"\s*[-–—]\s*", "-", str(value or ""))
+    value = re.sub(r"\s+", " ", value).strip(" \t\r\n,;:()[]")
+    return value if value and len(value) <= 32 else ""
+
+
+def clean_local_package_type(value: Any) -> str:
+    """清理 local slot debug 中的 package type。"""
+
+    value = re.sub(r"\s+", " ", str(value or "")).strip(" \t\r\n,;:()[]")
+    return value.upper() if value else ""
+
+
+def clean_local_package_drawing(value: Any) -> str:
+    """清理 local slot debug 中的 drawing/package code。"""
+
+    value = re.sub(r"\s+", " ", str(value or "")).strip(" \t\r\n,;:()[]")
+    return value.upper() if value and len(value) <= 12 else ""
+
+
+def clean_local_pin_count(value: Any) -> str:
+    """清理 local slot debug 中的 pin_count。"""
+
+    match = re.search(r"\d+", str(value or ""))
+    return match.group(0) if match else ""
+
+
+def identity_like_token(value: str) -> bool:
+    """局部标签是否像器件/symbol identity，而不是 QFN24/CBP 这种封装标签。"""
+
+    text = normalize_header(value)
+    if not re.search(r"[a-z]", text) or not re.search(r"\d", text):
+        return False
+    if re.fullmatch(
+        r"(?:qfn|vqfn|wqfn|wson|bga|pbga|fccsp|tssop|vssop|hvssop|htqfp)\d+",
+        text,
+    ):
+        return False
+    return True
+
+
+def is_local_generic_identity(value: str) -> bool:
+    """排除明显不是器件 identity 的局部 token。"""
+
+    text = normalize_header(value)
+    return bool(
+        text in {"table1", "table2", "figure1", "figure2"}
+        or re.fullmatch(r"(?:qfn|vqfn|wqfn|wson|bga|pbga|fccsp)\d+", text)
+    )
 
 
 def is_broad_pin_table_title(value: str) -> bool:
