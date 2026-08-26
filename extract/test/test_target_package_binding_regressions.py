@@ -215,3 +215,74 @@ def test_multi_package_slot_shortage_is_unresolved_not_crash():
     ]
     assert len(shortage) == 3
     assert {item["status"] for item in shortage} == {"unresolved"}
+
+
+def test_bottom_top_headers_bind_to_same_package_from_table_title():
+    entries = [
+        PackageCatalogEntry(package_key="", package_type="FCCSP", package_drawing="CBP"),
+        PackageCatalogEntry(package_key="", package_type="FCCSP", package_drawing="CBC"),
+    ]
+    freeze_package_slots(entries)
+    table = target_table(
+        401,
+        "Table 2-1. Ball Characteristics (CBP Pkg.)(3)",
+        "Table 2-1. Ball Characteristics (CBP Pkg.)(3)",
+        headers=("BOTTOM", "TOP", "SIGNAL NAME", "TYPE"),
+    )
+    diagnostics = []
+
+    assignments = bind_target_tables(
+        entries=entries,
+        target_tables=[table],
+        multi_package_plans={401: DummyPlan(["BOTTOM", "TOP"])},
+        multi_pkg_tab_resolution=None,
+        diagnostics=diagnostics,
+    )
+
+    assert assignments[(401, 0)].package_key == entries[0].package_key
+    assert assignments[(401, 1)].package_key == entries[0].package_key
+    assert [
+        item.get("effective_label")
+        for item in diagnostics
+        if item.get("reason") == "package_side_label"
+    ] == ["CBP", "CBP"]
+
+
+def test_bottom_top_package_labels_bind_to_same_package():
+    entries = [
+        PackageCatalogEntry(package_key="", package_type="FCCSP", package_drawing="CBP"),
+        PackageCatalogEntry(package_key="", package_type="FCCSP", package_drawing="CBC"),
+    ]
+    freeze_package_slots(entries)
+    table = target_table(
+        402,
+        "Table 2-5. External Memory Interfaces – GPMC Signals Description",
+        "Table 2-5. External Memory Interfaces – GPMC Signals Description",
+        headers=(
+            "Signal Name",
+            "BOTTOM CBP Pkg.",
+            "TOP CBP Pkg.",
+            "BOTTOM CBC Pkg.",
+        ),
+    )
+    diagnostics = []
+
+    assignments = bind_target_tables(
+        entries=entries,
+        target_tables=[table],
+        multi_package_plans={
+            402: DummyPlan(
+                [
+                    "BOTTOM CBP Pkg.",
+                    "TOP CBP Pkg.",
+                    "BOTTOM CBC Pkg.",
+                ]
+            )
+        },
+        multi_pkg_tab_resolution=None,
+        diagnostics=diagnostics,
+    )
+
+    assert assignments[(402, 0)].package_key == entries[0].package_key
+    assert assignments[(402, 1)].package_key == entries[0].package_key
+    assert assignments[(402, 2)].package_key == entries[1].package_key

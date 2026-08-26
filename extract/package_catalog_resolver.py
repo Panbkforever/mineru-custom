@@ -3203,6 +3203,50 @@ def bind_target_tables(
         # 多封装表必须把全部分支作为一个整体绑定。若逐个分支独立匹配，两个
         # 模糊标签可能同时落入第一个槽位，导致本应分开的 pkg 再次合并。
         if plan_creates_package_slots(plan) and len(local_labels) >= 2:
+            side_effective_labels = normalize_package_side_local_labels(
+                table,
+                local_labels,
+            )
+            if side_effective_labels is not None:
+                for local_slot, (local_label, effective_label) in enumerate(
+                    zip(local_labels, side_effective_labels)
+                ):
+                    matches = match_entries_in_text(entries, effective_label)
+                    if len(matches) == 1:
+                        assignment = assignment_from_entry(
+                            matches[0],
+                            entries,
+                            reason="package_side_label",
+                        )
+                    else:
+                        assignment = None
+                    reason = (
+                        assignment.reason
+                        if assignment is not None
+                        else (
+                            "ambiguous_package_side_label"
+                            if len(matches) > 1
+                            else "package_side_label_unresolved"
+                        )
+                    )
+                    append_package_binding_diagnostic(
+                        diagnostics,
+                        table=table,
+                        local_slot=local_slot,
+                        local_label=local_label,
+                        assignment=assignment,
+                        reason=reason,
+                        matched_entries=matches,
+                        entries=entries,
+                        effective_label=effective_label,
+                    )
+                    if assignment is not None:
+                        assignments[(table.table_id, local_slot)] = assignment
+                if chapter_context_key(table) != previous_context:
+                    previous_explicit = None
+                    previous_context = ""
+                continue
+
             link_resolution = resolve_table_symbol_package_links(
                 table,
                 local_labels,
@@ -3445,6 +3489,116 @@ def bind_multi_package_entries(
     ]
     selected_slots = maximum_weight_unique_assignment(score_matrix)
     return [entries[entry_slot] for entry_slot in selected_slots]
+
+
+def normalize_package_side_local_labels(
+    table: PackageTargetTable,
+    local_labels: Sequence[str],
+) -> tuple[str, ...] | None:
+    """把 BOTTOM/TOP 这类封装面标签归一到真实 package label。
+
+    例如 ``BOTTOM CBP Pkg.`` 和 ``TOP CBP Pkg.`` 都表示 CBP 封装的不同面，
+    不是两个独立 symbol。若表头只有 ``BOTTOM``/``TOP``，则从表题/表上下文的
+    ``(CBP Pkg.)`` 中补出 CBP。
+    """
+
+    if not local_labels:
+        return None
+
+    context_label = package_side_context_label(table)
+    normalized: list[str] = []
+    changed = False
+    saw_side_label = False
+    for label in local_labels:
+        side_label = package_label_from_side_local_label(label)
+        if side_label:
+            normalized.append(side_label)
+            changed = changed or side_label != label
+            saw_side_label = True
+            continue
+        if is_bare_package_side_label(label) and context_label:
+            normalized.append(context_label)
+            changed = True
+            saw_side_label = True
+            continue
+        normalized.append(label)
+
+    if not saw_side_label or not changed:
+        return None
+    return tuple(normalized)
+
+
+def package_label_from_side_local_label(value: str) -> str:
+    """从 ``BOTTOM CBP Pkg.`` / ``TOP CBC Pkg. 2`` 中提取 CBP/CBC。"""
+
+    match = re.fullmatch(
+        r"\s*(?:bottom|top)\b\s+(?P<body>.*?)\s*",
+        str(value or ""),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    body = clean_metadata(match.group("body"))
+    body = re.sub(
+        r"(?<![A-Za-z0-9])(?:pkg|package)(?![A-Za-z0-9])\.?",
+        " ",
+        body,
+        flags=re.IGNORECASE,
+    )
+    body = re.sub(r"\s*[\(（]?\s*\d+\s*[\)）]?\s*$", "", body)
+    body = re.sub(r"\s+", " ", body).strip(" \t\r\n,;:.")
+    return body if package_side_label_is_usable(body) else ""
+
+
+def is_bare_package_side_label(value: str) -> bool:
+    """判断标签是否只是 BOTTOM/TOP，不含真实 package 名称。"""
+
+    return bool(re.fullmatch(r"\s*(?:bottom|top)\s*", str(value or ""), re.IGNORECASE))
+
+
+def package_side_context_label(table: PackageTargetTable) -> str:
+    """从当前表题/上下文中提取唯一的 ``CBP Pkg.`` 这类 package label。"""
+
+    labels: dict[str, str] = {}
+    for text in [
+        table.title,
+        table.group_context,
+        *table.current_chapter_titles,
+        *table.headers,
+    ]:
+        for label in package_labels_from_pkg_text(text):
+            labels.setdefault(normalize_compact(label), label)
+    return next(iter(labels.values())) if len(labels) == 1 else ""
+
+
+def package_labels_from_pkg_text(text: str) -> tuple[str, ...]:
+    """提取文本里的短 package label，例如 ``(CBP Pkg.)``。"""
+
+    result: dict[str, str] = {}
+    for match in re.finditer(
+        r"(?<![A-Za-z0-9])(?P<label>[A-Za-z][A-Za-z0-9-]{0,14})"
+        r"\s*(?:pkg|package)\.?(?![A-Za-z0-9])",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    ):
+        label = clean_metadata(match.group("label"))
+        if package_side_label_is_usable(label):
+            result.setdefault(normalize_compact(label), label)
+    return tuple(result.values())
+
+
+def package_side_label_is_usable(value: str) -> bool:
+    """封装面归一化只接受短 package/drawing 标签，拒绝长描述。"""
+
+    value = clean_metadata(value)
+    return bool(
+        value
+        and len(value) <= 15
+        and "|" not in value
+        and "\n" not in value
+        and re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,14}", value)
+        and not is_bare_package_side_label(value)
+    )
 
 
 def maximum_weight_unique_assignment(
