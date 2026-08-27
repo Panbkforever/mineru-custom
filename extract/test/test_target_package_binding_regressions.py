@@ -265,6 +265,51 @@ def test_target_package_figure_physical_slots_override_bad_catalog_mix():
     assert resolution.assignment_for(202, 0).pkg == "VSSOP"
 
 
+def test_plan_local_identity_variants_create_catalog_slots_before_binding():
+    catalog = catalog_table(
+        1,
+        "Device Information",
+        ["PART NUMBER", "PACKAGE", "PACKAGE DRAWING", "PINS"],
+        [
+            ["PART NUMBER", "PACKAGE", "PACKAGE DRAWING", "PINS"],
+            ["DRV8350", "WQFN", "RTV", "32"],
+            ["DRV8350R", "VQFN", "RGZ", "48"],
+        ],
+    )
+    target_a = target_table(
+        501,
+        "Pin Functions—32-Pin DRV8350 Devices",
+        "Pin Functions—32-Pin DRV8350 Devices",
+        headers=("NAME", "DRV8350H PIN", "DRV8350S PIN", "TYPE"),
+    )
+    target_b = target_table(
+        502,
+        "Pin Functions—48-Pin DRV8350R Devices",
+        "Pin Functions—48-Pin DRV8350R Devices",
+        headers=("NAME", "DRV8350RH PIN", "DRV8350RS PIN", "TYPE"),
+    )
+
+    resolution = resolve_document_package_catalog(
+        all_tables=[catalog],
+        target_tables=[target_a, target_b],
+        multi_package_plans={
+            501: DummyPlan(["DRV8350H", "DRV8350S"]),
+            502: DummyPlan(["DRV8350RH", "DRV8350RS"]),
+        },
+        use_semantic_classifier=True,
+        classifier=identity_summary_classifier,
+    )
+
+    assert [
+        entry.identity_name
+        for entry in resolution.entries
+    ] == ["DRV8350H", "DRV8350S", "DRV8350RH", "DRV8350RS"]
+    assert resolution.assignment_for(501, 0).package_key == "slot:0"
+    assert resolution.assignment_for(501, 1).package_key == "slot:1"
+    assert resolution.assignment_for(502, 0).package_key == "slot:2"
+    assert resolution.assignment_for(502, 1).package_key == "slot:3"
+
+
 def test_multi_package_slot_shortage_is_unresolved_not_crash():
     entries = [
         PackageCatalogEntry(package_key="", package_type="FCCSP", package_drawing="CBP"),

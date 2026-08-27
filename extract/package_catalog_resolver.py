@@ -284,6 +284,12 @@ def resolve_document_package_catalog(
         target_tables=target_tables,
         diagnostics=diagnostics,
     )
+    entries = add_target_plan_identity_variant_catalog_entries(
+        entries,
+        target_tables=target_tables,
+        multi_package_plans=multi_package_plans,
+        diagnostics=diagnostics,
+    )
     entries = add_target_figure_physical_catalog_entries(
         entries,
         target_tables=target_tables,
@@ -2332,6 +2338,172 @@ def merge_target_figure_variant_catalog_entry(
         merge_redundant_catalog_evidence(existing, incoming)
         return
     entries.append(incoming)
+
+
+def add_target_plan_identity_variant_catalog_entries(
+    entries: Sequence[PackageCatalogEntry],
+    *,
+    target_tables: Sequence[PackageTargetTable],
+    multi_package_plans: Mapping[int, MultiPackagePlanLike],
+    diagnostics: list[dict[str, Any]] | None = None,
+) -> list[PackageCatalogEntry]:
+    """从表头已确认的 local identity 分支补建 H/S/P 变体槽位。
+
+    ``multi_package_plan`` 已经把 ``DRV8350H``、``DRV8350S`` 这类完整表头
+    分支识别出来。若它们能唯一关联到目录中的基础型号 ``DRV8350``，则在
+    freeze 前创建独立槽位；绑定阶段自然会按 identity 精确命中。
+    """
+
+    if not entries or not target_tables:
+        return list(entries)
+
+    tables_by_id = {table.table_id: table for table in target_tables}
+    derived_by_key: dict[tuple[str, str, str], PackageCatalogEntry] = {}
+    for table_id, plan in multi_package_plans.items():
+        table = tables_by_id.get(table_id)
+        if table is None or not plan_creates_package_slots(plan):
+            continue
+        local_labels = [binding.package for binding in plan.bindings]
+        if len(local_labels) < 2:
+            continue
+        if normalize_package_side_local_labels(table, local_labels) is not None:
+            continue
+
+        table_derived: list[PackageCatalogEntry] = []
+        for local_label in local_labels:
+            derived = derive_catalog_entry_from_plan_local_identity(
+                local_label,
+                entries,
+                evidence_table_id=table_id,
+            )
+            if derived is not None:
+                table_derived.append(derived)
+        if len(table_derived) < 2:
+            continue
+        if len({normalize_compact(entry.identity_name) for entry in table_derived}) != len(
+            table_derived
+        ):
+            continue
+
+        for derived in table_derived:
+            key = target_figure_variant_evidence_key(
+                identity_name=derived.identity_name,
+                package_type=derived.package_type,
+                pin_count=derived.pin_count,
+            )
+            existing = derived_by_key.get(key)
+            if existing is None:
+                derived_by_key[key] = derived
+            else:
+                merge_redundant_catalog_evidence(existing, derived)
+
+    if len(derived_by_key) < 2:
+        return list(entries)
+
+    derived_entries = list(derived_by_key.values())
+    base_identities = {
+        base_identity
+        for entry in derived_entries
+        for base_identity in [plan_variant_base_identity_from_entries(entry.identity_name, entries)]
+        if base_identity
+    }
+
+    result = entries_without_umbrella_family_slots(
+        list(entries),
+        base_identities=base_identities,
+        derived_entries=derived_entries,
+    )
+    for incoming in derived_entries:
+        merge_target_figure_variant_catalog_entry(result, incoming)
+
+    if diagnostics is not None:
+        diagnostics.append(
+            {
+                "stage": "target_plan_identity_variant_catalog_entries",
+                "status": "applied",
+                "base_identities": sorted(base_identities),
+                "created_identities": [
+                    entry.identity_name for entry in derived_entries
+                ],
+                "before": len(entries),
+                "after": len(result),
+            }
+        )
+    return result
+
+
+def derive_catalog_entry_from_plan_local_identity(
+    local_label: str,
+    entries: Sequence[PackageCatalogEntry],
+    *,
+    evidence_table_id: int,
+) -> PackageCatalogEntry | None:
+    """把 ``DRV8350H`` 这类 local label 关联到最长基础目录身份。"""
+
+    identity = clean_identity_name(local_label)
+    if not identity or is_physical_package_public_label(identity):
+        return None
+    base_entry, suffix = longest_base_entry_for_plan_variant_identity(identity, entries)
+    if base_entry is None or suffix.upper() not in {"H", "S", "P"}:
+        return None
+    evidence_table_ids = list(base_entry.evidence_table_ids)
+    if evidence_table_id not in evidence_table_ids:
+        evidence_table_ids.append(evidence_table_id)
+    return PackageCatalogEntry(
+        package_key="",
+        identity_name=identity,
+        identity_aliases=[],
+        package_type=base_entry.package_type,
+        package_drawing=base_entry.package_drawing,
+        pin_count=base_entry.pin_count,
+        evidence_table_ids=evidence_table_ids,
+    )
+
+
+def longest_base_entry_for_plan_variant_identity(
+    identity: str,
+    entries: Sequence[PackageCatalogEntry],
+) -> tuple[PackageCatalogEntry | None, str]:
+    """返回 local identity 的最长基础目录项和剩余变体后缀。"""
+
+    identity_key = normalize_compact(identity)
+    ranked: list[tuple[int, str, PackageCatalogEntry]] = []
+    for entry in entries:
+        for base_name in [entry.identity_name, *entry.identity_aliases]:
+            base = clean_identity_name(base_name)
+            base_key = normalize_compact(base)
+            if (
+                not base_key
+                or identity_key == base_key
+                or not identity_key.startswith(base_key)
+            ):
+                continue
+            suffix = identity_key[len(base_key):]
+            if suffix:
+                ranked.append((len(base_key), suffix, entry))
+    if not ranked:
+        return None, ""
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    best_length = ranked[0][0]
+    best = [item for item in ranked if item[0] == best_length]
+    unique_entries = {id(entry): (entry, suffix) for _length, suffix, entry in best}
+    if len(unique_entries) != 1:
+        return None, ""
+    entry, suffix = next(iter(unique_entries.values()))
+    return entry, suffix
+
+
+def plan_variant_base_identity_from_entries(
+    identity_name: str,
+    entries: Sequence[PackageCatalogEntry],
+) -> str:
+    """查找 plan local identity 对应的基础目录身份。"""
+
+    entry, _suffix = longest_base_entry_for_plan_variant_identity(
+        identity_name,
+        entries,
+    )
+    return entry.identity_name if entry is not None else ""
 
 
 def add_target_figure_physical_catalog_entries(
