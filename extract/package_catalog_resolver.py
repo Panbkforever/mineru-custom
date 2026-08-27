@@ -3444,11 +3444,23 @@ def bind_target_tables(
                     zip(local_labels, side_effective_labels)
                 ):
                     matches = match_entries_in_text(entries, effective_label)
+                    selected_side_match: PackageCatalogEntry | None = None
+                    reason = "package_side_label"
                     if len(matches) == 1:
+                        selected_side_match = matches[0]
+                    elif len(matches) > 1:
+                        selected_side_match = disambiguate_package_side_matches(
+                            table,
+                            matches,
+                        )
+                        if selected_side_match is not None:
+                            reason = "package_side_label_disambiguated"
+
+                    if selected_side_match is not None:
                         assignment = assignment_from_entry(
-                            matches[0],
+                            selected_side_match,
                             entries,
-                            reason="package_side_label",
+                            reason=reason,
                         )
                     else:
                         assignment = None
@@ -3468,7 +3480,11 @@ def bind_target_tables(
                         local_label=local_label,
                         assignment=assignment,
                         reason=reason,
-                        matched_entries=matches,
+                        matched_entries=(
+                            [selected_side_match]
+                            if selected_side_match is not None
+                            else matches
+                        ),
                         entries=entries,
                         effective_label=effective_label,
                     )
@@ -3652,6 +3668,59 @@ def bind_target_tables(
             previous_explicit = None
             previous_context = ""
     return assignments
+
+
+def disambiguate_package_side_matches(
+    table: PackageTargetTable,
+    matches: Sequence[PackageCatalogEntry],
+) -> PackageCatalogEntry | None:
+    """为 BOTTOM/TOP 这类封装面标签解除目录歧义。
+
+    ``Ball Characteristics (CBP/CBC Pkg.)`` 表中的 BOTTOM/TOP 表示同一
+    package drawing 的上下视图，不是两个独立封装。某些混合 PDF 会从后续
+    尺寸/卷带表中派生出同 drawing 的弱目录项，导致 ``CBP`` 同时命中
+    ``FCBGA`` 和 ``FCCSP``。这类物理 Ball Characteristics 表优先使用更早
+    的目录证据；通常前面的 ``PACKAGING INFORMATION`` 是主封装目录，后续
+    dimensions 表只是辅助包装信息。
+    """
+
+    if not is_ball_characteristics_package_side_table(table):
+        return None
+
+    earliest_evidence = min(
+        (
+            min(entry.evidence_table_ids)
+            for entry in matches
+            if entry.evidence_table_ids
+        ),
+        default=None,
+    )
+    if earliest_evidence is None:
+        return None
+
+    earliest_matches = [
+        entry
+        for entry in matches
+        if entry.evidence_table_ids
+        and min(entry.evidence_table_ids) == earliest_evidence
+    ]
+    if len(earliest_matches) == 1:
+        return earliest_matches[0]
+
+    bga_matches = [
+        entry
+        for entry in earliest_matches
+        if "BGA" in normalize_text(entry.package_type).upper()
+    ]
+    if len(bga_matches) == 1:
+        return bga_matches[0]
+    return None
+
+
+def is_ball_characteristics_package_side_table(table: PackageTargetTable) -> bool:
+    """判断当前目标表是否是带 BOTTOM/TOP 的 Ball Characteristics 表。"""
+
+    return "ball characteristics" in normalize_text(table.title)
 
 
 def append_package_binding_diagnostic(

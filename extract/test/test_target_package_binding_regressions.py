@@ -386,6 +386,59 @@ def test_bottom_top_headers_bind_to_same_package_from_table_title():
     ] == ["CBP", "CBP"]
 
 
+def test_ball_characteristics_side_labels_prefer_primary_catalog_evidence():
+    entries = [
+        PackageCatalogEntry(
+            package_key="",
+            package_type="FCBGA",
+            package_drawing="CBP",
+            pin_count="515",
+            evidence_table_ids=[243],
+        ),
+        PackageCatalogEntry(
+            package_key="",
+            package_type="FCCSP",
+            package_drawing="CBP",
+            pin_count="515",
+            evidence_table_ids=[244],
+        ),
+        PackageCatalogEntry(
+            package_key="",
+            package_type="FCCSP",
+            package_drawing="CUS",
+            pin_count="423",
+            evidence_table_ids=[243],
+        ),
+    ]
+    freeze_package_slots(entries)
+    table = target_table(
+        403,
+        "Table 2-1. Ball Characteristics (CBP Pkg.)(3)",
+        "Table 2-1. Ball Characteristics (CBP Pkg.)(3)",
+        headers=("BALL BOTTOM [1]", "BALL TOP [1]", "PIN NAME [2]", "TYPE [4]"),
+    )
+    diagnostics = []
+
+    assignments = bind_target_tables(
+        entries=entries,
+        target_tables=[table],
+        multi_package_plans={403: DummyPlan(["BOTTOM", "TOP"])},
+        multi_pkg_tab_resolution=None,
+        diagnostics=diagnostics,
+    )
+
+    assert assignments[(403, 0)].package_key == entries[0].package_key
+    assert assignments[(403, 1)].package_key == entries[0].package_key
+    assert [
+        item.get("reason")
+        for item in diagnostics
+        if item.get("effective_label") == "CBP"
+    ] == [
+        "package_side_label_disambiguated",
+        "package_side_label_disambiguated",
+    ]
+
+
 def test_bottom_top_package_labels_bind_to_same_package():
     entries = [
         PackageCatalogEntry(package_key="", package_type="FCCSP", package_drawing="CBP"),
