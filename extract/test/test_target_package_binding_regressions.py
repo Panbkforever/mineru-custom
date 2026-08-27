@@ -8,6 +8,7 @@ from extract.package_catalog_resolver import (
     PackageTargetTable,
     bind_target_tables,
     consolidate_target_physical_catalog_entries,
+    confirmed_package_slot_floor,
     freeze_package_slots,
     resolve_document_package_catalog,
 )
@@ -49,9 +50,9 @@ class DummyBinding:
 
 class DummyPlan:
     is_multi_package = True
-    mode = "package_columns"
 
-    def __init__(self, packages):
+    def __init__(self, packages, mode="package_columns"):
+        self.mode = mode
         self.bindings = tuple(DummyBinding(package) for package in packages)
 
 
@@ -131,6 +132,98 @@ def test_orderable_rows_with_same_physical_slot_bind_by_pin_count():
     assert len(entries) == 2
     assert assignments[(101, 0)].pkg == "VQFN"
     assert assignments[(102, 0)].pkg == "TSSOP"
+
+
+def test_physical_consolidation_respects_confirmed_package_slot_floor():
+    entries = [
+        PackageCatalogEntry(
+            package_key="",
+            identity_name="DRV8411",
+            package_type="HTSSOP",
+            package_drawing="PWP",
+            pin_count="16",
+        ),
+        PackageCatalogEntry(
+            package_key="",
+            identity_name="",
+            package_type="HTSSOP",
+            package_drawing="PWP",
+            pin_count="16",
+        ),
+    ]
+    table = target_table(
+        103,
+        "表 6-1. 引脚功能",
+        "表 6-1. 引脚功能",
+        headers=("引脚 名称", "引脚 RTE", "引脚 PWP、 DYZ", "类型(I)"),
+    )
+    diagnostics = []
+
+    result = consolidate_target_physical_catalog_entries(
+        entries,
+        target_tables=[table],
+        confirmed_slot_floor=2,
+        diagnostics=diagnostics,
+    )
+
+    assert len(result) == 2
+    assert diagnostics[-1]["protected_physical_signatures"] == [
+        ["htssop", "pwp", "16"]
+    ]
+
+
+def test_physical_consolidation_still_merges_without_confirmed_floor():
+    entries = [
+        PackageCatalogEntry(
+            package_key="",
+            identity_name="DRV8411",
+            package_type="HTSSOP",
+            package_drawing="PWP",
+            pin_count="16",
+        ),
+        PackageCatalogEntry(
+            package_key="",
+            identity_name="",
+            package_type="HTSSOP",
+            package_drawing="PWP",
+            pin_count="16",
+        ),
+    ]
+
+    result = consolidate_target_physical_catalog_entries(
+        entries,
+        target_tables=[],
+    )
+
+    assert len(result) == 1
+
+
+def test_confirmed_package_slot_floor_excludes_package_side_labels():
+    normal_table = target_table(
+        104,
+        "Pin Functions",
+        "Pin Functions",
+        headers=("NAME", "RTE PIN", "PWP DYZ PIN", "TYPE"),
+    )
+    side_table = target_table(
+        105,
+        "Table 2-1. Ball Characteristics (CBP Pkg.)(3)",
+        "Table 2-1. Ball Characteristics (CBP Pkg.)(3)",
+        headers=("BOTTOM", "TOP", "SIGNAL NAME", "TYPE"),
+    )
+
+    assert confirmed_package_slot_floor(
+        target_tables=[normal_table],
+        multi_package_plans={104: DummyPlan(["RTE", "PWP DYZ"])},
+    ) == 2
+    assert confirmed_package_slot_floor(
+        target_tables=[side_table],
+        multi_package_plans={105: DummyPlan(["BOTTOM", "TOP"])},
+    ) == 0
+    assert confirmed_package_slot_floor(
+        target_tables=[normal_table],
+        multi_package_plans={104: DummyPlan(["SPI", "GPIO"], mode="parallel_name_columns")},
+    ) == 0
 
 
 def test_target_package_figure_physical_slots_override_bad_catalog_mix():

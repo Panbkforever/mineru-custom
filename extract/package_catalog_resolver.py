@@ -289,9 +289,14 @@ def resolve_document_package_catalog(
         target_tables=target_tables,
         diagnostics=diagnostics,
     )
+    confirmed_slot_floor = confirmed_package_slot_floor(
+        target_tables=target_tables,
+        multi_package_plans=multi_package_plans,
+    )
     entries = consolidate_target_physical_catalog_entries(
         entries,
         target_tables=target_tables,
+        confirmed_slot_floor=confirmed_slot_floor,
         diagnostics=diagnostics,
     )
     if not entries and target_tables:
@@ -2069,6 +2074,33 @@ def plan_creates_package_slots(plan: MultiPackagePlanLike | None) -> bool:
     )
 
 
+def confirmed_package_slot_floor(
+    *,
+    target_tables: Sequence[PackageTargetTable],
+    multi_package_plans: Mapping[int, MultiPackagePlanLike],
+) -> int:
+    """严格表内多封装结构确认的最小槽位数。
+
+    物理封装元数据去重不能突破这个下限。``BOTTOM/TOP`` 这类封装面标签
+    只是同一 package 的两个视角，不是独立 symbol，因此不计入下限。
+    """
+
+    floor = 0
+    for table in target_tables:
+        plan = multi_package_plans.get(table.table_id)
+        if not plan_creates_package_slots(plan):
+            continue
+        local_labels = [binding.package for binding in plan.bindings]
+        if len(local_labels) < 2:
+            continue
+        if normalize_package_side_local_labels(table, local_labels) is not None:
+            continue
+        if len({normalize_compact(label) for label in local_labels if label}) < 2:
+            continue
+        floor = max(floor, len(local_labels))
+    return floor
+
+
 def freeze_package_slots(entries: Sequence[PackageCatalogEntry]) -> None:
     """按首次出现顺序冻结槽位 key；名称变化不能改变分组身份。"""
 
@@ -2481,9 +2513,14 @@ def consolidate_target_physical_catalog_entries(
     entries: Sequence[PackageCatalogEntry],
     *,
     target_tables: Sequence[PackageTargetTable],
+    confirmed_slot_floor: int = 0,
     diagnostics: list[dict[str, Any]] | None = None,
 ) -> list[PackageCatalogEntry]:
-    """合并订购型号造成的重复物理槽，并删除被强槽覆盖的弱槽。"""
+    """合并订购型号造成的重复物理槽，并删除被强槽覆盖的弱槽。
+
+    严格表内多封装结构是比物理元数据更强的证据。若它已经确认至少 N 个
+    独立映射空间，本阶段不能把目录槽位合并到 N 以下。
+    """
 
     if not entries:
         return []
@@ -2499,16 +2536,25 @@ def consolidate_target_physical_catalog_entries(
 
     skipped_entry_ids: set[int] = set()
     merged_signatures: list[tuple[str, str, str]] = []
+    protected_signatures: list[tuple[str, str, str]] = []
+    protected_weak_entries: list[dict[str, Any]] = []
+    current_count = len(entries)
+    slot_floor = max(0, int(confirmed_slot_floor or 0))
     for signature, group in groups.items():
         if len(group) < 2:
             continue
         if should_keep_duplicate_physical_slots(group, target_context):
+            continue
+        reduction = len(group) - 1
+        if slot_floor and current_count - reduction < slot_floor:
+            protected_signatures.append(signature)
             continue
         representative = group[0]
         for incoming in group[1:]:
             merge_redundant_catalog_evidence(representative, incoming)
             skipped_entry_ids.add(id(incoming))
         merged_signatures.append(signature)
+        current_count -= reduction
 
     strong_entries = [
         entry
@@ -2526,12 +2572,21 @@ def consolidate_target_physical_catalog_entries(
             and weak_entry_is_covered_by_strong_physical_slot(entry, strong_entries)
             and not catalog_entry_identity_is_mentioned(entry, target_context)
         ):
+            if slot_floor and current_count - 1 < slot_floor:
+                protected_weak_entries.append(catalog_entry_debug_dict(entry))
+                result.append(entry)
+                continue
             removed_weak_entries.append(catalog_entry_debug_dict(entry))
+            current_count -= 1
             continue
         result.append(entry)
 
     if diagnostics is not None and (
-        merged_signatures or removed_weak_entries or len(result) != len(entries)
+        merged_signatures
+        or protected_signatures
+        or removed_weak_entries
+        or protected_weak_entries
+        or len(result) != len(entries)
     ):
         diagnostics.append(
             {
@@ -2539,10 +2594,15 @@ def consolidate_target_physical_catalog_entries(
                 "status": "applied",
                 "before": len(entries),
                 "after": len(result),
+                "confirmed_slot_floor": slot_floor,
                 "merged_physical_signatures": [
                     list(signature) for signature in merged_signatures
                 ],
+                "protected_physical_signatures": [
+                    list(signature) for signature in protected_signatures
+                ],
                 "removed_weak_entries": removed_weak_entries,
+                "protected_weak_entries": protected_weak_entries,
             }
         )
     return result
