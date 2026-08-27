@@ -736,6 +736,7 @@ def extract_pin_package_info_from_table_candidates(
     # 精确去重。此处位于写 JSON 之前，因此后出现表格中的 description 已经
     # 全部可用，同时不会反向影响表格判断、字段映射或 package 绑定。
     result = build_public_result(packages, include_debug)
+    result = filter_supplemental_signal_groups_when_primary_tables_exist(result)
     return deduplicate_pins_within_packages(result)
 
 
@@ -2292,6 +2293,61 @@ def build_public_result(
             item["package_key"] = bucket["package_key"]
         result.append(item)
     return append_duplicate_pkg_suffixes(result)
+
+
+def filter_supplemental_signal_groups_when_primary_tables_exist(
+    result: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """有主引脚表时过滤接口/信号说明类补充表。
+
+    ``Signals Description`` / ``Feed-Through Balls`` 表结构上常包含
+    signal、ball、type，因此模型可能判断为可抽取；但当同一文档已经成功
+    抽出 ``Ball Characteristics`` 或 ``Pin Functions`` 主表时，这些说明表
+    只会造成重复和污染。该判断必须放在行提取后，因为只有此时才知道主表
+    是否真的抽出了 pin 记录。
+    """
+
+    has_primary_group = any(
+        is_primary_pin_group_name(str(group.get("group", "")))
+        for package in result
+        for group in package.get("group_list", [])
+        if group.get("pin_list")
+    )
+    if not has_primary_group:
+        return result
+
+    for package in result:
+        package["group_list"] = [
+            group
+            for group in package.get("group_list", [])
+            if not is_supplemental_signal_group_name(str(group.get("group", "")))
+        ]
+    return result
+
+
+def is_primary_pin_group_name(value: str) -> bool:
+    """识别最终输出中的主引脚表 group。"""
+
+    text = normalize_header(value)
+    if is_supplemental_signal_group_name(value):
+        return False
+    return (
+        "ball characteristics" in text
+        or "pin functions" in text
+        or "引脚功能" in value
+    )
+
+
+def is_supplemental_signal_group_name(value: str) -> bool:
+    """识别有主表时应删除的接口/信号说明补充 group。"""
+
+    text = normalize_header(value)
+    return bool(
+        "signals description" in text
+        or "signal description" in text
+        or "feed through balls" in text
+        or "feed-through balls" in str(value).lower()
+    )
 
 
 def deduplicate_pins_within_packages(
