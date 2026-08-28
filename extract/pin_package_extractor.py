@@ -1098,7 +1098,7 @@ def is_loose_candidate(title: str, headers: list[str], rows: list[list[str]]) ->
         return False
     if any(word in header_text for word in ("pin", "ball", "terminal", "signal", "引脚", "端子", "信号")):
         return True
-    if any(word in title_text for word in ("pin attributes", "terminal functions", "signal descriptions", "connectivity requirements")):
+    if any(word in title_text for word in ("pin functions", "pin attributes", "terminal functions", "signal descriptions", "connectivity requirements", "引脚功能")):
         return True
     return bool(re.search(r"\b[A-Z]{1,2}\d{1,3}\b", " ".join(" ".join(row) for row in rows[:8])))
 
@@ -1412,14 +1412,20 @@ def classify_header(header: str) -> tuple[str, int]:
 def strip_numeric_header_footnotes(value: str) -> str:
     """仅清除字段表头中的纯数字圆括号脚注。
 
-    支持 ``(1)``、``(1) (2)`` 和 ``(1, 2)``。括号中包含字母或其他
-    语义内容时保持原样，避免把型号、模式或普通说明误当成脚注删除。
+    支持 ``(1)``、``(1) (2)``、``(1, 2)`` 以及 MinerU 常见的
+    ``$^{(1)}$``/``$^{1}$`` 上标脚注。括号中包含字母或其他语义内容时
+    保持原样，避免把型号、模式或普通说明误当成脚注删除。
     """
 
+    text = re.sub(
+        r"\$\s*\^\s*\{\s*\(?\s*\d+(?:\s*[,，]\s*\d+)*\s*\)?\s*\}\s*\$",
+        " ",
+        str(value or ""),
+    )
     return re.sub(
         r"\(\s*\d+(?:\s*[,，]\s*\d+)*\s*\)",
         " ",
-        str(value or ""),
+        text,
     )
 
 

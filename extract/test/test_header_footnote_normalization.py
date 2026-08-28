@@ -5,6 +5,7 @@ import unittest
 from extract.pin_package_extractor import (
     choose_header_row,
     classify_header,
+    is_loose_candidate,
     strip_numeric_header_footnotes,
 )
 
@@ -37,6 +38,22 @@ class HeaderFootnoteNormalizationTest(unittest.TestCase):
         self.assertEqual(
             strip_numeric_header_footnotes("MODE (RGB) NAME"),
             "MODE (RGB) NAME",
+        )
+
+    def test_latex_superscript_numeric_footnotes_are_removed(self) -> None:
+        self.assertEqual(classify_header("类型 $^{(1)}$")[0], "type")
+        self.assertEqual(classify_header("I/O $^{2}$")[0], "type")
+
+    def test_pin_functions_title_recalls_name_no_io_table(self) -> None:
+        self.assertTrue(
+            is_loose_candidate(
+                "Pin Functions",
+                ["NAME", "NO.", "I/O", "DESCRIPTION"],
+                [
+                    ["INAM", "41", "I", "Differential analog input"],
+                    ["INAP", "42", "I", "Differential analog input"],
+                ],
+            )
         )
 
 
