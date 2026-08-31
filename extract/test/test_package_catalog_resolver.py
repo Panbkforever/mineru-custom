@@ -654,6 +654,51 @@ def test_identity_summary_creates_real_packages_and_packaging_only_enriches():
     ]
 
 
+def test_characteristics_scalar_values_do_not_create_identity_slots():
+    """普通特性表即使被误判为 identity_summary，也不能用标量值建 pkg。"""
+
+    characteristics = catalog_table(
+        0,
+        "Table 3-1. Characteristics of the 66AK2E0x Processor",
+        ["FEATURE", "DESCRIPTION", "VALUE A", "VALUE B"],
+        [
+            ["Memory", "L2 Cache", "32KB", "512KB"],
+            ["Revision", "CorePac Revision", "0x0009_0003", "0x0B9A_602F"],
+            ["Frequency", "Processor", "1.25 GHz", "1.4 GHz"],
+            ["Process Technology", "nm", "28 nm", "PD"],
+            ["Instances", "Cores", "1", "5"],
+        ],
+    )
+    target = target_table(
+        12,
+        "Table 6-2. Terminal Functions — Signals and Control by Function",
+        ["SIGNAL NAME", "BALL NUMBER", "TYPE"],
+    )
+
+    def classifier(table, source_name, target_tables):
+        return {
+            "is_package_summary": True,
+            "table_role": "identity_summary",
+            "header_row_index": 0,
+            "columns": [
+                {"column_index": 2, "role": "package_identity"},
+                {"column_index": 3, "role": "package_identity"},
+            ],
+        }
+
+    result = resolve_document_package_catalog(
+        all_tables=[characteristics],
+        target_tables=[target],
+        multi_package_plans={target.table_id: MultiPackagePlan(False, "single_package")},
+        use_semantic_classifier=True,
+        classifier=classifier,
+    )
+
+    assert len(result.entries) == 1
+    assert result.entries[0].identity_name == ""
+    assert result.assignment_for(target.table_id, 0).reason == "single_document_package"
+
+
 def test_same_public_package_type_does_not_merge_independent_identity_slots():
     """两个独立型号即使同为 QFN，也必须保持两个物理映射槽位。"""
 

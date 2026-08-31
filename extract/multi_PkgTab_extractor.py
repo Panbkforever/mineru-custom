@@ -457,7 +457,11 @@ def _matches_by_identity(
     result = []
     for index, entry in enumerate(entries):
         names = [entry.identity_name, *entry.identity_aliases]
-        if any(_identity_token_in_text(str(name or ""), text) for name in names):
+        if any(
+            _is_plausible_identity_token(str(name or ""))
+            and _identity_token_in_text(str(name or ""), text)
+            for name in names
+        ):
             result.append(index)
     return tuple(result)
 
@@ -623,6 +627,8 @@ def _token_in_text(token: str, text: str) -> bool:
 def _identity_token_in_text(token: str, text: str) -> bool:
     """器件身份匹配；支持标题里的 ``CC430F614x`` family 写法。"""
 
+    if not _is_plausible_identity_token(token):
+        return False
     if _token_in_text(token, text):
         return True
     identity = _normalize_compact(token)
@@ -640,6 +646,13 @@ def _identity_token_in_text(token: str, text: str) -> bool:
         ):
             return True
     return False
+
+
+def _is_plausible_identity_token(token: str) -> bool:
+    """器件身份必须至少包含字母，防止表编号 6-2 命中 identity=2。"""
+
+    compact = _normalize_compact(token)
+    return bool(compact and re.search(r"[a-z]", compact))
 
 
 def _plan_creates_package_slots(plan: MultiPackagePlanLike | None) -> bool:

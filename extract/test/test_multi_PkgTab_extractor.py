@@ -144,6 +144,29 @@ def test_identity_separates_models_that_share_one_package_family():
     assert catalog_groups_confirmed_by_target_tables(result) == []
 
 
+def test_numeric_identity_values_do_not_match_table_numbers():
+    """被误建的纯数字 identity 不能从 Table 6-2 这类表编号形成分支。"""
+
+    entries = [
+        Entry("1"),
+        Entry("2"),
+        Entry("3"),
+    ]
+    tables = [
+        Table(12, "Table 6-2. Terminal Functions — Signals and Control by Function"),
+        Table(13, "Table 6-3. Terminal Functions — Power and Ground"),
+    ]
+
+    result = resolve_multi_pkg_tab_structure(
+        target_tables=tables,
+        catalog_entries=entries,
+        multi_package_plans={table.table_id: single_plan() for table in tables},
+    )
+
+    assert result.branches == []
+    assert result.document_mode == "package_structure_unresolved"
+
+
 def test_intra_table_package_columns_stay_in_existing_branch():
     plan = MultiPackagePlan(
         True,

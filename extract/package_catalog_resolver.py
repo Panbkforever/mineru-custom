@@ -1228,6 +1228,7 @@ def create_identity_entries_from_table(
             )
             if (
                 not identity_name
+                or is_invalid_catalog_identity_name(identity_name)
                 or is_generic_package_label(identity_name)
                 or is_repeated_header_value(
                     identity_name,
@@ -4298,6 +4299,25 @@ def clean_identity_name(value: str) -> str:
     if not value or "|" in value or "\n" in value or len(value) > 15:
         return ""
     return value
+
+
+def is_invalid_catalog_identity_name(value: str) -> bool:
+    """排除特性/参数表里被误当成器件身份的标量值。"""
+
+    compact = normalize_compact(value)
+    if not compact:
+        return True
+    if not re.search(r"[a-z]", compact):
+        return True
+    if re.fullmatch(r"0x[0-9a-f_]+", compact):
+        return True
+    if re.fullmatch(r"\d+(?:kb|mb|gb|mhz|ghz|nm|v)", compact):
+        return True
+    return compact in {
+        "pd",
+        "pp",
+        "ai",
+    }
 
 
 def clean_public_package_name(value: str) -> str:
