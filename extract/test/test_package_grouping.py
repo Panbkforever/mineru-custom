@@ -4,16 +4,60 @@ import unittest
 from unittest.mock import patch
 
 import extract.pin_package_extractor as extractor
+from extract.multi_package_extractor import MultiPackagePlan, PackageBinding
+from extract.package_catalog_resolver import PackageAssignment
 from extract.pin_package_extractor import (
     ColumnDecision,
     TableCandidate,
     TableDecision,
+    derive_ball_side_package_assignment,
     extract_pin_package_info_from_table_candidates,
 )
 
 
 class PackageGroupingTest(unittest.TestCase):
     """覆盖单封装名称回退和表内多封装真实名称的通用行为。"""
+
+    def test_ball_bottom_and_top_columns_split_output_symbols(self) -> None:
+        """BALL BOTTOM/TOP 是同一物理封装的两个独立 symbol 输出空间。"""
+
+        plan = MultiPackagePlan(
+            True,
+            "package_columns",
+            (
+                PackageBinding("BOTTOM", 0, 2, 3),
+                PackageBinding("TOP", 1, 2, 3),
+            ),
+        )
+        assignment = PackageAssignment("catalog:0", "a", "package_side_label")
+        headers = ["BALL BOTTOM [1]", "BALL TOP [1]", "PIN NAME [2]", "TYPE [4]"]
+
+        bottom = derive_ball_side_package_assignment(assignment, plan, 0, headers)
+        top = derive_ball_side_package_assignment(assignment, plan, 1, headers)
+
+        self.assertEqual(bottom.package_key, "catalog:0:ball_side:bottom")
+        self.assertEqual(bottom.pkg, "a_bottom")
+        self.assertEqual(top.package_key, "catalog:0:ball_side:top")
+        self.assertEqual(top.pkg, "a_top")
+
+    def test_bottom_top_words_without_ball_headers_do_not_split_symbols(self) -> None:
+        """普通 bottom/top 文字不能影响多封装输出命名。"""
+
+        plan = MultiPackagePlan(
+            True,
+            "package_columns",
+            (
+                PackageBinding("BOTTOM", 0, 2, 3),
+                PackageBinding("TOP", 1, 2, 3),
+            ),
+        )
+        assignment = PackageAssignment("catalog:0", "QFN", "matched")
+        headers = ["BOTTOM PIN", "TOP PIN", "PIN NAME", "TYPE"]
+
+        self.assertEqual(
+            derive_ball_side_package_assignment(assignment, plan, 0, headers),
+            assignment,
+        )
 
     def test_single_package_without_catalog_uses_slot_fallback(self) -> None:
         table = TableCandidate(

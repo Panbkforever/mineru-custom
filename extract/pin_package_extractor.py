@@ -108,6 +108,9 @@
 * 多个独立 pin_no 列已经严格确认 N 个映射空间时，第二次模型只返回器件
   型号、没有 package_type/drawing/pin_count 的弱目录项不能把 N 个槽位扩成
   更多 pkg；有物理封装信息的独立目录项仍保留，不能因名称相同而合并。
+* 同一张表中同时存在 ``BALL BOTTOM`` 和 ``BALL TOP`` 两个编号列时，它们是
+  同一物理封装的上下两面映射空间，最终输出必须拆成 ``pkg_bottom`` 与
+  ``pkg_top`` 两个 symbol，不能继续合并到同一个 pkg。
 * 器件型号只参与槽位关联，不能写入 pkg。pkg 只使用物理封装类型；名称
   不明确时按固定槽位顺序使用 a、b、c……，但槽位数量保持不变。
 * 一个 pkg 只能是一个名称字符串，禁止使用 ``|`` 拼接多个名称；真实名称
@@ -664,6 +667,12 @@ def extract_pin_package_info_from_table_candidates(
                 # 封装目录的唯一绑定。表内标签不能直接绕过目录写入输出。
                 local_slot = local_package_index_for_bound_row(plan, bound_row)
                 package_assignment = package_assignments[local_slot]
+                output_assignment = derive_ball_side_package_assignment(
+                    package_assignment,
+                    plan,
+                    local_slot,
+                    item["headers"],
+                )
                 for record in extract_records_from_bound_package_row(bound_row):
                     # 多封装绑定对象只保存 pin_no/pin_name/type。description
                     # 必须使用 row_index 回到同一原始数据行读取，不能从相邻
@@ -679,7 +688,7 @@ def extract_pin_package_info_from_table_candidates(
                         record["source"] = source_name
                     if include_debug and item["table"].page_idx is not None:
                         record["source_page"] = item["table"].page_idx + 1
-                    bucket = get_package_bucket(packages, package_assignment)
+                    bucket = get_package_bucket(packages, output_assignment)
                     group = get_or_create_group(bucket, group_name)
                     add_pin_record_to_group(group, record)
                     extracted_count += 1
@@ -2259,6 +2268,74 @@ def local_package_index_for_bound_row(
     raise ValueError(
         f"多封装绑定行没有对应的本表封装索引: {bound_row.package!r}"
     )
+
+
+def derive_ball_side_package_assignment(
+    assignment: PackageAssignment,
+    plan: MultiPackagePlan,
+    local_slot: int,
+    headers: Sequence[str],
+) -> PackageAssignment:
+    """把 BALL BOTTOM/TOP 两个编号列拆成独立输出 symbol。
+
+    这里不改变文档级物理封装绑定。只有表内结构已经严格识别为
+    package_columns，并且当前编号列的表头明确是 ``BALL BOTTOM`` 或
+    ``BALL TOP`` 时，才在最终输出层追加 side 后缀。普通多封装列、运行模式
+    列、description 中出现的 bottom/top 文字都不会触发。
+    """
+
+    suffix = ball_side_suffix_for_local_slot(plan, local_slot, headers)
+    if not suffix:
+        return assignment
+
+    base_key = str(assignment.package_key)
+    base_pkg = str(assignment.pkg or assignment.package_key or "")
+    if not base_pkg:
+        base_pkg = alphabetic_slot_name(local_slot)
+    return PackageAssignment(
+        package_key=f"{base_key}:ball_side:{suffix}",
+        pkg=f"{base_pkg}_{suffix}",
+        reason=f"{assignment.reason}+ball_side_{suffix}",
+    )
+
+
+def ball_side_suffix_for_local_slot(
+    plan: MultiPackagePlan,
+    local_slot: int,
+    headers: Sequence[str],
+) -> str:
+    """当前本地槽位是否对应 BALL BOTTOM/TOP 编号列。"""
+
+    if plan.mode != "package_columns":
+        return ""
+    if local_slot < 0 or local_slot >= len(plan.bindings):
+        return ""
+
+    side_by_slot: dict[int, str] = {}
+    for slot, binding in enumerate(plan.bindings):
+        side = normalize_ball_side_label(binding.package)
+        if not side:
+            continue
+        header = safe_header(list(headers), binding.pin_no_column)
+        normalized_header = normalize_header(strip_numeric_header_footnotes(header))
+        if "ball" not in normalized_header or side not in normalized_header:
+            continue
+        side_by_slot[slot] = side
+
+    if {"bottom", "top"} - set(side_by_slot.values()):
+        return ""
+    return side_by_slot.get(local_slot, "")
+
+
+def normalize_ball_side_label(value: str) -> str:
+    """识别表内的 bottom/top 侧面标签。"""
+
+    text = normalize_header(strip_numeric_header_footnotes(value))
+    if text in {"bottom", "bot"}:
+        return "bottom"
+    if text == "top":
+        return "top"
+    return ""
 
 
 def get_package_bucket(
