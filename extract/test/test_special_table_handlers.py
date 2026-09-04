@@ -10,6 +10,7 @@ from extract.special_table_handlers import (
     find_special_table_match,
     mii_rmii_rgmii_pin_mux_table_filter,
     register_word_pin_affected_table_filter,
+    supplemental_characteristics_table_filter,
     unused_pins_connection_table_filter,
 )
 
@@ -87,6 +88,40 @@ class SpecialTableHandlersTest(unittest.TestCase):
             "Pin Functions",
             ["Pin No.", "MII MAC", "MII PHY", "RGMII"],
             [["56", "M1M_CRS", "-", "-"]],
+        )
+
+        self.assertIsNone(match)
+
+    def test_supplemental_characteristics_tables_are_rejected(self) -> None:
+        """复用和电源补充说明表必须在模型前直接过滤。"""
+
+        for title in (
+            "Table 4-3. Multiplexing Characteristics",
+            "Table 4-27. Power Supplies Description",
+        ):
+            with self.subTest(title=title):
+                match = supplemental_characteristics_table_filter(
+                    title,
+                    ["Signal Name", "Description", "Ball (ZCN Pkg.)"],
+                    [["VDD", "Power supply", "A1"]],
+                )
+
+                self.assertIsNotNone(match)
+                self.assertFalse(match.should_extract)
+                self.assertEqual(
+                    match.handler_name,
+                    "supplemental_characteristics_table_filter",
+                )
+
+    def test_signal_description_package_tables_do_not_match_supplemental_filter(
+        self,
+    ) -> None:
+        """Signal Descriptions 可能是真正 pin 表，不能被新增规则误伤。"""
+
+        match = find_special_table_match(
+            "Table 4-1. Signal Descriptions – RGZ Package",
+            ["Pin", "Signal Name", "Type"],
+            [["1", "DIO_0", "I/O"]],
         )
 
         self.assertIsNone(match)

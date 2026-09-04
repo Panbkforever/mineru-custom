@@ -12,6 +12,9 @@
 * ``mii_rmii_rgmii_pin_mux_table_filter``：处理表头固定为 ``Pin No.``、
   ``MII MAC``、``MII PHY``、``RMII MAC``、``RMII PHY``、``RGMII`` 的
   以太网接口复用矩阵；整表直接过滤，禁止把编号列误当成独立引脚清单。
+* ``supplemental_characteristics_table_filter``：处理
+  ``Multiplexing Characteristics`` 和 ``Power Supplies Description`` 这类
+  复用/电源补充说明表；整表直接过滤，禁止污染已经存在的主 pin list。
 * ``reserved_pin_table_handler``：处理只有物理引脚/球号和连接要求的
   Reserved/NC 表。只保留明确要求悬空或禁止连接的行；明确说明封装中不存在
   的位置不作为物理引脚输出。
@@ -59,6 +62,7 @@ def find_special_table_match(
     handlers = (
         unused_pins_connection_table_filter,
         mii_rmii_rgmii_pin_mux_table_filter,
+        supplemental_characteristics_table_filter,
         register_word_pin_affected_table_filter,
         reserved_pin_table_handler,
     )
@@ -95,6 +99,37 @@ def unused_pins_connection_table_filter(
     ):
         return SpecialTableMatch(
             handler_name="unused_pins_connection_table_filter",
+            columns=(),
+            included_row_indexes=frozenset(),
+            should_extract=False,
+        )
+    return None
+
+
+def supplemental_characteristics_table_filter(
+    title: str,
+    headers: list[str],
+    data_rows: list[list[str]],
+) -> SpecialTableMatch | None:
+    """过滤复用/电源补充说明表。
+
+    ``Multiplexing Characteristics`` 和 ``Power Supplies Description`` 描述
+    的是功能复用或电源连接说明，不是完整物理封装 pin list。它们经常带有
+    Ball/Pin 相关列，容易被字段模型误判成可抽表，因此在模型前直接拒绝。
+
+    该规则只依赖明确表题短语，不使用表头或行内容扩展判断范围，避免误伤
+    普通 ``Pin Functions`` 或 ``Signal Descriptions – XXX Package`` 主表。
+    """
+
+    normalized_title = normalize_text(title)
+    if not normalized_title:
+        return None
+    if (
+        re.search(r"\bmultiplexing\s+characteristics\b", normalized_title)
+        or re.search(r"\bpower\s+supplies\s+description\b", normalized_title)
+    ):
+        return SpecialTableMatch(
+            handler_name="supplemental_characteristics_table_filter",
             columns=(),
             included_row_indexes=frozenset(),
             should_extract=False,
