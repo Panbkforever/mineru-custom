@@ -3502,6 +3502,38 @@ def bind_target_tables(
                 entries,
             )
             if link_resolution.conflicts:
+                if len(entries) == len(local_labels):
+                    # 表头中的短 symbol 关系存在冲突时，说明无法证明哪个
+                    # 本地标签应绑定哪个目录槽位。但本表的 package_columns
+                    # 已经严格确认 N 个独立映射空间，且文档目录经补全后也
+                    # 恰好冻结为 N 个槽位。此时优先保证数据按本地结构完整
+                    # 分开输出；公开名称可能不完美，但不再因为名称冲突导致
+                    # 整张表 0 输出。
+                    for local_slot, (local_label, entry) in enumerate(
+                        zip(local_labels, entries)
+                    ):
+                        assignment = assignment_from_entry(
+                            entry,
+                            entries,
+                            reason="symbol_conflict_positional_binding",
+                        )
+                        assignments[(table.table_id, local_slot)] = assignment
+                        append_package_binding_diagnostic(
+                            diagnostics,
+                            table=table,
+                            local_slot=local_slot,
+                            local_label=local_label,
+                            assignment=assignment,
+                            reason=assignment.reason,
+                            matched_entries=[entry],
+                            entries=entries,
+                            link_conflicts=link_resolution.conflicts,
+                        )
+                    if chapter_context_key(table) != previous_context:
+                        previous_explicit = None
+                        previous_context = ""
+                    continue
+
                 for local_slot, local_label in enumerate(local_labels):
                     append_package_binding_diagnostic(
                         diagnostics,

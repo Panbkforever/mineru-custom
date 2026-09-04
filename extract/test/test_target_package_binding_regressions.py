@@ -355,6 +355,140 @@ def test_multi_package_slot_shortage_is_unresolved_not_crash():
     assert {item["status"] for item in shortage} == {"unresolved"}
 
 
+def test_symbol_link_conflict_binds_positionally_when_slot_counts_match():
+    """symbol 关系冲突但槽位数量相等时，按顺序保留本地分支输出。"""
+
+    entries = [
+        PackageCatalogEntry(
+            package_key="",
+            package_type="HTSSOP",
+            package_drawing="PWP",
+            pin_count="28",
+        ),
+        PackageCatalogEntry(
+            package_key="",
+            package_type="VQFN",
+            package_drawing="RGE",
+            pin_count="24",
+        ),
+        PackageCatalogEntry(package_key=""),
+        PackageCatalogEntry(package_key=""),
+    ]
+    freeze_package_slots(entries)
+    table = target_table(
+        351,
+        "Pin Functions",
+        "Pin Functions",
+        headers=(
+            "PIN NAME",
+            "PWP DRV8424E PIN",
+            "PWP DRV8424P PIN",
+            "RGE DRV8424E PIN",
+            "RGE DRV8424P PIN",
+        ),
+    )
+    diagnostics = []
+
+    assignments = bind_target_tables(
+        entries=entries,
+        target_tables=[table],
+        multi_package_plans={
+            351: DummyPlan(
+                [
+                    "PWP DRV8424E",
+                    "PWP DRV8424P",
+                    "RGE DRV8424E",
+                    "RGE DRV8424P",
+                ]
+            )
+        },
+        multi_pkg_tab_resolution=None,
+        diagnostics=diagnostics,
+    )
+
+    assert [assignments[(351, slot)].package_key for slot in range(4)] == [
+        entry.package_key for entry in entries
+    ]
+    assert [assignments[(351, slot)].pkg for slot in range(4)] == [
+        "HTSSOP",
+        "VQFN",
+        "c",
+        "d",
+    ]
+    assert {
+        item.get("reason")
+        for item in diagnostics
+        if item.get("table_id") == 351
+    } == {"symbol_conflict_positional_binding"}
+    assert all(
+        item.get("status") == "resolved"
+        for item in diagnostics
+        if item.get("table_id") == 351
+    )
+
+
+def test_symbol_link_conflict_stays_unresolved_when_slot_counts_differ():
+    """数量不一致时，symbol 冲突不能靠顺序绑定兜底。"""
+
+    entries = [
+        PackageCatalogEntry(
+            package_key="",
+            package_type="HTSSOP",
+            package_drawing="PWP",
+            pin_count="28",
+        ),
+        PackageCatalogEntry(
+            package_key="",
+            package_type="VQFN",
+            package_drawing="RGE",
+            pin_count="24",
+        ),
+    ]
+    freeze_package_slots(entries)
+    table = target_table(
+        352,
+        "Pin Functions",
+        "Pin Functions",
+        headers=(
+            "PIN NAME",
+            "PWP DRV8424E PIN",
+            "PWP DRV8424P PIN",
+            "RGE DRV8424E PIN",
+            "RGE DRV8424P PIN",
+        ),
+    )
+    diagnostics = []
+
+    assignments = bind_target_tables(
+        entries=entries,
+        target_tables=[table],
+        multi_package_plans={
+            352: DummyPlan(
+                [
+                    "PWP DRV8424E",
+                    "PWP DRV8424P",
+                    "RGE DRV8424E",
+                    "RGE DRV8424P",
+                ]
+            )
+        },
+        multi_pkg_tab_resolution=None,
+        diagnostics=diagnostics,
+    )
+
+    assert assignments == {}
+    assert {
+        item.get("reason")
+        for item in diagnostics
+        if item.get("table_id") == 352
+    } == {"symbol_package_link_conflict"}
+    assert all(
+        item.get("status") == "unresolved"
+        for item in diagnostics
+        if item.get("table_id") == 352
+    )
+
+
 def test_bottom_top_headers_bind_to_same_package_from_table_title():
     entries = [
         PackageCatalogEntry(package_key="", package_type="FCCSP", package_drawing="CBP"),
