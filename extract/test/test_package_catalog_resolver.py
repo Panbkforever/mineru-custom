@@ -1792,3 +1792,73 @@ def test_full_pipeline_falls_back_when_all_catalog_slots_are_unresolved():
         if item.get("stage") == "single_package_all_unresolved_fallback"
     )
     assert fallback["status"] == "applied"
+
+
+def test_full_pipeline_empty_final_output_uses_default_pkg_fallback():
+    """最终没有任何 pin 时，把已确认目标引脚表输出到 default。"""
+
+    pin_table = TableCandidate(
+        html=(
+            "<table><tr><td>PIN NO.</td><td>PIN NAME</td><td>TYPE</td></tr>"
+            "<tr><td>1</td><td>VDD</td><td>P</td></tr></table>"
+        ),
+        page_idx=0,
+        title="Pin Attributes(1)",
+        group_context="4.2 Pin Attributes\nPin Attributes(1)",
+        current_chapter_titles=("4.2 Pin Attributes",),
+    )
+    columns = [
+        ColumnDecision(0, "PIN NO.", "pin_no"),
+        ColumnDecision(1, "PIN NAME", "pin_name"),
+        ColumnDecision(2, "TYPE", "type"),
+    ]
+
+    class EmptyResolution:
+        entries = []
+        diagnostics = []
+
+        def declared_assignments(self):
+            return []
+
+        def assignment_for(self, table_id, local_slot):
+            return None
+
+    with (
+        patch.object(
+            pin_extractor,
+            "decide_all_tables",
+            return_value={0: TableDecision(True, columns=columns)},
+        ),
+        patch.object(
+            pin_extractor,
+            "resolve_document_package_catalog",
+            return_value=EmptyResolution(),
+        ),
+    ):
+        result = pin_extractor.extract_pin_package_info_from_table_candidates(
+            [pin_table],
+            source_name="binding-failed-document",
+            include_debug=True,
+        )
+
+    assert result[0]["pkg"] == "default"
+    assert result[0]["group_list"][0]["pin_list"] == [
+        {
+            "pin_no": "1",
+            "pin_name": "VDD",
+            "type": "P",
+            "source": "binding-failed-document",
+            "source_page": 1,
+        }
+    ]
+    debug = pin_extractor.get_last_extraction_debug()
+    extracted = next(item for item in debug if item.get("table_id") == 0)
+    assert extracted["status"] == "extracted"
+    assert extracted["empty_output_fallback"]["status"] == "applied"
+    assert extracted["package_assignments"] == [
+        {
+            "local_slot": 0,
+            "pkg": "default",
+            "reason": "empty_output_default_pkg_fallback",
+        }
+    ]

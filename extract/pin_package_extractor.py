@@ -11,8 +11,10 @@
 5. 多封装分析：只按表格结构生成多个编号列/行的绑定计划。
 6. 封装槽位：先冻结物理封装数量，再绑定每张引脚表；器件型号只用于关联。
 7. 行提取：单封装和多封装走各自独立逻辑，完整读取已经绑定的数据行。
-8. pkg 内去重：只按完全相同的 pin_no、pin_name 合并重复记录，并汇总描述。
-9. 结果整理：按固定槽位分组；pkg 使用物理封装名，未知时按 a/b/c 回退。
+8. 空结果兜底：若前面已经确认存在目标引脚表，但最终没有任何 pin 输出，
+   不再继续做封装归属判断，统一输出到 ``pkg=default``。
+9. pkg 内去重：只按完全相同的 pin_no、pin_name 合并重复记录，并汇总描述。
+10. 结果整理：按固定槽位分组；pkg 使用物理封装名，未知时按 a/b/c 回退。
 
 特别重要的项目规则：
 
@@ -117,6 +119,9 @@
   最长 15 个字符。
 * 最终 JSON 不允许出现完全相同的 pkg 名称。同名 pkg 出现多次时，按冻结
   槽位顺序从第一个开始追加 1、2、3……；只出现一次的 pkg 名称保持不变。
+* 如果最终公开 JSON 没有任何 pin 记录，但前面已经有表格通过语义/规则字段
+  判断，则触发最终空结果兜底：跳过所有封装绑定结果，把这些目标引脚表
+  直接输出到单个 ``pkg=default``，避免绑定阶段失败导致 0 输出。
 * 语义字段判断默认并发数为 4，可通过 ``EXTRACT_SCHEMA_WORKERS`` 覆盖。
 """
 
@@ -130,7 +135,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from extract.special_table_handlers import find_special_table_match
 from extract.parallel_cell_splitter import (
@@ -746,7 +751,24 @@ def extract_pin_package_info_from_table_candidates(
     # 全部可用，同时不会反向影响表格判断、字段映射或 package 绑定。
     result = build_public_result(packages, include_debug)
     result = filter_supplemental_signal_groups_when_primary_tables_exist(result)
-    return deduplicate_pins_within_packages(result)
+    result = deduplicate_pins_within_packages(result)
+    if (
+        not result_has_pin_records(result)
+        and any(
+            decisions[item["table_id"]].should_extract
+            for item in prepared
+        )
+    ):
+        result = apply_empty_output_default_pkg_fallback(
+            prepared=prepared,
+            decisions=decisions,
+            multi_package_plans=multi_package_plans,
+            include_debug=include_debug,
+            source_name=source_name,
+        )
+        result = filter_supplemental_signal_groups_when_primary_tables_exist(result)
+        result = deduplicate_pins_within_packages(result)
+    return result
 
 
 def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, include_debug: bool) -> dict[int, TableDecision]:
@@ -1743,6 +1765,136 @@ def add_pin_record_to_group(group: ExtractedGroup, record: dict[str, Any]) -> No
     """把单条 pin 追加到分组，刻意不按 pin_no 去重。"""
     # 项目规则：每条行记录独立保留，绝不按 pin_no 去重或合并。
     group.pin_list.append(normalize_pin_record(record))
+
+
+def result_has_pin_records(result: Sequence[dict[str, Any]]) -> bool:
+    """最终公开结果中是否已经存在任何 pin 记录。"""
+
+    return any(
+        bool(group.get("pin_list"))
+        for package in result
+        for group in package.get("group_list", [])
+    )
+
+
+def apply_empty_output_default_pkg_fallback(
+    *,
+    prepared: Sequence[dict[str, Any]],
+    decisions: Mapping[int, TableDecision],
+    multi_package_plans: Mapping[int, MultiPackagePlan],
+    include_debug: bool,
+    source_name: str,
+) -> list[dict[str, Any]]:
+    """最终无 pin 输出时，把所有已确认目标引脚表输出到 ``default``。
+
+    这是最后一层兜底：前面的特殊表过滤、字段判断和多封装结构分析都已经
+    完成；这里只绕过 package/symbol 绑定结果，避免所有目标表因
+    ``package_unresolved`` 被跳过后得到空 JSON。
+    """
+
+    default_assignment = PackageAssignment(
+        package_key="empty_output_default",
+        pkg="default",
+        reason="empty_output_default_pkg_fallback",
+    )
+    packages: dict[str, dict[str, Any]] = {}
+    total_extracted = 0
+    fallback_table_ids: list[int] = []
+
+    for item in prepared:
+        table_id = item["table_id"]
+        table_decision = decisions[table_id]
+        if not table_decision.should_extract:
+            continue
+
+        plan = multi_package_plans.get(table_id) or MultiPackagePlan(
+            False,
+            "single_package",
+        )
+        group_name = clean_group_name(
+            build_public_group_name(
+                infer_group_name(item["table"].title)
+                or table_decision.group
+                or infer_group_name_from_headers(item["headers"])
+                or "Pin/Package Table",
+                item["table"].figure_context_title,
+            )
+        )
+
+        extracted_count = 0
+        if plan.is_multi_package:
+            for bound_row in iter_bound_package_rows(plan, item["data_rows"]):
+                for record in extract_records_from_bound_package_row(bound_row):
+                    description = read_optional_mapped_field(
+                        item["data_rows"][bound_row.row_index],
+                        table_decision.columns,
+                        "description",
+                    )
+                    if description is not None:
+                        record["description"] = description
+                    if include_debug and source_name:
+                        record["source"] = source_name
+                    if include_debug and item["table"].page_idx is not None:
+                        record["source_page"] = item["table"].page_idx + 1
+                    bucket = get_package_bucket(packages, default_assignment)
+                    group = get_or_create_group(bucket, group_name)
+                    add_pin_record_to_group(group, record)
+                    extracted_count += 1
+        else:
+            for row_index, row in enumerate(item["data_rows"]):
+                if (
+                    table_decision.included_row_indexes is not None
+                    and row_index not in table_decision.included_row_indexes
+                ):
+                    continue
+                if not any(cell.strip() for cell in row):
+                    continue
+                if is_group_row(row):
+                    continue
+                for record in extract_records_from_row(row, table_decision.columns):
+                    record.pop("_raw_fields", None)
+                    if include_debug and source_name:
+                        record["source"] = source_name
+                    if include_debug and item["table"].page_idx is not None:
+                        record["source_page"] = item["table"].page_idx + 1
+                    bucket = get_package_bucket(packages, default_assignment)
+                    group = get_or_create_group(bucket, group_name)
+                    add_pin_record_to_group(group, record)
+                    extracted_count += 1
+
+        if extracted_count:
+            total_extracted += extracted_count
+            fallback_table_ids.append(table_id)
+            debug = item["debug"]
+            debug["status"] = "extracted"
+            debug["skip_reason"] = ""
+            debug["pin_count"] = extracted_count
+            debug["package_assignments"] = [
+                {
+                    "local_slot": 0,
+                    "pkg": default_assignment.pkg,
+                    "reason": default_assignment.reason,
+                }
+            ]
+            debug["group"] = group_name
+            debug["empty_output_fallback"] = {
+                "status": "applied",
+                "reason": "final_output_has_no_pin_records",
+                "pkg": default_assignment.pkg,
+            }
+
+    if include_debug and LAST_EXTRACTION_DEBUG:
+        LAST_EXTRACTION_DEBUG[0].setdefault("final_output_fallback", {})
+        LAST_EXTRACTION_DEBUG[0]["final_output_fallback"] = {
+            "stage": "empty_output_default_pkg_fallback",
+            "status": "applied" if total_extracted else "no_records_extracted",
+            "reason": "final_output_has_no_pin_records",
+            "pkg": default_assignment.pkg,
+            "target_table_ids": fallback_table_ids,
+            "pin_count": total_extracted,
+        }
+
+    return build_public_result(packages, include_debug)
 
 
 # ---------------------------------------------------------------------------
