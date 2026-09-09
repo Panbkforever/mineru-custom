@@ -90,20 +90,25 @@ def unused_pins_connection_table_filter(
     normalized_title = normalize_text(title)
     if not normalized_title:
         return None
-    if re.search(
+    is_unused_pins_connection_table = re.search(
         r"\bconnections?\s+for\s+unused\s+pins?(?:\s+and\s+modules)?\b",
         normalized_title,
     ) or re.search(
         r"\bunused\s+pins?(?:\s+and\s+modules)?\s+connections?\b",
         normalized_title,
-    ):
-        return SpecialTableMatch(
-            handler_name="unused_pins_connection_table_filter",
-            columns=(),
-            included_row_indexes=frozenset(),
-            should_extract=False,
-        )
-    return None
+    )
+    if not is_unused_pins_connection_table:
+        return None
+
+    if re.search(r"\b(?:rgz|rkp)\s+package\b", normalized_title):
+        return None
+
+    return SpecialTableMatch(
+        handler_name="unused_pins_connection_table_filter",
+        columns=(),
+        included_row_indexes=frozenset(),
+        should_extract=False,
+    )
 
 
 def supplemental_characteristics_table_filter(

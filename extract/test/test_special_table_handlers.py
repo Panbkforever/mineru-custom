@@ -22,7 +22,7 @@ class SpecialTableHandlersTest(unittest.TestCase):
         """Connections for Unused Pins 表必须在模型前直接过滤。"""
 
         match = unused_pins_connection_table_filter(
-            "Table 7-3. Connections for Unused Pins – RGZ Package",
+            "Table 7-3. Connections for Unused Pins – XYZ Package",
             ["Pin", "Signal", "Connection Requirements"],
             [["3", "NC", "Tie to ground"]],
         )
@@ -39,9 +39,27 @@ class SpecialTableHandlersTest(unittest.TestCase):
                 "</table>"
             ),
             page_idx=0,
-            title="Table 7-4. Connection for Unused Pins and Modules – RKP Package",
+            title="Table 7-4. Connection for Unused Pins and Modules – XYZ Package",
         )
         self.assertEqual(extract_pin_package_info_from_table_candidates([table]), [])
+
+    def test_unused_pins_connection_table_rgz_rkp_package_is_not_rejected(
+        self,
+    ) -> None:
+        """RGZ/RKP package 的 unused pins 连接表不能被特殊规则过滤。"""
+
+        for title in (
+            "Table 7-3. Connections for Unused Pins – RGZ Package",
+            "Table 7-4. Connection for Unused Pins and Modules – RKP Package",
+        ):
+            with self.subTest(title=title):
+                match = unused_pins_connection_table_filter(
+                    title,
+                    ["Pin", "Signal", "Connection Requirements"],
+                    [["3", "NC", "Tie to ground"]],
+                )
+
+                self.assertIsNone(match)
 
     def test_unused_word_without_connection_title_does_not_match(self) -> None:
         """普通 unused 说明标题不能被扩大过滤。"""
