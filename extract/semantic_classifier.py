@@ -14,12 +14,17 @@
 
 from __future__ import annotations
 
+import contextlib
+import errno
+import fcntl
 import json
 import os
 import re
+import tempfile
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Sequence
 
 
@@ -367,8 +372,9 @@ def call_model_json(
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=request_timeout) as response:
-                raw = response.read().decode("utf-8")
+            with llm_request_slot():
+                with urllib.request.urlopen(request, timeout=request_timeout) as response:
+                    raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore")
             last_error = RuntimeError(f"DeepSeek API 请求失败: HTTP {exc.code} {detail}")
@@ -400,6 +406,63 @@ def call_model_json(
                 continue
             break
     raise last_error or ValueError("DeepSeek returned invalid JSON")
+
+
+@contextlib.contextmanager
+def llm_request_slot():
+    """Limit concurrent model HTTP requests across batch_extract.py subprocesses.
+
+    Set EXTRACT_LLM_WORKERS to a positive integer to enable the process-wide
+    file-lock semaphore. A value of 0 or an unset variable keeps the historical
+    direct-call behavior for standalone extract.py usage.
+    """
+
+    worker_count_text = os.getenv("EXTRACT_LLM_WORKERS")
+    if not worker_count_text:
+        yield
+        return
+
+    try:
+        worker_count = int(worker_count_text)
+    except ValueError:
+        worker_count = 0
+
+    if worker_count <= 0:
+        yield
+        return
+
+    lock_dir = Path(
+        os.getenv("EXTRACT_LLM_LOCK_DIR")
+        or (Path(tempfile.gettempdir()) / "mineru_extract_llm_locks")
+    )
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        poll_seconds = float(os.getenv("EXTRACT_LLM_LOCK_POLL_SECONDS", "0.2"))
+    except ValueError:
+        poll_seconds = 0.2
+    poll_seconds = max(0.05, poll_seconds)
+
+    slot_file = None
+    while slot_file is None:
+        for slot_index in range(worker_count):
+            candidate = (lock_dir / f"slot-{slot_index}.lock").open("a+")
+            try:
+                fcntl.flock(candidate.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                candidate.close()
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                continue
+            slot_file = candidate
+            break
+        if slot_file is None:
+            time.sleep(poll_seconds)
+
+    try:
+        yield
+    finally:
+        fcntl.flock(slot_file.fileno(), fcntl.LOCK_UN)
+        slot_file.close()
 
 
 def parse_json_content(content: str) -> dict[str, Any]:

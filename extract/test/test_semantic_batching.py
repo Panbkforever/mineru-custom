@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -52,6 +54,40 @@ class SemanticBatchingTests(unittest.TestCase):
 
         self.assertEqual(result, {"ok": True})
         self.assertEqual(captured["timeout"], 90.0)
+
+    def test_model_json_uses_configured_llm_slot_lock(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return (
+                    b'{"choices":[{"message":{"content":"{\\"ok\\": true}"}}]}'
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.dict(
+            os.environ,
+            {
+                "EXTRACT_LLM_WORKERS": "1",
+                "EXTRACT_LLM_LOCK_DIR": tmp_dir,
+            },
+            clear=True,
+        ), patch(
+            "extract.semantic_classifier.urllib.request.urlopen",
+            return_value=FakeResponse(),
+        ):
+            result = call_model_json(
+                {"task": "test"},
+                api_key="test",
+                system_prompt="Return JSON.",
+                max_tokens=10,
+            )
+
+            self.assertEqual(result, {"ok": True})
+            self.assertTrue((Path(tmp_dir) / "slot-0.lock").exists())
 
     def test_small_pin_table_sends_all_data_rows(self):
         rows = [["PARENT"], ["PIN"]] + [[str(index)] for index in range(30)]
