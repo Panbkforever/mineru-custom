@@ -281,6 +281,42 @@ class SemanticBatchingTests(unittest.TestCase):
             9,
         )
 
+    def test_package_catalog_batch_timeout_prints_warning(self):
+        tables = [
+            PackageCatalogTable(
+                table_id=index,
+                page_idx=index,
+                title=f"Table {index}",
+                group_context="",
+                current_chapter_titles=(),
+                headers=("A", "B"),
+                rows=(("A", "B"), ("x", "y")),
+            )
+            for index in range(4)
+        ]
+
+        with patch(
+            "extract.semantic_classifier.classify_package_catalog_tables",
+            side_effect=TimeoutError("read operation timed out"),
+        ), patch("builtins.print") as mocked_print:
+            entries, diagnostics = classify_package_catalog_candidates(
+                tables,
+                source_name="sample.pdf",
+                target_tables=(),
+            )
+
+        self.assertEqual(entries, [])
+        self.assertEqual(
+            sum(item.get("status") == "error" for item in diagnostics),
+            4,
+        )
+        printed = "\n".join(
+            " ".join(str(arg) for arg in call.args)
+            for call in mocked_print.call_args_list
+        )
+        self.assertIn("封装目录判断批次超时", printed)
+        self.assertIn("[0, 1, 2, 3]", printed)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -186,6 +186,35 @@ def test_catalog_candidates_without_toc_use_first_and_last_ten_pages():
     assert [table.page_idx for table in candidates] == [0, 9, 90, 99]
 
 
+def test_catalog_candidates_exclude_family_members_tables_before_model():
+    family_members = catalog_table(
+        1,
+        "Table 3-1. Family Members",
+        ["DEVICE", "PROGRAM (KB)", "SRAM (KB)", "I/O", "PACKAGE"],
+        [
+            ["DEVICE", "PROGRAM (KB)", "SRAM (KB)", "I/O", "PACKAGE"],
+            ["CC430F6147", "32", "4", "44", "64 RGC"],
+            ["CC430F5147", "32", "4", "30", "48 RGZ"],
+        ],
+        page_idx=8,
+    )
+    device_info = catalog_table(
+        0,
+        "器件信息",
+        ["器件型号", "封装", "封装尺寸"],
+        [["CC430F6147IRGC", "VQFN (64)", "9mm x 9mm"]],
+        page_idx=1,
+    )
+
+    candidates = find_package_catalog_candidates(
+        [device_info, family_members],
+        document_page_count=131,
+    )
+
+    assert device_info in candidates
+    assert family_members not in candidates
+
+
 def test_priority_title_checks_own_table_title_not_inherited_chapter():
     inherited_only = PackageCatalogTable(
         table_id=1,

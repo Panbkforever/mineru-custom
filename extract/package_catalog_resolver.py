@@ -405,6 +405,8 @@ def find_package_catalog_candidates(
             continue
         if not _has_catalog_table_shape(table):
             continue
+        if _is_family_members_catalog_table(table):
+            continue
 
         # 最高优先级只看当前表自己的 title。group_context 和章节标题仍会
         # 传给模型作为语义上下文，但不能把整章普通表都提升为候选。
@@ -422,6 +424,17 @@ def find_package_catalog_candidates(
     # 最终 Markdown 缺少 middle_json 时没有可靠页码。此时不能恢复旧的
     # “前后 15% 表格”猜测，只保留有自身表题证据的候选，避免请求量失控。
     return [*priority, *regional]
+
+
+def _is_family_members_catalog_table(table: PackageCatalogTable) -> bool:
+    """排除器件族能力对比表，避免污染文档级物理封装槽位。
+
+    ``Family Members`` 表通常列出 Program/SRAM/外设/I/O 资源，并附带
+    一个 package 列。它不是 package catalog；若送入第二次模型，模型可能
+    把每个 family member 行误判成独立封装槽。
+    """
+
+    return "family members" in normalize_text(table.title)
 
 
 def _has_catalog_table_shape(table: PackageCatalogTable) -> bool:
@@ -546,6 +559,15 @@ def classify_package_catalog_candidates(
                 except Exception as exc:
                     batch_responses = {}
                     batch_error = str(exc)
+                    if _is_timeout_error(exc):
+                        table_ids = [table.table_id for _, table in batch]
+                        print(
+                            "⚠️ 封装目录判断批次超时: "
+                            f"候选表 {table_ids} 标记为失败，"
+                            "后续将按现有规则尝试本地 fallback。"
+                            f"原因: {batch_error}",
+                            flush=True,
+                        )
                 else:
                     batch_error = ""
                 for order, table in batch:
@@ -644,6 +666,15 @@ def classify_package_catalog_candidates(
             target_tables=target_tables,
         )
     return entries, diagnostics
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    """识别第二次 package catalog 模型调用的超时异常。"""
+
+    if isinstance(exc, TimeoutError):
+        return True
+    message = str(exc).lower()
+    return "timeout" in message or "timed out" in message or "超时" in message
 
 
 def package_catalog_decision_from_response(
