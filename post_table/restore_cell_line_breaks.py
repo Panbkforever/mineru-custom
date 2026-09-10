@@ -593,8 +593,6 @@ def _visual_runs_from_characters(
     heights = sorted(max(0.5, item["y1"] - item["y0"]) for item in characters)
     median_height = heights[len(heights) // 2]
     y_tolerance = max(1.5, median_height * 0.45)
-    widths = sorted(max(0.2, item["x1"] - item["x0"]) for item in characters)
-    median_width = widths[len(widths) // 2]
 
     # PDFium 返回的是紧字符框。逗号和下划线的中心通常明显低于同一行的
     # 字母数字，直接按全部字符聚类会把标点误判成独立视觉行。因此先用
@@ -619,16 +617,9 @@ def _visual_runs_from_characters(
     ):
         best_index = -1
         best_distance = float("inf")
-        for index, line_chars in enumerate(visual_lines):
-            if not _same_visual_line(
-                item,
-                line_chars,
-                y_tolerance=y_tolerance,
-                median_width=median_width,
-            ):
-                continue
-            distance = abs(item["cy"] - line_centers[index])
-            if distance < best_distance:
+        for index, center in enumerate(line_centers):
+            distance = abs(item["cy"] - center)
+            if distance <= y_tolerance and distance < best_distance:
                 best_index = index
                 best_distance = distance
         if best_index < 0:
@@ -681,98 +672,6 @@ def _visual_runs_from_characters(
             ))
         result.append(runs)
     return result
-
-
-def _same_visual_line(
-    item: dict[str, Any],
-    line_chars: list[dict[str, Any]],
-    *,
-    y_tolerance: float,
-    median_width: float,
-) -> bool:
-    """判断一个字符是否属于已聚类的视觉行。
-
-    PDFium 返回的是紧字符框，窄数字或不同字形的字符中心点可能有轻微
-    上下偏差。这里先看字符框的垂直重叠，再保留原来的中心点距离兜底；
-    对横向紧邻的同一 word 字符允许更宽的纵向偏差，避免 ``12`` 被拆成
-    两条视觉行。
-    """
-
-    if not line_chars:
-        return False
-
-    line_y0 = min(value["y0"] for value in line_chars)
-    line_y1 = max(value["y1"] for value in line_chars)
-    line_height = max(0.5, line_y1 - line_y0)
-    item_height = max(0.5, item["y1"] - item["y0"])
-    height_ratio = min(item_height, line_height) / max(item_height, line_height)
-
-    overlap = max(0.0, min(item["y1"], line_y1) - max(item["y0"], line_y0))
-    overlap_ratio = overlap / max(0.5, min(item_height, line_height))
-    if height_ratio >= 0.55 and overlap_ratio >= 0.45:
-        return True
-
-    line_center = sum(value["cy"] for value in line_chars) / len(line_chars)
-    if abs(item["cy"] - line_center) <= y_tolerance:
-        return True
-
-    return _near_horizontal_neighbor_same_line(
-        item,
-        line_chars,
-        y_tolerance=y_tolerance,
-        median_width=median_width,
-    )
-
-
-def _near_horizontal_neighbor_same_line(
-    item: dict[str, Any],
-    line_chars: list[dict[str, Any]],
-    *,
-    y_tolerance: float,
-    median_width: float,
-) -> bool:
-    """用横向紧邻关系修正同一 word 内字符的行归属。
-
-    只接受左右相邻、间距很小的字符；上下两行同列文本通常是 x 区间重叠，
-    不满足这个横向紧邻条件，因此不会被这里重新粘成一行。
-    """
-
-    neighbor = None
-    best_gap = float("inf")
-    for candidate in line_chars:
-        if candidate["x1"] <= item["x0"]:
-            gap = item["x0"] - candidate["x1"]
-        elif item["x1"] <= candidate["x0"]:
-            gap = candidate["x0"] - item["x1"]
-        else:
-            continue
-        if gap < best_gap:
-            best_gap = gap
-            neighbor = candidate
-
-    if neighbor is None:
-        return False
-    if best_gap > max(1.5, median_width * 0.8):
-        return False
-
-    item_height = max(0.5, item["y1"] - item["y0"])
-    neighbor_height = max(0.5, neighbor["y1"] - neighbor["y0"])
-    height_ratio = min(item_height, neighbor_height) / max(item_height, neighbor_height)
-    if height_ratio < 0.55:
-        return False
-
-    overlap = max(
-        0.0,
-        min(item["y1"], neighbor["y1"]) - max(item["y0"], neighbor["y0"]),
-    )
-    overlap_ratio = overlap / max(0.5, min(item_height, neighbor_height))
-    if overlap_ratio >= 0.25:
-        return True
-
-    return abs(item["cy"] - neighbor["cy"]) <= max(
-        y_tolerance * 1.5,
-        item_height * 0.75,
-    )
 
 
 def _characters_to_text(characters: list[dict[str, Any]]) -> str:

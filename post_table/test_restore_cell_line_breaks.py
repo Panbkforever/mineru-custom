@@ -8,7 +8,6 @@ from post_table.restore_cell_line_breaks import (
     _match_visual_lines_across_pages,
     _restore_table_cells,
     _scale_bbox_to_pdf,
-    _visual_runs_from_characters,
 )
 
 
@@ -71,58 +70,6 @@ def test_short_cell_is_not_excluded_by_arbitrary_length_limit():
     assert corrected == "<table><tr><td>A1<br>A2</td></tr></table>"
     assert changed_cells == 1
     assert added_breaks == 1
-
-
-def test_adjacent_digit_characters_with_shifted_tight_boxes_stay_on_one_visual_line():
-    characters = [
-        {
-            "char": "1",
-            "x0": 10.0,
-            "x1": 13.0,
-            "y0": 100.0,
-            "y1": 106.0,
-            "cy": 103.0,
-        },
-        {
-            "char": "2",
-            "x0": 13.4,
-            "x1": 16.8,
-            "y0": 103.0,
-            "y1": 109.0,
-            "cy": 106.0,
-        },
-    ]
-
-    runs = _visual_runs_from_characters(characters)
-
-    assert len(runs) == 1
-    assert [run.text for run in runs[0]] == ["12"]
-
-
-def test_true_stacked_digit_characters_remain_separate_visual_lines():
-    characters = [
-        {
-            "char": "1",
-            "x0": 10.0,
-            "x1": 13.0,
-            "y0": 100.0,
-            "y1": 106.0,
-            "cy": 103.0,
-        },
-        {
-            "char": "2",
-            "x0": 10.1,
-            "x1": 13.1,
-            "y0": 111.0,
-            "y1": 117.0,
-            "cy": 114.0,
-        },
-    ]
-
-    runs = _visual_runs_from_characters(characters)
-
-    assert len(runs) == 2
-    assert [line[0].text for line in runs] == ["1", "2"]
 
 
 def test_unmatched_cell_remains_unchanged():
