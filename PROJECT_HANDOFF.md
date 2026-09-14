@@ -211,7 +211,38 @@ python batch_extract.py \
 
 如果直接把 `--workers` 开大，而不限制 `--llm-workers`，实际 API 并发会被文档级并发和表级模型并发叠加放大，容易造成超时、限流或结果不稳定。
 
-### 4.4 主要环境变量
+### 4.4 接口层并发
+
+`extract_api.py` 是 PDF -> pin/package JSON 的 Flask 接口。它和 CLI 批处理使用同一套 `extract.py` 子进程链路。
+
+服务级并发配置：
+
+```bash
+export EXTRACT_API_WORKERS=2
+export EXTRACT_API_LLM_WORKERS=1
+python extract_api.py
+```
+
+含义：
+
+- `EXTRACT_API_WORKERS`：接口服务同时允许几个完整 parse + extract 任务进入执行；
+- `EXTRACT_API_LLM_WORKERS`：接口服务下所有 extract 子进程共享的 DeepSeek 请求并发；
+- `EXTRACT_API_LOCK_DIR`：接口完整任务锁目录，默认在系统临时目录；
+- `EXTRACT_API_LLM_LOCK_DIR`：接口 LLM 锁目录，默认在系统临时目录。
+
+接口层不把 `api_workers/llm_workers` 设计成单次请求参数。原因是并发额度必须在服务进程和多个请求之间共享；如果每个请求各自传不同的并发数，文件锁 slot 数会不一致，限流语义不可靠。
+
+`/health` 会返回当前接口并发配置：
+
+```json
+{
+  "status": "ok",
+  "api_workers": 2,
+  "llm_workers": 1
+}
+```
+
+### 4.5 主要环境变量
 
 DeepSeek 相关：
 
@@ -858,6 +889,13 @@ AutoDL 单卡：--workers 2 --llm-workers 1
 ```
 
 不建议直接 `--workers 4` 起步，因为 MinerU parse 会加载 OCR/table/formula/VLM 相关模型，显存和 CPU/IO 都可能成为瓶颈。
+
+接口层也已接入同一思路：
+
+- `extract_api.py` 使用 `EXTRACT_API_WORKERS` 限制完整请求并发；
+- `extract_api.py` 启动 `extract.py` 子进程时注入 `EXTRACT_LLM_WORKERS` 和 `EXTRACT_LLM_LOCK_DIR`；
+- 所以接口并发请求之间的第一次模型调用和第二次封装目录模型调用也会按全局 LLM slot 排队；
+- Flask 本地启动时显式启用 `threaded=True`，允许多个 HTTP 请求同时进入服务，由文件锁决定实际执行数量。
 
 ## 16. 调试方式
 

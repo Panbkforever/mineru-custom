@@ -15,12 +15,16 @@ Example:
 
 from __future__ import annotations
 
+import contextlib
+import errno
+import fcntl
 import logging
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from flask import Flask, after_this_request, jsonify, request, send_file
@@ -45,7 +49,46 @@ DEFAULT_SEMANTIC_CLASSIFY = os.environ.get("EXTRACT_SEMANTIC_CLASSIFY", "false")
     "yes",
     "on",
 }
-MAX_EXTRACT_SECONDS = int(os.environ.get("EXTRACT_API_TIMEOUT", "3600"))
+
+
+def int_from_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        logging.warning("Invalid integer env %s=%r, use %s", name, os.environ.get(name), default)
+        return default
+
+
+def float_from_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        logging.warning("Invalid float env %s=%r, use %s", name, os.environ.get(name), default)
+        return default
+
+
+MAX_EXTRACT_SECONDS = int_from_env("EXTRACT_API_TIMEOUT", 3600)
+DEFAULT_API_WORKERS = max(1, int_from_env("EXTRACT_API_WORKERS", 1))
+DEFAULT_LLM_WORKERS = max(
+    1,
+    int_from_env(
+        "EXTRACT_API_LLM_WORKERS",
+        int_from_env("EXTRACT_LLM_WORKERS", 1),
+    ),
+)
+DEFAULT_API_LOCK_DIR = Path(
+    os.environ.get("EXTRACT_API_LOCK_DIR")
+    or (Path(tempfile.gettempdir()) / "mineru_extract_api_pipeline_locks")
+)
+DEFAULT_LLM_LOCK_DIR = Path(
+    os.environ.get("EXTRACT_API_LLM_LOCK_DIR")
+    or os.environ.get("EXTRACT_LLM_LOCK_DIR")
+    or (Path(tempfile.gettempdir()) / "mineru_extract_api_llm_locks")
+)
+DEFAULT_LOCK_POLL_SECONDS = max(
+    0.05,
+    float_from_env("EXTRACT_API_LOCK_POLL_SECONDS", 0.2),
+)
 
 
 def allowed_pdf(filename: str) -> bool:
@@ -79,13 +122,25 @@ def index():
                 "lang": f"optional, default {DEFAULT_LANG}",
                 "semantic_classify": f"optional, default {DEFAULT_SEMANTIC_CLASSIFY}",
             },
+            "server_concurrency": {
+                "api_workers": DEFAULT_API_WORKERS,
+                "llm_workers": DEFAULT_LLM_WORKERS,
+                "api_lock_dir": str(DEFAULT_API_LOCK_DIR),
+                "llm_lock_dir": str(DEFAULT_LLM_LOCK_DIR),
+            },
         }
     ), 200
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"}), 200
+    return jsonify(
+        {
+            "status": "ok",
+            "api_workers": DEFAULT_API_WORKERS,
+            "llm_workers": DEFAULT_LLM_WORKERS,
+        }
+    ), 200
 
 
 @app.route("/api/extract-pdf-json", methods=["POST"])
@@ -120,16 +175,17 @@ def extract_pdf_json():
         uploaded.save(pdf_path)
         logging.info("Received PDF: %s", filename)
 
-        run_extract_pipeline(
-            pdf_path=pdf_path,
-            parse_output_dir=parse_output_dir,
-            extract_output=extract_output,
-            summary_output=summary_output,
-            backend=backend,
-            method=method,
-            lang=lang,
-            semantic_classify=semantic_classify,
-        )
+        with api_request_slot():
+            run_extract_pipeline(
+                pdf_path=pdf_path,
+                parse_output_dir=parse_output_dir,
+                extract_output=extract_output,
+                summary_output=summary_output,
+                backend=backend,
+                method=method,
+                lang=lang,
+                semantic_classify=semantic_classify,
+            )
 
         if not extract_output.exists():
             raise FileNotFoundError(f"Extraction JSON not found: {extract_output}")
@@ -207,6 +263,10 @@ def run_extract_pipeline(
     if semantic_classify:
         command.append("--semantic-classify")
 
+    env = os.environ.copy()
+    env["EXTRACT_LLM_WORKERS"] = str(DEFAULT_LLM_WORKERS)
+    env["EXTRACT_LLM_LOCK_DIR"] = str(DEFAULT_LLM_LOCK_DIR)
+
     logging.info("Running extraction command: %s", " ".join(command))
     subprocess.run(
         command,
@@ -214,9 +274,38 @@ def run_extract_pipeline(
         text=True,
         capture_output=True,
         timeout=MAX_EXTRACT_SECONDS,
+        env=env,
     )
+
+
+@contextlib.contextmanager
+def api_request_slot():
+    """Limit concurrent full parse+extract jobs across API requests/processes."""
+
+    DEFAULT_API_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    slot_file = None
+    while slot_file is None:
+        for slot_index in range(DEFAULT_API_WORKERS):
+            candidate = (DEFAULT_API_LOCK_DIR / f"slot-{slot_index}.lock").open("a+")
+            try:
+                fcntl.flock(candidate.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                candidate.close()
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                continue
+            slot_file = candidate
+            break
+        if slot_file is None:
+            time.sleep(DEFAULT_LOCK_POLL_SECONDS)
+
+    try:
+        yield
+    finally:
+        fcntl.flock(slot_file.fileno(), fcntl.LOCK_UN)
+        slot_file.close()
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("EXTRACT_API_PORT", "5002"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
