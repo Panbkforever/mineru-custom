@@ -63,9 +63,9 @@ def classify_table_schema_batch(
         return {}
     if len(tables) > 4:
         raise ValueError("每个语义字段判断批次最多包含 4 张表")
-    api_key = os.getenv("DEEPSEEK_API_KEY")
+    api_key = get_default_deepseek_api_key()
     if not api_key:
-        raise RuntimeError("启用语义字段判断需要先设置环境变量 DEEPSEEK_API_KEY")
+        raise RuntimeError("启用语义字段判断需要先设置环境变量 DEEPSEEK_API_KEY 或 DEEPSEEK_API_KEYS")
 
     requests = []
     headers_by_id: dict[str, list[str]] = {}
@@ -155,9 +155,9 @@ def classify_package_catalog_tables(
     if len(tables) > 4:
         raise ValueError("每个封装目录判断批次最多包含 4 张表")
 
-    api_key = os.getenv("DEEPSEEK_API_KEY")
+    api_key = get_default_deepseek_api_key()
     if not api_key:
-        raise RuntimeError("启用封装目录判断需要先设置环境变量 DEEPSEEK_API_KEY")
+        raise RuntimeError("启用封装目录判断需要先设置环境变量 DEEPSEEK_API_KEY 或 DEEPSEEK_API_KEYS")
 
     payload = {
         "task": (
@@ -338,7 +338,6 @@ def call_model_json(
         if timeout is not None
         else float(os.getenv("DEEPSEEK_TIMEOUT", "90"))
     )
-    url = f"{base_url}/chat/completions"
 
     body = {
         "model": model,
@@ -362,17 +361,21 @@ def call_model_json(
     max_retries = max(1, int(os.getenv("DEEPSEEK_MAX_RETRIES", "4")))
     retry_base = float(os.getenv("DEEPSEEK_RETRY_BASE_SECONDS", "2"))
     for attempt in range(max_retries):
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(body).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            method="POST",
-        )
         try:
-            with llm_request_slot():
+            with llm_request_slot() as slot_index:
+                request_api_key = select_deepseek_api_key(api_key, slot_index)
+                request_base_url = select_deepseek_base_url(base_url, slot_index)
+                request_body = dict(body)
+                request_body["model"] = select_deepseek_model(model, slot_index)
+                request = urllib.request.Request(
+                    f"{request_base_url}/chat/completions",
+                    data=json.dumps(request_body).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {request_api_key}",
+                    },
+                    method="POST",
+                )
                 with urllib.request.urlopen(request, timeout=request_timeout) as response:
                     raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
@@ -408,6 +411,74 @@ def call_model_json(
     raise last_error or ValueError("DeepSeek returned invalid JSON")
 
 
+def split_env_list(value: str | None) -> list[str]:
+    """解析逗号、分号或换行分隔的环境变量列表。"""
+
+    if not value:
+        return []
+    return [item.strip() for item in re.split(r"[,;\n]+", value) if item.strip()]
+
+
+def get_deepseek_api_keys() -> list[str]:
+    """读取一个或多个 DeepSeek API key，兼容原单 key 配置。"""
+
+    keys = split_env_list(os.getenv("DEEPSEEK_API_KEYS"))
+    if keys:
+        return keys
+    single_key = os.getenv("DEEPSEEK_API_KEY")
+    return [single_key] if single_key else []
+
+
+def get_default_deepseek_api_key() -> str | None:
+    keys = get_deepseek_api_keys()
+    return keys[0] if keys else None
+
+
+def select_deepseek_api_key(default_api_key: str, slot_index: int | None) -> str:
+    """按 LLM 并发 slot 选择 API key。
+
+    例如 DEEPSEEK_API_KEYS="key1,key2" 且 EXTRACT_LLM_WORKERS=2 时：
+    slot 0 使用 key1，slot 1 使用 key2。若 key 数少于 slot 数，则按 slot
+    取模复用，保证旧配置仍可工作。
+    """
+
+    keys = get_deepseek_api_keys()
+    if not keys:
+        return default_api_key
+    if slot_index is None:
+        return keys[0]
+    return keys[slot_index % len(keys)]
+
+
+def select_env_value_by_slot(
+    list_env_name: str,
+    fallback: str,
+    slot_index: int | None,
+) -> str:
+    values = split_env_list(os.getenv(list_env_name))
+    if not values:
+        return fallback
+    if slot_index is None:
+        return values[0]
+    return values[slot_index % len(values)]
+
+
+def select_deepseek_base_url(default_base_url: str, slot_index: int | None) -> str:
+    return select_env_value_by_slot(
+        "DEEPSEEK_BASE_URLS",
+        default_base_url,
+        slot_index,
+    ).rstrip("/")
+
+
+def select_deepseek_model(default_model: str, slot_index: int | None) -> str:
+    return select_env_value_by_slot(
+        "DEEPSEEK_MODELS",
+        default_model,
+        slot_index,
+    )
+
+
 @contextlib.contextmanager
 def llm_request_slot():
     """Limit concurrent model HTTP requests across batch_extract.py subprocesses.
@@ -419,7 +490,7 @@ def llm_request_slot():
 
     worker_count_text = os.getenv("EXTRACT_LLM_WORKERS")
     if not worker_count_text:
-        yield
+        yield None
         return
 
     try:
@@ -428,7 +499,7 @@ def llm_request_slot():
         worker_count = 0
 
     if worker_count <= 0:
-        yield
+        yield None
         return
 
     lock_dir = Path(
@@ -443,6 +514,7 @@ def llm_request_slot():
     poll_seconds = max(0.05, poll_seconds)
 
     slot_file = None
+    selected_slot_index = None
     while slot_file is None:
         for slot_index in range(worker_count):
             candidate = (lock_dir / f"slot-{slot_index}.lock").open("a+")
@@ -454,12 +526,13 @@ def llm_request_slot():
                     raise
                 continue
             slot_file = candidate
+            selected_slot_index = slot_index
             break
         if slot_file is None:
             time.sleep(poll_seconds)
 
     try:
-        yield
+        yield selected_slot_index
     finally:
         fcntl.flock(slot_file.fileno(), fcntl.LOCK_UN)
         slot_file.close()

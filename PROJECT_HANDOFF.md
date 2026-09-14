@@ -232,6 +232,28 @@ python batch_extract.py \
 
 如果直接把 `--workers` 开大，而不限制 `--llm-workers`，实际 API 并发会被文档级并发和表级模型并发叠加放大，容易造成超时、限流或结果不稳定。
 
+如果有多个 DeepSeek API key，可以用 `DEEPSEEK_API_KEYS` 配置多个 key，并把
+`--llm-workers` 调到相同数量。例如两个 key：
+
+```bash
+export DEEPSEEK_API_KEYS="key_1,key_2"
+python batch_extract.py \
+  -i Multi_package_TIpdf \
+  -o ex_outputs \
+  --workers 2 \
+  --llm-workers 2 \
+  --semantic-classify \
+  --continue-on-error
+```
+
+LLM 并发 slot 会按顺序选择 key：slot 0 使用 `key_1`，slot 1 使用 `key_2`。
+如果两个 API 的 base URL 或模型也不同，可以同时配置：
+
+```bash
+export DEEPSEEK_BASE_URLS="https://api.deepseek.com,https://api.deepseek.com"
+export DEEPSEEK_MODELS="deepseek-v4-flash,deepseek-v4-flash"
+```
+
 ### 4.4 接口层并发
 
 `extract_api.py` 是 PDF -> pin/package JSON 的 Flask 接口。它和 CLI 批处理使用同一套 `extract.py` 子进程链路。
@@ -261,6 +283,19 @@ source MinerU/.venv/bin/activate
 echo $DEEPSEEK_MODEL
 export EXTRACT_API_WORKERS=2
 export EXTRACT_API_LLM_WORKERS=1
+python extract_api.py
+```
+
+如果接口下有两个 DeepSeek API key，可以这样启动 LLM 两路并发：
+
+```bash
+cd /root/autodl-tmp
+source .env
+source MinerU/.venv/bin/activate
+echo $DEEPSEEK_MODEL
+export DEEPSEEK_API_KEYS="key_1,key_2"
+export EXTRACT_API_WORKERS=2
+export EXTRACT_API_LLM_WORKERS=2
 python extract_api.py
 ```
 

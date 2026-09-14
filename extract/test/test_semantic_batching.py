@@ -17,7 +17,12 @@ from extract.pin_package_extractor import (
     build_semantic_table_sample,
     decide_all_tables,
 )
-from extract.semantic_classifier import call_model_json, classify_table_schema_batch
+from extract.semantic_classifier import (
+    call_model_json,
+    classify_table_schema_batch,
+    get_deepseek_api_keys,
+    select_deepseek_api_key,
+)
 from extract.table_header_structure import NameColumnLayout
 
 
@@ -88,6 +93,69 @@ class SemanticBatchingTests(unittest.TestCase):
 
             self.assertEqual(result, {"ok": True})
             self.assertTrue((Path(tmp_dir) / "slot-0.lock").exists())
+
+    def test_deepseek_api_keys_env_supports_multiple_values(self):
+        with patch.dict(
+            os.environ,
+            {"DEEPSEEK_API_KEYS": "key-a,key-b\nkey-c"},
+            clear=True,
+        ):
+            self.assertEqual(get_deepseek_api_keys(), ["key-a", "key-b", "key-c"])
+            self.assertEqual(select_deepseek_api_key("fallback", 0), "key-a")
+            self.assertEqual(select_deepseek_api_key("fallback", 1), "key-b")
+            self.assertEqual(select_deepseek_api_key("fallback", 2), "key-c")
+            self.assertEqual(select_deepseek_api_key("fallback", 3), "key-a")
+
+    def test_model_json_selects_key_by_llm_slot(self):
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return (
+                    b'{"choices":[{"message":{"content":"{\\"ok\\": true}"}}]}'
+                )
+
+        def fake_urlopen(request, timeout):
+            captured["authorization"] = request.get_header("Authorization")
+            return FakeResponse()
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.dict(
+            os.environ,
+            {
+                "DEEPSEEK_API_KEYS": "key-a,key-b",
+                "EXTRACT_LLM_WORKERS": "2",
+                "EXTRACT_LLM_LOCK_DIR": tmp_dir,
+            },
+            clear=True,
+        ), patch(
+            "extract.semantic_classifier.llm_request_slot",
+        ) as fake_slot, patch(
+            "extract.semantic_classifier.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            class SlotOne:
+                def __enter__(self):
+                    return 1
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            fake_slot.return_value = SlotOne()
+            result = call_model_json(
+                {"task": "test"},
+                api_key="key-a",
+                system_prompt="Return JSON.",
+                max_tokens=10,
+            )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(captured["authorization"], "Bearer key-b")
 
     def test_small_pin_table_sends_all_data_rows(self):
         rows = [["PARENT"], ["PIN"]] + [[str(index)] for index in range(30)]
