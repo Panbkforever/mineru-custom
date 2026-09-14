@@ -5,6 +5,9 @@ Upload multiple PDFs, run the existing parse + extract pipeline for each PDF,
 and return a ZIP file containing JSON results and a batch report.
 
 Run:
+    cd /root/autodl-tmp
+    source .env
+    source MinerU/.venv/bin/activate
     python extract_api.py
 
 Example:

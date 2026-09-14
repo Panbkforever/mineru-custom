@@ -160,6 +160,19 @@ ex_outputs/
 
 ## 4. 运行方式
 
+所有 AutoDL 运行命令都必须先进入项目目录并激活项目环境。不要绕过
+`MinerU/.venv` 直接使用 `/root/miniconda3/bin/python` 启动解析、批处理或接口，
+否则 `extract.py -> parse_doc.py -> MinerU` 会继承错误的 Python 环境。
+
+标准前置命令：
+
+```bash
+cd /root/autodl-tmp
+source .env
+source MinerU/.venv/bin/activate
+echo $DEEPSEEK_MODEL
+```
+
 ### 4.1 单文件完整解析和抽取
 
 ```bash
@@ -176,6 +189,10 @@ python extract.py Multi_package_TIpdf/AM335x_324_298.pdf \
 ### 4.2 批量串行
 
 ```bash
+cd /root/autodl-tmp
+source .env
+source MinerU/.venv/bin/activate
+echo $DEEPSEEK_MODEL
 python batch_extract.py --semantic-classify
 ```
 
@@ -193,6 +210,10 @@ python batch_extract.py --semantic-classify
 推荐 AutoDL 单卡先从：
 
 ```bash
+cd /root/autodl-tmp
+source .env
+source MinerU/.venv/bin/activate
+echo $DEEPSEEK_MODEL
 python batch_extract.py \
   -i Multi_package_TIpdf \
   -o ex_outputs \
@@ -234,6 +255,10 @@ curl -X POST http://127.0.0.1:5002/api/extract-pdf-json-batch \
 服务级并发配置：
 
 ```bash
+cd /root/autodl-tmp
+source .env
+source MinerU/.venv/bin/activate
+echo $DEEPSEEK_MODEL
 export EXTRACT_API_WORKERS=2
 export EXTRACT_API_LLM_WORKERS=1
 python extract_api.py
@@ -1033,7 +1058,10 @@ python -m unittest post_table.test_split_merged_tables
 AutoDL 上使用：
 
 ```bash
-/root/miniconda3/bin/python -m unittest extract.test.test_semantic_batching
+cd /root/autodl-tmp
+source .env
+source MinerU/.venv/bin/activate
+python -m unittest extract.test.test_semantic_batching
 ```
 
 ## 18. 目前已知重要样例和经验结论
