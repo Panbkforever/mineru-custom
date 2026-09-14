@@ -215,6 +215,22 @@ python batch_extract.py \
 
 `extract_api.py` 是 PDF -> pin/package JSON 的 Flask 接口。它和 CLI 批处理使用同一套 `extract.py` 子进程链路。
 
+当前接口采用“一个 HTTP 请求上传多个 PDF，返回一个 zip 包”的批量模式：
+
+```bash
+curl -X POST http://127.0.0.1:5002/api/extract-pdf-json-batch \
+  -F "files=@/root/autodl-tmp/pdfs/a.pdf" \
+  -F "files=@/root/autodl-tmp/pdfs/b.pdf" \
+  -o extract_results.zip
+```
+
+返回的 zip 中包含：
+
+- 每个成功 PDF 对应的 `<stem>.json`；
+- `_batch_report.json`，记录每个输入文件的成功、失败、跳过原因。
+
+原单文件接口 `/api/extract-pdf-json` 已从 Flask 路由中注释掉，代码仅保留作回滚参考。
+
 服务级并发配置：
 
 ```bash
@@ -230,7 +246,7 @@ python extract_api.py
 - `EXTRACT_API_LOCK_DIR`：接口完整任务锁目录，默认在系统临时目录；
 - `EXTRACT_API_LLM_LOCK_DIR`：接口 LLM 锁目录，默认在系统临时目录。
 
-接口层不把 `api_workers/llm_workers` 设计成单次请求参数。原因是并发额度必须在服务进程和多个请求之间共享；如果每个请求各自传不同的并发数，文件锁 slot 数会不一致，限流语义不可靠。
+接口层不把 `api_workers/llm_workers` 设计成单次请求参数。原因是并发额度必须在服务进程、批量请求内部任务、多个 HTTP 请求之间共享；如果每个请求各自传不同的并发数，文件锁 slot 数会不一致，限流语义不可靠。
 
 `/health` 会返回当前接口并发配置：
 
@@ -892,7 +908,7 @@ AutoDL 单卡：--workers 2 --llm-workers 1
 
 接口层也已接入同一思路：
 
-- `extract_api.py` 使用 `EXTRACT_API_WORKERS` 限制完整请求并发；
+- `extract_api.py` 使用 `EXTRACT_API_WORKERS` 限制批量请求内部和请求之间的完整 parse + extract 任务并发；
 - `extract_api.py` 启动 `extract.py` 子进程时注入 `EXTRACT_LLM_WORKERS` 和 `EXTRACT_LLM_LOCK_DIR`；
 - 所以接口并发请求之间的第一次模型调用和第二次封装目录模型调用也会按全局 LLM slot 排队；
 - Flask 本地启动时显式启用 `threaded=True`，允许多个 HTTP 请求同时进入服务，由文件锁决定实际执行数量。
