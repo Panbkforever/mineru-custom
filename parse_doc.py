@@ -234,6 +234,7 @@ def apply_mineru_vllm_gpu_memory_utilization_override() -> None:
 
     try:
         from mineru.backend.vlm import utils as vlm_utils  # noqa: WPS433
+        from mineru.backend.vlm import vlm_analyze  # noqa: WPS433
     except Exception as exc:
         print(f"  ⚠️  跳过 MinerU/vLLM 显存比例覆盖: {exc}")
         return
@@ -242,6 +243,7 @@ def apply_mineru_vllm_gpu_memory_utilization_override() -> None:
         return value
 
     vlm_utils.set_default_gpu_memory_utilization = fixed_gpu_memory_utilization
+    vlm_analyze.set_default_gpu_memory_utilization = fixed_gpu_memory_utilization
     os.environ["MINERU_VLLM_GPU_MEMORY_UTILIZATION"] = str(value)
     print(f"MinerU/vLLM GPU memory utilization: {value}")
 
