@@ -286,7 +286,8 @@ curl -X POST http://127.0.0.1:5002/api/extract-pdf-json-batch \
 cd /root/autodl-tmp
 source .env
 source MinerU/.venv/bin/activate
-echo $DEEPSEEK_MODEL
+echo "${DEEPSEEK_MODEL:-$DEEPSEEK_MODELS}"
+export MINERU_VLLM_GPU_MEMORY_UTILIZATION=0.4
 export EXTRACT_API_WORKERS=2
 export EXTRACT_API_LLM_WORKERS=1
 python extract_api.py
@@ -298,8 +299,9 @@ python extract_api.py
 cd /root/autodl-tmp
 source .env
 source MinerU/.venv/bin/activate
-echo $DEEPSEEK_MODEL
+echo "${DEEPSEEK_MODEL:-$DEEPSEEK_MODELS}"
 export DEEPSEEK_API_KEYS="key_1,key_2"
+export MINERU_VLLM_GPU_MEMORY_UTILIZATION=0.4
 export EXTRACT_API_WORKERS=2
 export EXTRACT_API_LLM_WORKERS=2
 python extract_api.py
@@ -373,7 +375,13 @@ MinerU 相关：
 
 ```bash
 export MINERU_MODEL_SOURCE=modelscope
+export MINERU_VLLM_GPU_MEMORY_UTILIZATION=0.4
 ```
+
+`MINERU_VLLM_GPU_MEMORY_UTILIZATION` 用来覆盖 MinerU/vLLM 默认
+`gpu_memory_utilization=0.5`。在两个 PDF 并发进入 `hybrid-auto-engine` 时，
+`0.5 + 0.5` 容易把整卡显存占满；项目默认值已降为 `0.4`，给 OCR、PDF 渲染、
+CUDA graph 和临时张量留出余量。若仍然 OOM，可继续试 `0.35`。
 
 ## 5. 总体处理流程
 

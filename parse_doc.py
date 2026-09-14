@@ -199,6 +199,53 @@ from post_table.split_merged_tables import (  # noqa: E402
 )
 
 
+DEFAULT_MINERU_VLLM_GPU_MEMORY_UTILIZATION = 0.4
+
+
+def apply_mineru_vllm_gpu_memory_utilization_override() -> None:
+    """Limit MinerU/vLLM per-process GPU reservation for multi-PDF concurrency.
+
+    MinerU defaults each vLLM process to gpu_memory_utilization=0.5. With two
+    concurrent hybrid-auto-engine parses, two vLLM processes can reserve nearly
+    the whole GPU, leaving no headroom for OCR, PDF rendering and temporary CUDA
+    allocations. Keep the default lower in this project, while allowing operators
+    to tune it with MINERU_VLLM_GPU_MEMORY_UTILIZATION.
+    """
+
+    raw_value = os.getenv(
+        "MINERU_VLLM_GPU_MEMORY_UTILIZATION",
+        str(DEFAULT_MINERU_VLLM_GPU_MEMORY_UTILIZATION),
+    )
+    try:
+        value = float(raw_value)
+    except ValueError:
+        value = DEFAULT_MINERU_VLLM_GPU_MEMORY_UTILIZATION
+        print(
+            "  ⚠️  MINERU_VLLM_GPU_MEMORY_UTILIZATION 无效，"
+            f"使用默认值 {value}: {raw_value!r}"
+        )
+
+    if not 0 < value <= 1:
+        print(
+            "  ⚠️  MINERU_VLLM_GPU_MEMORY_UTILIZATION 必须在 0~1 之间，"
+            f"使用默认值 {DEFAULT_MINERU_VLLM_GPU_MEMORY_UTILIZATION}: {value}"
+        )
+        value = DEFAULT_MINERU_VLLM_GPU_MEMORY_UTILIZATION
+
+    try:
+        from mineru.backend.vlm import utils as vlm_utils  # noqa: WPS433
+    except Exception as exc:
+        print(f"  ⚠️  跳过 MinerU/vLLM 显存比例覆盖: {exc}")
+        return
+
+    def fixed_gpu_memory_utilization() -> float:
+        return value
+
+    vlm_utils.set_default_gpu_memory_utilization = fixed_gpu_memory_utilization
+    os.environ["MINERU_VLLM_GPU_MEMORY_UTILIZATION"] = str(value)
+    print(f"MinerU/vLLM GPU memory utilization: {value}")
+
+
 def write_final_markdown_json(md_path: Path) -> Path:
     """
     将最终 Markdown 同步保存为同名 JSON。
@@ -280,6 +327,7 @@ def apply_post_table_correction(doc_output_dir: Path) -> tuple[int, int]:
 def main():
     # 模型下载源设为 modelscope（国内镜像）
     os.environ.setdefault("MINERU_MODEL_SOURCE", "modelscope")
+    apply_mineru_vllm_gpu_memory_utilization_override()
 
     # ---- 命令行参数定义 ----
     parser = argparse.ArgumentParser(description="MinerU 文档解析工具（Python API）")
