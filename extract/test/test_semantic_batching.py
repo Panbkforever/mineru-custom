@@ -21,6 +21,7 @@ from extract.semantic_classifier import (
     call_model_json,
     classify_table_schema_batch,
     get_deepseek_api_keys,
+    get_fixed_llm_key_index,
     select_deepseek_api_key,
 )
 from extract.table_header_structure import NameColumnLayout
@@ -156,6 +157,57 @@ class SemanticBatchingTests(unittest.TestCase):
 
         self.assertEqual(result, {"ok": True})
         self.assertEqual(captured["authorization"], "Bearer key-b")
+
+    def test_model_json_fixed_key_index_overrides_runtime_slot(self):
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return (
+                    b'{"choices":[{"message":{"content":"{\\"ok\\": true}"}}]}'
+                )
+
+        def fake_urlopen(request, timeout):
+            captured["authorization"] = request.get_header("Authorization")
+            return FakeResponse()
+
+        with patch.dict(
+            os.environ,
+            {
+                "DEEPSEEK_API_KEYS": "key-a,key-b",
+                "EXTRACT_LLM_KEY_INDEX": "0",
+            },
+            clear=True,
+        ), patch(
+            "extract.semantic_classifier.llm_request_slot",
+        ) as fake_slot, patch(
+            "extract.semantic_classifier.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            class SlotOne:
+                def __enter__(self):
+                    return 1
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            fake_slot.return_value = SlotOne()
+            self.assertEqual(get_fixed_llm_key_index(), 0)
+            result = call_model_json(
+                {"task": "test"},
+                api_key="key-a",
+                system_prompt="Return JSON.",
+                max_tokens=10,
+            )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(captured["authorization"], "Bearer key-a")
 
     def test_small_pin_table_sends_all_data_rows(self):
         rows = [["PARENT"], ["PIN"]] + [[str(index)] for index in range(30)]

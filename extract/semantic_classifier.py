@@ -363,10 +363,12 @@ def call_model_json(
     for attempt in range(max_retries):
         try:
             with llm_request_slot() as slot_index:
-                request_api_key = select_deepseek_api_key(api_key, slot_index)
-                request_base_url = select_deepseek_base_url(base_url, slot_index)
+                fixed_key_index = get_fixed_llm_key_index()
+                key_index = fixed_key_index if fixed_key_index is not None else slot_index
+                request_api_key = select_deepseek_api_key(api_key, key_index)
+                request_base_url = select_deepseek_base_url(base_url, key_index)
                 request_body = dict(body)
-                request_body["model"] = select_deepseek_model(model, slot_index)
+                request_body["model"] = select_deepseek_model(model, key_index)
                 request = urllib.request.Request(
                     f"{request_base_url}/chat/completions",
                     data=json.dumps(request_body).encode("utf-8"),
@@ -434,12 +436,26 @@ def get_default_deepseek_api_key() -> str | None:
     return keys[0] if keys else None
 
 
+def get_fixed_llm_key_index() -> int | None:
+    """Return the PDF-level fixed LLM key index when a parent worker provides it."""
+
+    value = os.getenv("EXTRACT_LLM_KEY_INDEX")
+    if value is None or not value.strip():
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
 def select_deepseek_api_key(default_api_key: str, slot_index: int | None) -> str:
-    """按 LLM 并发 slot 选择 API key。
+    """按固定 PDF key index 或 LLM 并发 slot 选择 API key。
 
     例如 DEEPSEEK_API_KEYS="key1,key2" 且 EXTRACT_LLM_WORKERS=2 时：
-    slot 0 使用 key1，slot 1 使用 key2。若 key 数少于 slot 数，则按 slot
-    取模复用，保证旧配置仍可工作。
+    index 0 使用 key1，index 1 使用 key2。若 key 数少于 index 数，则按 index
+    取模复用。调用方优先传入 PDF 级固定 index，保证同一 PDF 的两次模型
+    调用不会切换 API；没有固定 index 时才退回瞬时 LLM slot。
     """
 
     keys = get_deepseek_api_keys()

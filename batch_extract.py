@@ -286,12 +286,14 @@ def run_one_extract_job(
     env = os.environ.copy()
     env["EXTRACT_LLM_WORKERS"] = str(args.llm_workers)
     env["EXTRACT_LLM_LOCK_DIR"] = str(llm_lock_dir)
+    env["EXTRACT_LLM_KEY_INDEX"] = str(fixed_llm_key_index(index, args.llm_workers))
 
     with log_path.open("w", encoding="utf-8") as log_file:
         print(f"[{index}/{total}] PDF: {pdf_path.name}", file=log_file)
         print("COMMAND:", " ".join(command), file=log_file)
         print(f"EXTRACT_LLM_WORKERS={args.llm_workers}", file=log_file)
         print(f"EXTRACT_LLM_LOCK_DIR={llm_lock_dir}", file=log_file)
+        print(f"EXTRACT_LLM_KEY_INDEX={env['EXTRACT_LLM_KEY_INDEX']}", file=log_file)
         print("-" * 60, file=log_file)
         log_file.flush()
         completed = subprocess.run(
@@ -319,6 +321,12 @@ def run_one_extract_job(
         "summary": summary,
         "error": error,
     }
+
+
+def fixed_llm_key_index(pdf_index: int, llm_workers: int) -> int:
+    """Bind one PDF job to one LLM key/model index for its whole subprocess."""
+
+    return (max(1, pdf_index) - 1) % max(1, llm_workers)
 
 
 def build_extract_command(

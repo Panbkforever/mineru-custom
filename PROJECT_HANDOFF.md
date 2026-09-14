@@ -246,7 +246,13 @@ python batch_extract.py \
   --continue-on-error
 ```
 
-LLM 并发 slot 会按顺序选择 key：slot 0 使用 `key_1`，slot 1 使用 `key_2`。
+每个 PDF 子进程启动时会固定一个 `EXTRACT_LLM_KEY_INDEX`：
+
+- 第 1 个 PDF 固定使用 index 0，即 `key_1`；
+- 第 2 个 PDF 固定使用 index 1，即 `key_2`；
+- 第 3 个 PDF 再回到 index 0；
+- 同一个 PDF 内第一次字段判断和第二次封装目录判断必须使用同一个 key/model，中途不会因为 LLM slot 空闲情况变化而切换。
+
 如果两个 API 的 base URL 或模型也不同，可以同时配置：
 
 ```bash
@@ -298,6 +304,13 @@ export EXTRACT_API_WORKERS=2
 export EXTRACT_API_LLM_WORKERS=2
 python extract_api.py
 ```
+
+接口批量上传时也按 PDF 固定 key/model：
+
+- batch 内第 1 个有效 PDF 固定 index 0；
+- batch 内第 2 个有效 PDF 固定 index 1；
+- 后续 PDF 按 `EXTRACT_API_LLM_WORKERS` 取模；
+- `_batch_report.json` 中会记录每个文件的 `llm_key_index`。
 
 含义：
 

@@ -314,6 +314,7 @@ def extract_pdf_json_batch():
                     "parse_output_dir": parse_output_dir,
                     "extract_output": extract_output,
                     "summary_output": summary_output,
+                    "llm_key_index": fixed_llm_key_index(index, DEFAULT_LLM_WORKERS),
                 }
             )
 
@@ -352,6 +353,7 @@ def extract_pdf_json_batch():
                         "input": job["input"],
                         "output": f"{job['safe_stem']}.json",
                         "status": "failed",
+                        "llm_key_index": job.get("llm_key_index"),
                         "error": str(exc),
                     }
 
@@ -432,6 +434,7 @@ def run_one_batch_job(
                 method=method,
                 lang=lang,
                 semantic_classify=semantic_classify,
+                llm_key_index=job["llm_key_index"],
             )
 
         if not job["extract_output"].exists():
@@ -442,6 +445,7 @@ def run_one_batch_job(
             "input": job["input"],
             "output": job["extract_output"].name,
             "status": "success",
+            "llm_key_index": job["llm_key_index"],
         }
     except subprocess.TimeoutExpired as exc:
         logging.exception("Batch extraction timed out for %s", job["input"])
@@ -449,6 +453,7 @@ def run_one_batch_job(
             "input": job["input"],
             "output": job["extract_output"].name,
             "status": "failed",
+            "llm_key_index": job.get("llm_key_index"),
             "error": "Extraction timed out",
             "detail": str(exc),
         }
@@ -458,6 +463,7 @@ def run_one_batch_job(
             "input": job["input"],
             "output": job["extract_output"].name,
             "status": "failed",
+            "llm_key_index": job.get("llm_key_index"),
             "error": "Extraction failed",
             "return_code": exc.returncode,
             "stdout": exc.stdout or "",
@@ -469,6 +475,7 @@ def run_one_batch_job(
             "input": job["input"],
             "output": job["extract_output"].name,
             "status": "failed",
+            "llm_key_index": job.get("llm_key_index"),
             "error": str(exc),
         }
 
@@ -482,6 +489,7 @@ def run_extract_pipeline(
     method: str,
     lang: str,
     semantic_classify: bool,
+    llm_key_index: int | None = None,
 ) -> None:
     command = [
         sys.executable,
@@ -506,6 +514,8 @@ def run_extract_pipeline(
     env = os.environ.copy()
     env["EXTRACT_LLM_WORKERS"] = str(DEFAULT_LLM_WORKERS)
     env["EXTRACT_LLM_LOCK_DIR"] = str(DEFAULT_LLM_LOCK_DIR)
+    if llm_key_index is not None:
+        env["EXTRACT_LLM_KEY_INDEX"] = str(llm_key_index)
 
     logging.info("Running extraction command: %s", " ".join(command))
     subprocess.run(
@@ -516,6 +526,12 @@ def run_extract_pipeline(
         timeout=MAX_EXTRACT_SECONDS,
         env=env,
     )
+
+
+def fixed_llm_key_index(pdf_index: int, llm_workers: int) -> int:
+    """Bind one PDF job to one LLM key/model index for its whole subprocess."""
+
+    return (max(1, pdf_index) - 1) % max(1, llm_workers)
 
 
 @contextlib.contextmanager
