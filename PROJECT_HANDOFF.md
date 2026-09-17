@@ -307,11 +307,11 @@ export EXTRACT_API_LLM_WORKERS=2
 python extract_api.py
 ```
 
-接口批量上传时也按 PDF 固定 key/model：
+接口上传时也按 PDF 固定 key/model，并且 key index 是跨 HTTP 请求全局轮转：
 
-- batch 内第 1 个有效 PDF 固定 index 0；
-- batch 内第 2 个有效 PDF 固定 index 1；
-- 后续 PDF 按 `EXTRACT_API_LLM_WORKERS` 取模；
+- 如果一次请求上传多个 PDF：第 1 个有效 PDF 固定 index 0，第 2 个固定 index 1，后续按 `EXTRACT_API_LLM_WORKERS` 取模；
+- 如果连续发送多个单 PDF 请求：第 1 个请求固定 index 0，第 2 个请求固定 index 1，后续同样轮转；
+- 这个全局分配由 `EXTRACT_API_LLM_ASSIGN_DIR` 中的 counter 文件保护，默认在系统临时目录；
 - `_batch_report.json` 中会记录每个文件的 `llm_key_index`。
 
 含义：

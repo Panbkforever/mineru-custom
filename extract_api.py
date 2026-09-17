@@ -92,6 +92,11 @@ DEFAULT_LLM_LOCK_DIR = Path(
     or os.environ.get("EXTRACT_LLM_LOCK_DIR")
     or (Path(tempfile.gettempdir()) / "mineru_extract_api_llm_locks")
 )
+DEFAULT_LLM_ASSIGN_DIR = Path(
+    os.environ.get("EXTRACT_API_LLM_ASSIGN_DIR")
+    or os.environ.get("EXTRACT_LLM_ASSIGN_DIR")
+    or (Path(tempfile.gettempdir()) / "mineru_extract_api_llm_assign")
+)
 DEFAULT_LOCK_POLL_SECONDS = max(
     0.05,
     float_from_env("EXTRACT_API_LOCK_POLL_SECONDS", 0.2),
@@ -314,7 +319,7 @@ def extract_pdf_json_batch():
                     "parse_output_dir": parse_output_dir,
                     "extract_output": extract_output,
                     "summary_output": summary_output,
-                    "llm_key_index": fixed_llm_key_index(index, DEFAULT_LLM_WORKERS),
+                    "llm_key_index": assign_next_llm_key_index(DEFAULT_LLM_WORKERS),
                 }
             )
 
@@ -528,10 +533,31 @@ def run_extract_pipeline(
     )
 
 
-def fixed_llm_key_index(pdf_index: int, llm_workers: int) -> int:
-    """Bind one PDF job to one LLM key/model index for its whole subprocess."""
+def assign_next_llm_key_index(llm_workers: int) -> int:
+    """Assign a process-wide LLM key/model index to one PDF job.
 
-    return (max(1, pdf_index) - 1) % max(1, llm_workers)
+    The index is global across HTTP requests, so repeated single-PDF requests
+    still rotate across configured API keys/models. The chosen index is then
+    injected into the extract.py subprocess, which keeps all LLM calls for that
+    PDF bound to the same key/model.
+    """
+
+    worker_count = max(1, llm_workers)
+    DEFAULT_LLM_ASSIGN_DIR.mkdir(parents=True, exist_ok=True)
+    counter_path = DEFAULT_LLM_ASSIGN_DIR / "counter.txt"
+    lock_path = DEFAULT_LLM_ASSIGN_DIR / "counter.lock"
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                counter = int(counter_path.read_text(encoding="utf-8").strip() or "0")
+            except (FileNotFoundError, ValueError):
+                counter = 0
+            assigned = counter % worker_count
+            counter_path.write_text(str(counter + 1), encoding="utf-8")
+            return assigned
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 @contextlib.contextmanager
