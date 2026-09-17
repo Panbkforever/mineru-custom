@@ -264,19 +264,19 @@ export DEEPSEEK_MODELS="deepseek-v4-flash,deepseek-v4-flash"
 
 `extract_api.py` 是 PDF -> pin/package JSON 的 Flask 接口。它和 CLI 批处理使用同一套 `extract.py` 子进程链路。
 
-当前接口采用“一个 HTTP 请求上传多个 PDF，返回一个 zip 包”的批量模式：
+当前接口采用“一个 HTTP 请求上传一个或多个 PDF，直接返回 JSON”的模式：
 
 ```bash
 curl -X POST http://127.0.0.1:5002/api/extract-pdf-json-batch \
   -F "files=@/root/autodl-tmp/pdfs/a.pdf" \
   -F "files=@/root/autodl-tmp/pdfs/b.pdf" \
-  -o extract_results.zip
+  -o extract_results.json
 ```
 
-返回的 zip 中包含：
+返回格式：
 
-- 每个成功 PDF 对应的 `<stem>.json`；
-- `_batch_report.json`，记录每个输入文件的成功、失败、跳过原因。
+- 如果一次请求只有 1 个 PDF，并且成功完成，HTTP body 直接就是这个 PDF 的最终抽取 JSON；
+- 如果一次请求包含多个 PDF，或存在失败/跳过，HTTP body 是批量 JSON envelope，`files[].result` 中包含每个成功 PDF 的最终抽取 JSON，失败项保留 `error/stdout/stderr/return_code` 等信息。
 
 原单文件接口 `/api/extract-pdf-json` 已从 Flask 路由中注释掉，代码仅保留作回滚参考。
 
@@ -312,7 +312,7 @@ python extract_api.py
 - 如果一次请求上传多个 PDF：第 1 个有效 PDF 固定 index 0，第 2 个固定 index 1，后续按 `EXTRACT_API_LLM_WORKERS` 取模；
 - 如果连续发送多个单 PDF 请求：第 1 个请求固定 index 0，第 2 个请求固定 index 1，后续同样轮转；
 - 这个全局分配由 `EXTRACT_API_LLM_ASSIGN_DIR` 中的 counter 文件保护，默认在系统临时目录；
-- `_batch_report.json` 中会记录每个文件的 `llm_key_index`。
+- 多 PDF 或失败/跳过响应的 `files[]` 中会记录每个文件的 `llm_key_index`。
 
 含义：
 

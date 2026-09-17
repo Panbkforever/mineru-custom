@@ -2,7 +2,7 @@
 MinerU pin/package extraction API.
 
 Upload multiple PDFs, run the existing parse + extract pipeline for each PDF,
-and return a ZIP file containing JSON results and a batch report.
+and return JSON results directly.
 
 Run:
     cd /root/autodl-tmp
@@ -14,7 +14,7 @@ Example:
     curl -X POST http://localhost:5002/api/extract-pdf-json-batch \
       -F "files=@/root/autodl-tmp/pdfs/a.pdf" \
       -F "files=@/root/autodl-tmp/pdfs/b.pdf" \
-      -o results.zip
+      -o results.json
 """
 
 from __future__ import annotations
@@ -30,7 +30,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -251,9 +250,11 @@ def extract_pdf_json():
 @app.route("/api/extract-pdf-json-batch", methods=["POST"])
 def extract_pdf_json_batch():
     """
-    Receive multiple PDFs -> parse/extract each one -> return a ZIP containing:
-    - one JSON file per successful PDF
-    - _batch_report.json with success/failure details
+    Receive one or more PDFs -> parse/extract each one -> return JSON directly.
+
+    If exactly one PDF succeeds and nothing failed/skipped, return that PDF's
+    final extraction JSON as the response body. For multi-file or partial-failure
+    requests, return a batch JSON envelope with per-file results.
     """
 
     uploaded_files = request.files.getlist("files")
@@ -274,7 +275,6 @@ def extract_pdf_json_batch():
         tmp_root = Path(tmpdir)
         upload_dir = tmp_root / "uploads"
         results_dir = tmp_root / "results"
-        zip_path = tmp_root / "extract_results.zip"
         upload_dir.mkdir(parents=True, exist_ok=True)
         results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -369,32 +369,28 @@ def extract_pdf_json_batch():
                 report["files"].append(result)
 
         report["files"].sort(key=lambda item: str(item.get("input", "")))
-        report_path = results_dir / "_batch_report.json"
-        report_path.write_text(
-            json.dumps(report, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.write(report_path, arcname="_batch_report.json")
-            for item in report["files"]:
-                if item.get("status") != "success":
-                    continue
-                output_path = results_dir / str(item["output"])
-                if output_path.exists():
-                    archive.write(output_path, arcname=output_path.name)
+        for item in report["files"]:
+            if item.get("status") != "success":
+                continue
+            output_path = results_dir / str(item["output"])
+            if output_path.exists():
+                item["result"] = load_json_file(output_path)
 
         @after_this_request
         def cleanup(response):
             shutil.rmtree(tmpdir, ignore_errors=True)
             return response
 
-        response = send_file(
-            zip_path,
-            as_attachment=True,
-            download_name="extract_results.zip",
-            mimetype="application/zip",
-        )
+        if (
+            len(report["files"]) == 1
+            and report["success"] == 1
+            and report["failed"] == 0
+            and report["skipped"] == 0
+            and "result" in report["files"][0]
+        ):
+            response = jsonify(report["files"][0]["result"])
+        else:
+            response = jsonify(report)
         if report["failed"] or report["skipped"]:
             response.status_code = 207
         return response
@@ -418,6 +414,10 @@ def make_unique_stem(results_dir: Path, stem: str, index: int) -> str:
         candidate = f"{index:03d}_{safe_stem}_{suffix}"
         suffix += 1
     return candidate
+
+
+def load_json_file(path: Path) -> object:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def run_one_batch_job(
