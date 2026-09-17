@@ -31,7 +31,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from flask import Flask, after_this_request, jsonify, request
+from flask import Flask, Response, after_this_request, jsonify, request
 from werkzeug.utils import secure_filename
 
 
@@ -220,7 +220,10 @@ def extract_pdf_json():
             shutil.rmtree(tmpdir, ignore_errors=True)
             return response
 
-        return jsonify(load_json_file(extract_output))
+        return Response(
+            extract_output.read_text(encoding="utf-8"),
+            mimetype="application/json",
+        )
 
     except subprocess.TimeoutExpired as exc:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -251,10 +254,6 @@ def extract_pdf_json():
                 "detail": str(exc),
             }
         ), 500
-
-
-def load_json_file(path: Path) -> object:
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def run_extract_pipeline(
