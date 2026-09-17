@@ -1,8 +1,8 @@
 """
 MinerU pin/package extraction API.
 
-Upload multiple PDFs, run the existing parse + extract pipeline for each PDF,
-and return JSON results directly.
+Upload one PDF per request, run the existing parse + extract pipeline,
+and return the final extraction JSON directly.
 
 Run:
     cd /root/autodl-tmp
@@ -13,8 +13,7 @@ Run:
 Example:
     curl -X POST http://localhost:5002/api/extract-pdf-json-batch \
       -F "files=@/root/autodl-tmp/pdfs/a.pdf" \
-      -F "files=@/root/autodl-tmp/pdfs/b.pdf" \
-      -o results.json
+      -o result.json
 """
 
 from __future__ import annotations
@@ -30,10 +29,9 @@ import subprocess
 import sys
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from flask import Flask, after_this_request, jsonify, request, send_file
+from flask import Flask, after_this_request, jsonify, request
 from werkzeug.utils import secure_filename
 
 
@@ -125,10 +123,9 @@ def index():
             "message": "MinerU PDF pin/package extraction API",
             "health": "/health",
             "endpoint": "/api/extract-pdf-json-batch",
-            "disabled_single_file_endpoint": "/api/extract-pdf-json",
             "method": "POST",
             "form_fields": {
-                "files": "one or more PDF files",
+                "files": "exactly one PDF file",
                 "backend": f"optional, default {DEFAULT_BACKEND}",
                 "method": f"optional, default {DEFAULT_METHOD}",
                 "lang": f"optional, default {DEFAULT_LANG}",
@@ -155,24 +152,30 @@ def health():
     ), 200
 
 
-# Single-PDF request style is intentionally disabled. Keep the implementation
-# below for reference/rollback, but do not register it as a Flask route.
-# @app.route("/api/extract-pdf-json", methods=["POST"])
+@app.route("/api/extract-pdf-json-batch", methods=["POST"])
 def extract_pdf_json():
     """
     Receive PDF -> parse with MinerU -> extract pin/package fields -> return JSON.
     """
-    if "file" not in request.files:
-        return jsonify({"error": "No file part in request"}), 400
+    uploaded_files = request.files.getlist("files") + request.files.getlist("file")
+    uploaded_files = [item for item in uploaded_files if item and item.filename]
+    if not uploaded_files:
+        return jsonify({"error": "No PDF file selected; use form field 'files'"}), 400
+    if len(uploaded_files) != 1:
+        return jsonify(
+            {
+                "error": "Only one PDF is allowed per request. Send multiple HTTP requests for concurrency.",
+                "received": len(uploaded_files),
+            }
+        ), 400
 
-    uploaded = request.files["file"]
-    if not uploaded or uploaded.filename == "":
-        return jsonify({"error": "No file selected"}), 400
+    uploaded = uploaded_files[0]
+    original_filename = uploaded.filename or "uploaded.pdf"
+    filename = secure_filename(original_filename) or "uploaded.pdf"
 
-    if not allowed_pdf(uploaded.filename):
+    if not allowed_pdf(filename):
         return jsonify({"error": "Invalid file type, please upload PDF"}), 400
 
-    filename = secure_filename(uploaded.filename)
     backend = str_from_request("backend", DEFAULT_BACKEND)
     method = str_from_request("method", DEFAULT_METHOD)
     lang = str_from_request("lang", DEFAULT_LANG)
@@ -185,9 +188,16 @@ def extract_pdf_json():
         parse_output_dir = tmp_root / "mineru_output"
         extract_output = tmp_root / f"{Path(filename).stem}.json"
         summary_output = tmp_root / f"{Path(filename).stem}_info.json"
+        llm_key_index = assign_next_llm_key_index(DEFAULT_LLM_WORKERS)
 
         uploaded.save(pdf_path)
-        logging.info("Received PDF: %s", filename)
+        logging.info(
+            "Received PDF: %s, api_workers=%s, llm_workers=%s, llm_key_index=%s",
+            original_filename,
+            DEFAULT_API_WORKERS,
+            DEFAULT_LLM_WORKERS,
+            llm_key_index,
+        )
 
         with api_request_slot():
             run_extract_pipeline(
@@ -199,6 +209,7 @@ def extract_pdf_json():
                 method=method,
                 lang=lang,
                 semantic_classify=semantic_classify,
+                llm_key_index=llm_key_index,
             )
 
         if not extract_output.exists():
@@ -209,12 +220,7 @@ def extract_pdf_json():
             shutil.rmtree(tmpdir, ignore_errors=True)
             return response
 
-        return send_file(
-            extract_output,
-            as_attachment=True,
-            download_name=f"{Path(filename).stem}.json",
-            mimetype="application/json",
-        )
+        return jsonify(load_json_file(extract_output))
 
     except subprocess.TimeoutExpired as exc:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -247,242 +253,8 @@ def extract_pdf_json():
         ), 500
 
 
-@app.route("/api/extract-pdf-json-batch", methods=["POST"])
-def extract_pdf_json_batch():
-    """
-    Receive one or more PDFs -> parse/extract each one -> return JSON directly.
-
-    If exactly one PDF succeeds and nothing failed/skipped, return that PDF's
-    final extraction JSON as the response body. For multi-file or partial-failure
-    requests, return a batch JSON envelope with per-file results.
-    """
-
-    uploaded_files = request.files.getlist("files")
-    if not uploaded_files:
-        uploaded_files = request.files.getlist("file")
-
-    uploaded_files = [item for item in uploaded_files if item and item.filename]
-    if not uploaded_files:
-        return jsonify({"error": "No PDF files selected; use form field 'files'"}), 400
-
-    backend = str_from_request("backend", DEFAULT_BACKEND)
-    method = str_from_request("method", DEFAULT_METHOD)
-    lang = str_from_request("lang", DEFAULT_LANG)
-    semantic_classify = bool_from_request("semantic_classify", DEFAULT_SEMANTIC_CLASSIFY)
-
-    tmpdir = tempfile.mkdtemp(prefix="mineru_extract_api_batch_")
-    try:
-        tmp_root = Path(tmpdir)
-        upload_dir = tmp_root / "uploads"
-        results_dir = tmp_root / "results"
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        results_dir.mkdir(parents=True, exist_ok=True)
-
-        jobs = []
-        report = {
-            "total": len(uploaded_files),
-            "success": 0,
-            "failed": 0,
-            "skipped": 0,
-            "api_workers": DEFAULT_API_WORKERS,
-            "llm_workers": DEFAULT_LLM_WORKERS,
-            "files": [],
-        }
-
-        for index, uploaded in enumerate(uploaded_files, start=1):
-            original_filename = uploaded.filename or f"uploaded-{index}.pdf"
-            filename = secure_filename(original_filename) or f"uploaded-{index}.pdf"
-            if not allowed_pdf(filename):
-                report["skipped"] += 1
-                report["files"].append(
-                    {
-                        "input": original_filename,
-                        "status": "skipped",
-                        "error": "Invalid file type, please upload PDF",
-                    }
-                )
-                continue
-
-            safe_stem = make_unique_stem(results_dir, Path(filename).stem, index)
-            pdf_path = upload_dir / f"{safe_stem}.pdf"
-            parse_output_dir = tmp_root / "mineru_output" / safe_stem
-            extract_output = results_dir / f"{safe_stem}.json"
-            summary_output = results_dir / f"{safe_stem}_info.json"
-            uploaded.save(pdf_path)
-
-            jobs.append(
-                {
-                    "input": original_filename,
-                    "filename": filename,
-                    "safe_stem": safe_stem,
-                    "pdf_path": pdf_path,
-                    "parse_output_dir": parse_output_dir,
-                    "extract_output": extract_output,
-                    "summary_output": summary_output,
-                    "llm_key_index": assign_next_llm_key_index(DEFAULT_LLM_WORKERS),
-                }
-            )
-
-        logging.info(
-            "Received batch: %s files, %s valid PDFs, api_workers=%s, llm_workers=%s",
-            len(uploaded_files),
-            len(jobs),
-            DEFAULT_API_WORKERS,
-            DEFAULT_LLM_WORKERS,
-        )
-
-        if not jobs:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            return jsonify(report), 400
-
-        max_workers = min(DEFAULT_API_WORKERS, len(jobs))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_job = {
-                executor.submit(
-                    run_one_batch_job,
-                    job,
-                    backend,
-                    method,
-                    lang,
-                    semantic_classify,
-                ): job
-                for job in jobs
-            }
-            for future in as_completed(future_to_job):
-                job = future_to_job[future]
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    logging.exception("Batch extraction failed for %s", job["input"])
-                    result = {
-                        "input": job["input"],
-                        "output": f"{job['safe_stem']}.json",
-                        "status": "failed",
-                        "llm_key_index": job.get("llm_key_index"),
-                        "error": str(exc),
-                    }
-
-                if result.get("status") == "success":
-                    report["success"] += 1
-                else:
-                    report["failed"] += 1
-                report["files"].append(result)
-
-        report["files"].sort(key=lambda item: str(item.get("input", "")))
-        for item in report["files"]:
-            if item.get("status") != "success":
-                continue
-            output_path = results_dir / str(item["output"])
-            if output_path.exists():
-                item["result"] = load_json_file(output_path)
-
-        @after_this_request
-        def cleanup(response):
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            return response
-
-        if (
-            len(report["files"]) == 1
-            and report["success"] == 1
-            and report["failed"] == 0
-            and report["skipped"] == 0
-            and "result" in report["files"][0]
-        ):
-            response = jsonify(report["files"][0]["result"])
-        else:
-            response = jsonify(report)
-        if report["failed"] or report["skipped"]:
-            response.status_code = 207
-        return response
-
-    except Exception as exc:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        logging.exception("Batch PDF extraction API failed")
-        return jsonify(
-            {
-                "error": "Batch PDF extraction API failed",
-                "detail": str(exc),
-            }
-        ), 500
-
-
-def make_unique_stem(results_dir: Path, stem: str, index: int) -> str:
-    safe_stem = secure_filename(stem) or f"uploaded-{index}"
-    candidate = f"{index:03d}_{safe_stem}"
-    suffix = 2
-    while (results_dir / f"{candidate}.json").exists():
-        candidate = f"{index:03d}_{safe_stem}_{suffix}"
-        suffix += 1
-    return candidate
-
-
 def load_json_file(path: Path) -> object:
     return json.loads(path.read_text(encoding="utf-8"))
-
-
-def run_one_batch_job(
-    job: dict,
-    backend: str,
-    method: str,
-    lang: str,
-    semantic_classify: bool,
-) -> dict:
-    logging.info("Batch extraction started: %s", job["input"])
-    try:
-        with api_request_slot():
-            run_extract_pipeline(
-                pdf_path=job["pdf_path"],
-                parse_output_dir=job["parse_output_dir"],
-                extract_output=job["extract_output"],
-                summary_output=job["summary_output"],
-                backend=backend,
-                method=method,
-                lang=lang,
-                semantic_classify=semantic_classify,
-                llm_key_index=job["llm_key_index"],
-            )
-
-        if not job["extract_output"].exists():
-            raise FileNotFoundError(f"Extraction JSON not found: {job['extract_output']}")
-
-        logging.info("Batch extraction finished: %s", job["input"])
-        return {
-            "input": job["input"],
-            "output": job["extract_output"].name,
-            "status": "success",
-            "llm_key_index": job["llm_key_index"],
-        }
-    except subprocess.TimeoutExpired as exc:
-        logging.exception("Batch extraction timed out for %s", job["input"])
-        return {
-            "input": job["input"],
-            "output": job["extract_output"].name,
-            "status": "failed",
-            "llm_key_index": job.get("llm_key_index"),
-            "error": "Extraction timed out",
-            "detail": str(exc),
-        }
-    except subprocess.CalledProcessError as exc:
-        logging.exception("Batch extraction command failed for %s", job["input"])
-        return {
-            "input": job["input"],
-            "output": job["extract_output"].name,
-            "status": "failed",
-            "llm_key_index": job.get("llm_key_index"),
-            "error": "Extraction failed",
-            "return_code": exc.returncode,
-            "stdout": exc.stdout or "",
-            "stderr": exc.stderr or "",
-        }
-    except Exception as exc:
-        logging.exception("Batch extraction failed for %s", job["input"])
-        return {
-            "input": job["input"],
-            "output": job["extract_output"].name,
-            "status": "failed",
-            "llm_key_index": job.get("llm_key_index"),
-            "error": str(exc),
-        }
 
 
 def run_extract_pipeline(
