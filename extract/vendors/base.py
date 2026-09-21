@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 HeaderClassifier = Callable[[str], tuple[str, int]]
 TableMatcher = Callable[[str, list[str], list[list[str]]], Any]
+PhysicalTableGuard = Callable[[str, list[str]], bool]
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,7 @@ class VendorProfile:
     description: str = ""
     header_classifier: HeaderClassifier | None = None
     table_matcher: TableMatcher | None = None
+    physical_table_guard: PhysicalTableGuard | None = None
 
     @property
     def canonical_name(self) -> str:
@@ -38,3 +40,8 @@ class VendorProfile:
         if self.table_matcher is None:
             return None
         return self.table_matcher(title, headers, data_rows)
+
+    def is_physical_table(self, title: str, headers: list[str]) -> bool:
+        if self.physical_table_guard is None:
+            return False
+        return self.physical_table_guard(title, headers)

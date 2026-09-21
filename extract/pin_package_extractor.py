@@ -403,14 +403,23 @@ def extract_pin_package_info_from_table_candidates(
         if is_ordering_table(rough_headers):
             skip(debug, "ordering_table")
             continue
-        if not is_loose_candidate(
+        rough_vendor_match = vendor_profile.match_table(
+            table.title,
+            rough_headers,
+            rough_data_rows,
+        )
+        if rough_vendor_match is None and not is_loose_candidate(
             table.title,
             rough_headers,
             rough_data_rows,
         ):
             skip(debug, "not_pin_table_candidate")
             continue
-        if is_non_physical_port_function_table(table.title, rough_headers):
+        if (
+            rough_vendor_match is None
+            and not vendor_profile.is_physical_table(table.title, rough_headers)
+            and is_non_physical_port_function_table(table.title, rough_headers)
+        ):
             skip(debug, "non_physical_port_function_table")
             continue
 
@@ -446,15 +455,19 @@ def extract_pin_package_info_from_table_candidates(
         if is_ordering_table(headers):
             skip(debug, "ordering_table_after_span_expansion")
             continue
-        if not is_loose_candidate(table.title, headers, data_rows):
+        vendor_match = vendor_profile.match_table(table.title, headers, data_rows)
+        if vendor_match is None and not is_loose_candidate(table.title, headers, data_rows):
             skip(debug, "not_pin_table_candidate_after_span_expansion")
             continue
-        if is_non_physical_port_function_table(table.title, headers):
+        if (
+            vendor_match is None
+            and not vendor_profile.is_physical_table(table.title, headers)
+            and is_non_physical_port_function_table(table.title, headers)
+        ):
             skip(debug, "non_physical_port_function_table_after_span_expansion")
             continue
 
         rule_columns = classify_columns(headers, data_rows, table.title)
-        vendor_match = vendor_profile.match_table(table.title, headers, data_rows)
         prepared.append(
             {
                 "table_id": table_id,

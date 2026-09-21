@@ -27,6 +27,25 @@ def classify_st_header(normalized_header: str) -> tuple[str, int]:
     return "", 0
 
 
+def match_st_table(
+    title: str,
+    headers: list[str],
+    data_rows: list[list[str]],
+) -> SpecialTableMatch | None:
+    return (
+        match_st_pad_description_table(title, headers, data_rows)
+        or match_st_pin_assignment_table(title, headers, data_rows)
+    )
+
+
+def is_st_physical_table(title: str, headers: list[str]) -> bool:
+    title_text = normalize_text(title)
+    if "pin assignment" not in title_text or "description" not in title_text:
+        return False
+    roles = _st_pin_assignment_roles(headers)
+    return bool(roles["pin_no"] and roles["pin_name"])
+
+
 def match_st_pad_description_table(
     title: str,
     headers: list[str],
@@ -91,3 +110,67 @@ def _find_header_index(headers: list[str], accepted: set[str]) -> int | None:
 
 def _has_data_cell(row: list[str], index: int) -> bool:
     return index < len(row) and bool(str(row[index]).strip())
+
+
+def match_st_pin_assignment_table(
+    title: str,
+    headers: list[str],
+    data_rows: list[list[str]],
+) -> SpecialTableMatch | None:
+    """Recognize ST MCU pin assignment tables with package-specific pin columns."""
+
+    if not is_st_physical_table(title, headers):
+        return None
+    roles = _st_pin_assignment_roles(headers)
+    mappings: list[SpecialColumnMapping] = []
+    for index in roles["pin_no"]:
+        mappings.append(SpecialColumnMapping(index, headers[index], "pin_no"))
+    mappings.append(SpecialColumnMapping(roles["pin_name"][0], headers[roles["pin_name"][0]], "pin_name"))
+    if roles["type"]:
+        mappings.append(SpecialColumnMapping(roles["type"][0], headers[roles["type"][0]], "type"))
+
+    if not any(
+        any(_has_data_cell(row, index) for index in roles["pin_no"])
+        for row in data_rows
+    ):
+        return None
+
+    return SpecialTableMatch(
+        handler_name="st_pin_assignment_table_handler",
+        columns=tuple(mappings),
+        included_row_indexes=frozenset(range(len(data_rows))),
+    )
+
+
+def _st_pin_assignment_roles(headers: list[str]) -> dict[str, list[int]]:
+    roles = {"pin_no": [], "pin_name": [], "type": []}
+    for index, header in enumerate(headers):
+        normalized = normalize_header_text(header)
+        if _is_st_package_pin_header(normalized):
+            roles["pin_no"].append(index)
+        elif normalized.startswith("pin name"):
+            roles["pin_name"].append(index)
+        elif normalized == "pin type":
+            roles["type"].append(index)
+    return roles
+
+
+def _is_st_package_pin_header(normalized: str) -> bool:
+    if not normalized.startswith("pin "):
+        return False
+    if normalized.startswith("pin name") or normalized == "pin type":
+        return False
+    package_terms = (
+        "so",
+        "sop",
+        "tssop",
+        "wlcsp",
+        "ufqfpn",
+        "ufqfn",
+        "qfpn",
+        "lqfp",
+        "ufbga",
+        "bga",
+        "qfn",
+    )
+    return any(term in normalized for term in package_terms)
