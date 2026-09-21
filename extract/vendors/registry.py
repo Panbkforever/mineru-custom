@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from extract.vendors.base import VendorProfile
 from extract.vendors.st.profile import PROFILE as ST_PROFILE
 from extract.vendors.ti.profile import PROFILE as TI_PROFILE
@@ -42,6 +44,10 @@ def get_vendor_profile(value: str | None) -> VendorProfile:
         raise ValueError(
             f"Unsupported vendor {value!r}. Supported vendors: {supported}"
         ) from exc
+
+
+def get_current_vendor_profile() -> VendorProfile:
+    return get_vendor_profile(os.environ.get("EXTRACT_VENDOR", "TI"))
 
 
 def supported_vendors() -> tuple[str, ...]:

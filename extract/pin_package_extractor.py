@@ -138,6 +138,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from extract.special_table_handlers import find_special_table_match
+from extract.vendors import get_current_vendor_profile
 from extract.parallel_cell_splitter import (
     parse_html_cell_text,
     split_parallel_pin_names as split_parallel_pin_names_by_structure,
@@ -344,6 +345,8 @@ def extract_pin_package_info_from_table_candidates(
     candidates = list(tables)
     packages: dict[str, dict[str, Any]] = {}
 
+    vendor_profile = get_current_vendor_profile()
+
     # 第一阶段：只准备候选表，不创建任何 pin 记录。
     prepared = []
     parsed_tables = [
@@ -451,6 +454,7 @@ def extract_pin_package_info_from_table_candidates(
             continue
 
         rule_columns = classify_columns(headers, data_rows, table.title)
+        vendor_match = vendor_profile.match_table(table.title, headers, data_rows)
         prepared.append(
             {
                 "table_id": table_id,
@@ -462,6 +466,7 @@ def extract_pin_package_info_from_table_candidates(
                 "name_layout": name_layout,
                 "data_rows": data_rows,
                 "rule_columns": rule_columns,
+                "vendor_match": vendor_match,
                 "debug": debug,
             }
         )
@@ -785,11 +790,13 @@ def decide_all_tables(prepared: list[dict[str, Any]], use_semantic: bool, includ
     results: dict[int, TableDecision] = {}
     remaining: list[dict[str, Any]] = []
     for item in prepared:
-        special_match = find_special_table_match(
-            item["table"].title,
-            item["headers"],
-            item["data_rows"],
-        )
+        special_match = item.get("vendor_match")
+        if special_match is None:
+            special_match = find_special_table_match(
+                item["table"].title,
+                item["headers"],
+                item["data_rows"],
+            )
         if special_match is None:
             remaining.append(item)
             continue
@@ -1420,6 +1427,9 @@ def classify_header(header: str) -> tuple[str, int]:
     # 否则首行描述里的 package/pin/type 等普通词会污染字段评分。
     if is_description_header(h):
         return "", 0
+    vendor_field, vendor_score = get_current_vendor_profile().classify_header(h)
+    if vendor_field:
+        return vendor_field, vendor_score
     if any(word in h for word in ("pin no", "pin number", "ball no", "ball number", "terminal no", "terminal number", "引脚编号", "端子编号")) or re.search(r"(?:引脚|端子|球)\s+编号", h):
         return "pin_no", 5
     # Reserved/NC 表常把物理编号列简写为 PINS、BALLS 或 TERMINALS。
