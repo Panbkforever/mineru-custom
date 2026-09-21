@@ -22,6 +22,8 @@ import sys
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
+from extract.vendors import get_vendor_profile, supported_vendors
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(
@@ -87,6 +89,14 @@ def main() -> int:
         help="Use DeepSeek semantic classification in extract.py. Requires DEEPSEEK_API_KEY.",
     )
     parser.add_argument(
+        "--vendor",
+        default=os.environ.get("EXTRACT_VENDOR", "TI"),
+        help=(
+            "PDF manufacturer profile. Supported: "
+            f"{', '.join(supported_vendors())}. Default: EXTRACT_VENDOR or TI."
+        ),
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=1,
@@ -108,6 +118,12 @@ def main() -> int:
     if args.llm_workers < 1:
         print("--llm-workers 必须 >= 1")
         return 1
+    try:
+        vendor_profile = get_vendor_profile(args.vendor)
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+    args.vendor = vendor_profile.canonical_name
 
     project_root = Path(__file__).resolve().parent
     input_dir = (project_root / args.input_dir).resolve()
@@ -137,6 +153,7 @@ def main() -> int:
     print(f"输入目录: {input_dir}")
     print(f"JSON 输出目录: {output_dir}")
     print(f"MinerU 输出目录: {parse_output_dir}")
+    print(f"厂家 profile: {args.vendor} ({vendor_profile.display_name})")
     print(f"待处理 PDF 数量: {len(pdf_files)}")
     print(f"PDF 并发数: {args.workers}")
     print(f"DeepSeek 全局并发数: {args.llm_workers}")
@@ -287,10 +304,12 @@ def run_one_extract_job(
     env["EXTRACT_LLM_WORKERS"] = str(args.llm_workers)
     env["EXTRACT_LLM_LOCK_DIR"] = str(llm_lock_dir)
     env["EXTRACT_LLM_KEY_INDEX"] = str(fixed_llm_key_index(index, args.llm_workers))
+    env["EXTRACT_VENDOR"] = args.vendor
 
     with log_path.open("w", encoding="utf-8") as log_file:
         print(f"[{index}/{total}] PDF: {pdf_path.name}", file=log_file)
         print("COMMAND:", " ".join(command), file=log_file)
+        print(f"EXTRACT_VENDOR={args.vendor}", file=log_file)
         print(f"EXTRACT_LLM_WORKERS={args.llm_workers}", file=log_file)
         print(f"EXTRACT_LLM_LOCK_DIR={llm_lock_dir}", file=log_file)
         print(f"EXTRACT_LLM_KEY_INDEX={env['EXTRACT_LLM_KEY_INDEX']}", file=log_file)
@@ -320,6 +339,7 @@ def run_one_extract_job(
         "log_path": str(log_path),
         "summary": summary,
         "error": error,
+        "vendor": args.vendor,
     }
 
 
@@ -349,6 +369,8 @@ def build_extract_command(
         args.method,
         "--lang",
         args.lang,
+        "--vendor",
+        args.vendor,
         "--start-page",
         str(args.start_page),
         "--extract-output",
@@ -380,6 +402,13 @@ def write_batch_summary(summaries: list[dict], output_path: Path) -> None:
         "pdf_count": len(summaries),
         "package_count": total_packages,
         "pin_count": total_pins,
+        "vendors": sorted(
+            {
+                str(summary.get("vendor", "")).strip()
+                for summary in summaries
+                if summary.get("vendor")
+            }
+        ),
         "pdf_list": summaries,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)

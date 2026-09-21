@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -23,6 +24,7 @@ from extract.pin_package_extractor import (
     strip_debug_fields,
     write_extraction_json,
 )
+from extract.vendors import get_vendor_profile, supported_vendors
 
 
 def main() -> int:
@@ -83,7 +85,22 @@ def main() -> int:
         action="store_true",
         help="Use DeepSeek semantic classification to filter non-pin tables. Requires DEEPSEEK_API_KEY.",
     )
+    parser.add_argument(
+        "--vendor",
+        default=os.environ.get("EXTRACT_VENDOR", "TI"),
+        help=(
+            "PDF manufacturer profile. Supported: "
+            f"{', '.join(supported_vendors())}. Default: EXTRACT_VENDOR or TI."
+        ),
+    )
     args = parser.parse_args()
+    try:
+        vendor_profile = get_vendor_profile(args.vendor)
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+    args.vendor = vendor_profile.canonical_name
+    os.environ["EXTRACT_VENDOR"] = args.vendor
 
     input_path = Path(args.input_path)
     output_dir = Path(args.output).resolve()
@@ -132,8 +149,10 @@ def main() -> int:
     package_count = len(extracted)
     pdf_name = input_path.name if input_path.is_file() else input_path.resolve().name
     summary = build_extraction_summary(extracted_with_debug, pdf_name=pdf_name)
+    summary["vendor"] = args.vendor
     debug_payload = {
         "pdf_name": pdf_name,
+        "vendor": args.vendor,
         "source_files": [str(path) for path in source_files],
         "table_list": get_last_extraction_debug(),
     }
@@ -148,6 +167,7 @@ def main() -> int:
     write_extraction_json(extracted, output_path)
     write_extraction_json(summary, summary_path)
     write_extraction_json(debug_payload, debug_path)
+    print(f"厂家 profile: {args.vendor} ({vendor_profile.display_name})")
     print(f"引脚/封装字段提取完成: {output_path}")
     print(f"提取信息文件完成: {summary_path}")
     print(f"字段判断调试文件完成: {debug_path}")

@@ -34,6 +34,8 @@ from pathlib import Path
 from flask import Flask, Response, after_this_request, jsonify, request
 from werkzeug.utils import secure_filename
 
+from extract.vendors import get_vendor_profile, supported_vendors
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,6 +49,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_BACKEND = os.environ.get("MINERU_BACKEND", "hybrid-auto-engine")
 DEFAULT_METHOD = os.environ.get("MINERU_PARSE_METHOD", "auto")
 DEFAULT_LANG = os.environ.get("MINERU_LANG", "ch")
+DEFAULT_VENDOR = os.environ.get("EXTRACT_VENDOR", "TI")
 DEFAULT_SEMANTIC_CLASSIFY = os.environ.get("EXTRACT_SEMANTIC_CLASSIFY", "false").lower() in {
     "1",
     "true",
@@ -129,6 +132,10 @@ def index():
                 "backend": f"optional, default {DEFAULT_BACKEND}",
                 "method": f"optional, default {DEFAULT_METHOD}",
                 "lang": f"optional, default {DEFAULT_LANG}",
+                "vendor": (
+                    f"optional, supported {', '.join(supported_vendors())}, "
+                    f"default {DEFAULT_VENDOR}"
+                ),
                 "semantic_classify": f"optional, default {DEFAULT_SEMANTIC_CLASSIFY}",
             },
             "server_concurrency": {
@@ -146,6 +153,8 @@ def health():
     return jsonify(
         {
             "status": "ok",
+            "default_vendor": DEFAULT_VENDOR,
+            "supported_vendors": supported_vendors(),
             "api_workers": DEFAULT_API_WORKERS,
             "llm_workers": DEFAULT_LLM_WORKERS,
         }
@@ -179,6 +188,12 @@ def extract_pdf_json():
     backend = str_from_request("backend", DEFAULT_BACKEND)
     method = str_from_request("method", DEFAULT_METHOD)
     lang = str_from_request("lang", DEFAULT_LANG)
+    vendor = str_from_request("vendor", DEFAULT_VENDOR)
+    try:
+        vendor_profile = get_vendor_profile(vendor)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    vendor = vendor_profile.canonical_name
     semantic_classify = bool_from_request("semantic_classify", DEFAULT_SEMANTIC_CLASSIFY)
 
     tmpdir = tempfile.mkdtemp(prefix="mineru_extract_api_")
@@ -192,8 +207,10 @@ def extract_pdf_json():
 
         uploaded.save(pdf_path)
         logging.info(
-            "Received PDF: %s, api_workers=%s, llm_workers=%s, llm_key_index=%s",
+            "Received PDF: %s, vendor=%s, api_workers=%s, llm_workers=%s, "
+            "llm_key_index=%s",
             original_filename,
+            vendor,
             DEFAULT_API_WORKERS,
             DEFAULT_LLM_WORKERS,
             llm_key_index,
@@ -208,6 +225,7 @@ def extract_pdf_json():
                 backend=backend,
                 method=method,
                 lang=lang,
+                vendor=vendor,
                 semantic_classify=semantic_classify,
                 llm_key_index=llm_key_index,
             )
@@ -264,6 +282,7 @@ def run_extract_pipeline(
     backend: str,
     method: str,
     lang: str,
+    vendor: str,
     semantic_classify: bool,
     llm_key_index: int | None = None,
 ) -> None:
@@ -279,6 +298,8 @@ def run_extract_pipeline(
         method,
         "--lang",
         lang,
+        "--vendor",
+        vendor,
         "--extract-output",
         str(extract_output),
         "--summary-output",
@@ -288,6 +309,7 @@ def run_extract_pipeline(
         command.append("--semantic-classify")
 
     env = os.environ.copy()
+    env["EXTRACT_VENDOR"] = vendor
     env["EXTRACT_LLM_WORKERS"] = str(DEFAULT_LLM_WORKERS)
     env["EXTRACT_LLM_LOCK_DIR"] = str(DEFAULT_LLM_LOCK_DIR)
     if llm_key_index is not None:
