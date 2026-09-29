@@ -40,6 +40,40 @@ def match_st_table(
     )
 
 
+def should_keep_st_record(record: dict[str, object]) -> bool:
+    pin_no = re.sub(r"\s+", "", str(record.get("pin_no", "")))
+    if pin_no and set(pin_no) == {"-"}:
+        return False
+    return True
+
+
+def repair_st_table(
+    title: str,
+    headers: list[str],
+    data_rows: list[list[str]],
+) -> tuple[list[str], list[list[str]]]:
+    """Normalize ST pin definition table structure after PDF table parsing."""
+
+    repaired_headers, repaired_rows = _repair_st_package_label_header_row(
+        title,
+        headers,
+        data_rows,
+    )
+    repaired_headers, repaired_rows = _expand_combined_st_package_pin_columns(
+        title,
+        repaired_headers,
+        repaired_rows,
+    )
+    repaired_headers, repaired_rows = _restore_missing_st_package_header_before_name(
+        title,
+        repaired_headers,
+        repaired_rows,
+    )
+    if repaired_headers is headers and repaired_rows is data_rows:
+        return headers, data_rows
+    return repaired_headers, repaired_rows
+
+
 def repair_st_table_rows(
     title: str,
     headers: list[str],
@@ -60,11 +94,17 @@ def repair_st_table_rows(
     repaired_rows: list[list[str]] = []
     changed = False
 
-    for row in data_rows:
+    for row_index, row in enumerate(data_rows):
         normalized_row = list(row)
         for index in pin_indexes:
             if index < len(normalized_row):
-                fixed = _join_wrapped_bga_ball(normalized_row[index])
+                fixed = _join_wrapped_pin_number(
+                    normalized_row[index],
+                    headers[index],
+                    data_rows,
+                    row_index,
+                    index,
+                )
                 if fixed != normalized_row[index]:
                     normalized_row[index] = fixed
                     changed = True
@@ -82,6 +122,282 @@ def repair_st_table_rows(
             changed = True
 
     return repaired_rows if changed else data_rows
+
+
+def _repair_st_package_label_header_row(
+    title: str,
+    headers: list[str],
+    data_rows: list[list[str]],
+) -> tuple[list[str], list[list[str]]]:
+    if not data_rows or not _is_st_pin_definition_context(title, headers):
+        return headers, data_rows
+
+    first_row = data_rows[0]
+    package_label_count = _leading_st_package_label_count(first_row)
+    if package_label_count < 2:
+        return headers, data_rows
+
+    generic_pin_headers = sum(
+        1
+        for header in headers[:package_label_count]
+        if normalize_header_text(header) in {"pin", "pin number", "pin no", "pin no."}
+    )
+    if generic_pin_headers < 2:
+        return headers, data_rows
+
+    width = max([len(headers), len(first_row)] + [len(row) for row in data_rows[:20]])
+    new_headers: list[str] = []
+    for index in range(package_label_count):
+        new_headers.append(f"Pin number {_canonicalize_st_package_label(first_row[index])}")
+
+    tail_cells = [
+        str(first_row[index] if index < len(first_row) else "").strip()
+        for index in range(package_label_count, width)
+    ]
+    first_tail = normalize_header_text(tail_cells[0]) if tail_cells else ""
+    if not first_tail.startswith("pin name"):
+        pin_name_header = _first_header_matching(headers, "pin name") or (
+            "Pin name(function after reset)"
+        )
+        tail_cells.insert(0, pin_name_header)
+
+    for value in tail_cells[: max(0, width - len(new_headers))]:
+        new_headers.append(value)
+    while len(new_headers) < width:
+        index = len(new_headers)
+        fallback = headers[index] if index < len(headers) else ""
+        new_headers.append(fallback)
+
+    return new_headers, data_rows[1:]
+
+
+def _expand_combined_st_package_pin_columns(
+    title: str,
+    headers: list[str],
+    data_rows: list[list[str]],
+) -> tuple[list[str], list[list[str]]]:
+    if not _is_st_pin_definition_context(title, headers):
+        return headers, data_rows
+
+    new_headers: list[str] = []
+    column_expansions: list[tuple[int, int]] = []
+    changed = False
+    for index, header in enumerate(headers):
+        normalized = normalize_header_text(header)
+        labels = (
+            _split_combined_st_package_labels(header)
+            if _is_st_package_pin_header(normalized)
+            else []
+        )
+        if len(labels) < 2:
+            new_headers.append(header)
+            column_expansions.append((index, 1))
+            continue
+        for label in labels:
+            new_headers.append(f"Pin number {label}")
+        column_expansions.append((index, len(labels)))
+        changed = True
+
+    if not changed:
+        return headers, data_rows
+
+    new_rows = []
+    for row in data_rows:
+        new_row: list[str] = []
+        for source_index, copies in column_expansions:
+            value = row[source_index] if source_index < len(row) else ""
+            new_row.extend([value] * copies)
+        new_rows.append(new_row)
+    return new_headers, new_rows
+
+
+def _restore_missing_st_package_header_before_name(
+    title: str,
+    headers: list[str],
+    data_rows: list[list[str]],
+) -> tuple[list[str], list[list[str]]]:
+    if not data_rows or not _is_st_pin_definition_context(title, headers):
+        return headers, data_rows
+
+    pin_name_index = next(
+        (
+            index
+            for index, header in enumerate(headers)
+            if normalize_header_text(header).startswith("pin name")
+        ),
+        None,
+    )
+    if pin_name_index is None or pin_name_index + 1 >= len(headers):
+        return headers, data_rows
+
+    current_values = [
+        row[pin_name_index]
+        for row in data_rows[:12]
+        if pin_name_index < len(row) and str(row[pin_name_index]).strip()
+    ]
+    next_values = [
+        row[pin_name_index + 1]
+        for row in data_rows[:12]
+        if pin_name_index + 1 < len(row) and str(row[pin_name_index + 1]).strip()
+    ]
+    if not current_values or not next_values:
+        return headers, data_rows
+    if sum(_looks_like_st_pin_value(value) for value in current_values) < 2:
+        return headers, data_rows
+    if sum(_looks_like_st_signal_name(value) for value in next_values) < 2:
+        return headers, data_rows
+
+    missing_label = _infer_missing_st_package_label(headers[:pin_name_index])
+    if not missing_label:
+        return headers, data_rows
+
+    new_headers = list(headers)
+    new_headers.insert(pin_name_index, f"Pin number {missing_label}")
+    return new_headers, data_rows
+
+
+def _infer_missing_st_package_label(headers: list[str]) -> str:
+    labels = [
+        _package_label_from_pin_header(header)
+        for header in headers
+        if _is_st_package_pin_header(normalize_header_text(header))
+    ]
+    labels = [label for label in labels if label]
+    if not labels:
+        return ""
+
+    smps_bases = [
+        re.sub(r"\s+SMPS$", "", label, flags=re.IGNORECASE)
+        for label in labels
+        if label.upper().endswith(" SMPS")
+    ]
+    plain_labels = {
+        label
+        for label in labels
+        if not label.upper().endswith(" SMPS")
+    }
+    if not smps_bases or not plain_labels:
+        return ""
+
+    previous_plain = next(
+        (
+            label
+            for label in reversed(labels)
+            if not label.upper().endswith(" SMPS")
+        ),
+        "",
+    )
+    previous_count = _package_pin_count(previous_plain)
+    candidates = [
+        label
+        for label in smps_bases
+        if label not in plain_labels
+        and (previous_count is None or _package_pin_count(label) == previous_count)
+    ]
+    return candidates[-1] if candidates else ""
+
+
+def _package_label_from_pin_header(header: str) -> str:
+    normalized = normalize_header_text(_remove_st_pin_number_role(header))
+    labels = _split_combined_st_package_labels(normalized)
+    if len(labels) == 1:
+        return labels[0]
+    if _ST_PACKAGE_LABEL_PATTERN.fullmatch(normalized):
+        return _canonicalize_st_package_label(normalized)
+    return ""
+
+
+def _package_pin_count(label: str) -> int | None:
+    match = re.search(r"\d{1,3}", label)
+    return int(match.group(0)) if match else None
+
+
+def _looks_like_st_pin_value(value: str) -> bool:
+    compact = re.sub(r"\s+", "", str(value or ""))
+    return bool(re.fullmatch(r"(?:\d{1,3}|[A-Z]{1,2}\d{1,2})", compact))
+
+
+def _looks_like_st_signal_name(value: str) -> bool:
+    compact = re.sub(r"\s+", "", str(value or ""))
+    return bool(
+        re.fullmatch(
+            r"(?:P[A-Z]\d{1,2}|VDD[A-Z0-9_]*|VSS[A-Z0-9_]*|VBAT|NRST|BOOT\d*)",
+            compact,
+        )
+    )
+
+
+def _is_st_pin_definition_context(title: str, headers: list[str]) -> bool:
+    title_text = normalize_text(title)
+    if (
+        "pin assignment" in title_text
+        and "description" in title_text
+    ) or "ball definitions" in title_text:
+        return True
+    normalized_headers = [normalize_header_text(header) for header in headers]
+    pin_header_count = sum(
+        1
+        for header in normalized_headers
+        if header.startswith("pin number") or header in {"pin", "pin no", "pin no."}
+    )
+    has_name_or_type = any(
+        header.startswith("pin name") or header == "pin type"
+        for header in normalized_headers
+    )
+    return pin_header_count >= 2 and has_name_or_type
+
+
+def _leading_st_package_label_count(row: list[str]) -> int:
+    count = 0
+    for value in row:
+        if not _is_st_package_label(value):
+            break
+        count += 1
+    return count
+
+
+def _is_st_package_label(value: str) -> bool:
+    normalized = normalize_header_text(_canonicalize_st_package_label(value))
+    return bool(_ST_PACKAGE_LABEL_PATTERN.fullmatch(normalized))
+
+
+def _first_header_matching(headers: list[str], prefix: str) -> str:
+    for header in headers:
+        if normalize_header_text(header).startswith(prefix):
+            return header
+    return ""
+
+
+def _split_combined_st_package_labels(header: str) -> list[str]:
+    text = _remove_st_pin_number_role(header)
+    matches = list(_ST_PACKAGE_TOKEN_PATTERN.finditer(normalize_header_text(text)))
+    if len(matches) < 2:
+        return []
+
+    labels = []
+    normalized_text = normalize_header_text(text)
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized_text)
+        label = normalized_text[match.start():end].strip(" -:/,;&")
+        label = _canonicalize_st_package_label(label)
+        if label:
+            labels.append(label)
+    return labels if len(labels) >= 2 else []
+
+
+def _remove_st_pin_number_role(value: str) -> str:
+    return re.sub(
+        r"\bpin\s*(?:number|no\.?|#)?\b",
+        " ",
+        str(value or ""),
+        flags=re.IGNORECASE,
+    )
+
+
+def _canonicalize_st_package_label(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    text = re.sub(r"\buqfpn\b", "UFQFPN", text, flags=re.IGNORECASE)
+    return text.strip(" -:/,;&").upper()
 
 
 def _is_st_ball_definition_table(title: str, headers: list[str]) -> bool:
@@ -102,14 +418,103 @@ def _is_st_ball_definition_table(title: str, headers: list[str]) -> bool:
     return has_bga_package and has_pin_name and has_pin_type
 
 
-def _join_wrapped_bga_ball(value: str) -> str:
+def _join_wrapped_pin_number(
+    value: str,
+    header: str,
+    data_rows: list[list[str]],
+    row_index: int,
+    column_index: int,
+) -> str:
     text = str(value or "").strip()
     if not text or "\n" not in text:
         return text
     compact = re.sub(r"\s+", "", text)
     if re.fullmatch(r"[A-Z]{1,2}\d{1,2}", compact):
         return compact
+    if _should_join_wrapped_numeric_pin(
+        compact,
+        header,
+        data_rows,
+        row_index,
+        column_index,
+    ):
+        return compact
     return text
+
+
+def _should_join_wrapped_numeric_pin(
+    compact: str,
+    header: str,
+    data_rows: list[list[str]],
+    row_index: int,
+    column_index: int,
+) -> bool:
+    if not re.fullmatch(r"\d{2,3}", compact):
+        return False
+    package_limit = _numeric_package_pin_limit(header)
+    if package_limit is None:
+        return False
+    value = int(compact)
+    if value < 1 or value > package_limit:
+        return False
+    previous_value = _nearest_numeric_pin(data_rows, row_index, column_index, -1)
+    next_value = _nearest_numeric_pin(data_rows, row_index, column_index, 1)
+    return (previous_value is not None and previous_value + 1 == value) or (
+        next_value is not None and next_value - 1 == value
+    )
+
+
+def _numeric_package_pin_limit(header: str) -> int | None:
+    normalized = normalize_header_text(header)
+    numeric_package_terms = (
+        "lqfp",
+        "ufqfpn",
+        "uqfpn",
+        "ufqfn",
+        "qfpn",
+        "qfn",
+        "tssop",
+        "so",
+        "sop",
+    )
+    if not any(term in normalized for term in numeric_package_terms):
+        return None
+    counts = [
+        int(match.group(1))
+        for match in re.finditer(
+            r"(?:lqfp|ufqfpn|uqfpn|ufqfn|qfpn|qfn|tssop|so|sop)\s*(\d{2,3})",
+            normalized,
+        )
+    ]
+    if not counts:
+        return None
+    return max(counts)
+
+
+def _nearest_numeric_pin(
+    data_rows: list[list[str]],
+    row_index: int,
+    column_index: int,
+    step: int,
+) -> int | None:
+    index = row_index + step
+    while 0 <= index < len(data_rows):
+        row = data_rows[index]
+        value = row[column_index] if column_index < len(row) else ""
+        number = _single_numeric_pin_value(value)
+        if number is not None:
+            return number
+        if str(value or "").strip() not in {"", "-"}:
+            return None
+        index += step
+    return None
+
+
+def _single_numeric_pin_value(value: str) -> int | None:
+    compact = re.sub(r"\s+", "", str(value or ""))
+    if re.fullmatch(r"\d{1,3}", compact):
+        return int(compact)
+    return None
 
 
 def _split_merged_st_ball_row(
@@ -356,6 +761,7 @@ def _is_st_package_pin_header(normalized: str) -> bool:
         "tssop",
         "wlcsp",
         "ufqfpn",
+        "uqfpn",
         "ufqfn",
         "qfpn",
         "lqfp",
@@ -364,3 +770,32 @@ def _is_st_package_pin_header(normalized: str) -> bool:
         "qfn",
     )
     return any(term in normalized for term in package_terms)
+
+
+_ST_PACKAGE_TERMS = (
+    "ufqfpn",
+    "uqfpn",
+    "ufqfn",
+    "lfbga",
+    "tfbga",
+    "ufbga",
+    "wlcsp",
+    "lqfp",
+    "tssop",
+    "qfpn",
+    "qfn",
+    "sop",
+    "so",
+    "bga",
+)
+_ST_PACKAGE_TERMS_RE = "|".join(_ST_PACKAGE_TERMS)
+
+_ST_PACKAGE_TOKEN_PATTERN = re.compile(
+    rf"(?:{_ST_PACKAGE_TERMS_RE})\s*-?\s*\d{{1,3}}"
+    rf"[a-z0-9]*?(?=(?:{_ST_PACKAGE_TERMS_RE})|$|\s)"
+)
+
+_ST_PACKAGE_LABEL_PATTERN = re.compile(
+    rf"(?:{_ST_PACKAGE_TERMS_RE})\s*-?\s*\d{{1,3}}[a-z0-9]*"
+    r"(?:\s+[a-z0-9_+-]+)*"
+)

@@ -14,7 +14,12 @@ from typing import Any, Callable
 HeaderClassifier = Callable[[str], tuple[str, int]]
 TableMatcher = Callable[[str, list[str], list[list[str]]], Any]
 PhysicalTableGuard = Callable[[str, list[str]], bool]
+TableRepairer = Callable[
+    [str, list[str], list[list[str]]],
+    tuple[list[str], list[list[str]]],
+]
 RowRepairer = Callable[[str, list[str], list[list[str]]], list[list[str]]]
+RecordFilterer = Callable[[dict[str, Any]], bool]
 
 
 @dataclass(frozen=True)
@@ -27,7 +32,9 @@ class VendorProfile:
     header_classifier: HeaderClassifier | None = None
     table_matcher: TableMatcher | None = None
     physical_table_guard: PhysicalTableGuard | None = None
+    table_repairer: TableRepairer | None = None
     row_repairer: RowRepairer | None = None
+    record_filterer: RecordFilterer | None = None
 
     @property
     def canonical_name(self) -> str:
@@ -48,7 +55,22 @@ class VendorProfile:
             return False
         return self.physical_table_guard(title, headers)
 
+    def repair_table(
+        self,
+        title: str,
+        headers: list[str],
+        rows: list[list[str]],
+    ) -> tuple[list[str], list[list[str]]]:
+        if self.table_repairer is None:
+            return headers, rows
+        return self.table_repairer(title, headers, rows)
+
     def repair_rows(self, title: str, headers: list[str], rows: list[list[str]]) -> list[list[str]]:
         if self.row_repairer is None:
             return rows
         return self.row_repairer(title, headers, rows)
+
+    def should_keep_record(self, record: dict[str, Any]) -> bool:
+        if self.record_filterer is None:
+            return True
+        return self.record_filterer(record)

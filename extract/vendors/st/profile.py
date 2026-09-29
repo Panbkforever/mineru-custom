@@ -11,7 +11,9 @@ from extract.vendors.st.table_handlers import (
     classify_st_header,
     is_st_physical_table,
     match_st_table,
+    repair_st_table,
     repair_st_table_rows,
+    should_keep_st_record,
 )
 
 
@@ -22,5 +24,7 @@ PROFILE = VendorProfile(
     header_classifier=classify_st_header,
     table_matcher=match_st_table,
     physical_table_guard=is_st_physical_table,
+    table_repairer=repair_st_table,
     row_repairer=repair_st_table_rows,
+    record_filterer=should_keep_st_record,
 )

@@ -445,6 +445,18 @@ def extract_pin_package_info_from_table_candidates(
         headers = [path.combined for path in header_paths]
         name_layout = analyze_name_column_layout(header_paths)
         data_rows = rows[header_index + 1 :]
+        repaired_headers, repaired_table_rows = vendor_profile.repair_table(
+            table.title,
+            headers,
+            data_rows,
+        )
+        if repaired_headers is not headers or repaired_table_rows is not data_rows:
+            headers = repaired_headers
+            data_rows = repaired_table_rows
+            rows = [headers] + data_rows
+            header_index = 0
+            header_paths = build_header_paths(rows, header_index)
+            name_layout = analyze_name_column_layout(header_paths)
         repaired_data_rows = vendor_profile.repair_rows(table.title, headers, data_rows)
         if repaired_data_rows is not data_rows:
             data_rows = repaired_data_rows
@@ -704,6 +716,8 @@ def extract_pin_package_info_from_table_candidates(
                     # 多封装绑定对象只保存 pin_no/pin_name/type。description
                     # 必须使用 row_index 回到同一原始数据行读取，不能从相邻
                     # 绑定或已经生成的记录继承。
+                    if not vendor_profile.should_keep_record(record):
+                        continue
                     description = read_optional_mapped_field(
                         item["data_rows"][bound_row.row_index],
                         table_decision.columns,
@@ -738,6 +752,8 @@ def extract_pin_package_info_from_table_candidates(
                     continue
                 for record in extract_records_from_row(row, table_decision.columns):
                     record.pop("_raw_fields", None)
+                    if not vendor_profile.should_keep_record(record):
+                        continue
                     if include_debug and source_name:
                         record["source"] = source_name
                     if include_debug and item["table"].page_idx is not None:
