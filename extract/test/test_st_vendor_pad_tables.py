@@ -161,6 +161,54 @@ class STVendorPadTableTest(unittest.TestCase):
 
         self.assertEqual(repaired[1][0], "3\n6")
 
+    def test_st_ball_definition_repairs_wrapped_numeric_pin_with_same_row_evidence(self):
+        headers = [
+            "Pin number LQFP48",
+            "Pin number LQFP64",
+            "Pin number LQFP100",
+            "Pin name(function after reset)",
+            "Pin type",
+        ]
+        rows = [["20", "2\n8", "37", "PB2", "I/O"]]
+
+        repaired = repair_st_table_rows(
+            "Table 7. STM32Uxxx pin/ball definitions",
+            headers,
+            rows,
+        )
+
+        self.assertEqual(repaired[0][1], "28")
+
+    def test_st_ball_definition_skips_bga_neighbors_for_same_row_numeric_evidence(self):
+        headers = [
+            "Pin number LQFP100",
+            "Pin number UFBGA132",
+            "Pin number LQFP144",
+            "Pin name(function after reset)",
+            "Pin type",
+        ]
+        rows = [["31", "K3", "4\n2", "PA7", "I/O"]]
+
+        repaired = repair_st_table_rows(
+            "Table 7. STM32Uxxx pin/ball definitions",
+            headers,
+            rows,
+        )
+
+        self.assertEqual(repaired[0][2], "42")
+
+    def test_st_ball_definition_normalizes_spaced_power_pin_name(self):
+        headers = ["Pin number TFBGA169", "Pin name(function after reset)", "Pin type"]
+        rows = [["N7", "VD D", "S"], ["N8", "VSS", "S"]]
+
+        repaired = repair_st_table_rows(
+            "Table 7. STM32Uxxx pin/ball definitions",
+            headers,
+            rows,
+        )
+
+        self.assertEqual(repaired[0][1], "VDD")
+
     def test_st_table_repair_promotes_package_label_row_to_headers(self):
         headers = (
             ["Pin number"] * 13
@@ -254,6 +302,55 @@ class STVendorPadTableTest(unittest.TestCase):
             ],
         )
         self.assertEqual(repaired_rows[0][:3], ["1", "1", "PA0"])
+
+    def test_st_repairs_wrapped_wlcsp_pin_after_ocr_space_in_package_name(self):
+        headers = [
+            "Pin number WLCS P72 SMPS",
+            "Pin name(function after reset)",
+            "Pin type",
+        ]
+        rows = [["D\n1", "VDDIO2", "S"]]
+
+        repaired = repair_st_table_rows(
+            "Table 26. STM32Uxxx pin/ball definitions",
+            headers,
+            rows,
+        )
+
+        self.assertEqual(repaired[0][0], "D1")
+
+    def test_st_table_repair_normalizes_wlcsp_ocr_package_label(self):
+        headers = [
+            "Pin number WLCSPT2 SMPS",
+            "Pin name(function after reset)",
+            "Pin type",
+        ]
+        rows = [["A1", "PA0", "I/O"]]
+
+        repaired_headers, _ = repair_st_table(
+            "Table 26. STM32Uxxx pin/ball definitions",
+            headers,
+            rows,
+        )
+
+        self.assertIn("WLCSP72", repaired_headers[0])
+
+    def test_st_table_repair_normalizes_wlcsp_missing_p_ocr_label(self):
+        headers = ["Pin number", "Pin number", "Pin name(function after reset)", "Pin type"]
+        rows = [
+            ["LQFP100 SMPS", "WLCS150 DSI SMPS", "Pin type", "I/O structure"],
+            ["90", "G\n7", "PB7", "I/O"],
+        ]
+
+        repaired_headers, repaired_rows = repair_st_table(
+            "Table 26. STM32Uxxx pin/ball definitions",
+            headers,
+            rows,
+        )
+
+        self.assertEqual(repaired_headers[1], "Pin number WLCSP150 DSI SMPS")
+        self.assertTrue(repaired_headers[2].startswith("Pin name"))
+        self.assertEqual(repaired_rows[0][2], "PB7")
 
     def test_st_record_filter_drops_dash_pin_placeholders(self):
         self.assertFalse(should_keep_st_record({"pin_no": "-"}))
