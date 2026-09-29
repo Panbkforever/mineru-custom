@@ -445,6 +445,10 @@ def extract_pin_package_info_from_table_candidates(
         headers = [path.combined for path in header_paths]
         name_layout = analyze_name_column_layout(header_paths)
         data_rows = rows[header_index + 1 :]
+        repaired_data_rows = vendor_profile.repair_rows(table.title, headers, data_rows)
+        if repaired_data_rows is not data_rows:
+            data_rows = repaired_data_rows
+            rows = rows[: header_index + 1] + data_rows
 
         # 横向重复字段块是已确认不需要的冗余引脚列表。必须在模型判断和
         # 多封装分析之前整表排除，不能再按普通单封装表进入行提取。

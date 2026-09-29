@@ -14,6 +14,7 @@ from typing import Any, Callable
 HeaderClassifier = Callable[[str], tuple[str, int]]
 TableMatcher = Callable[[str, list[str], list[list[str]]], Any]
 PhysicalTableGuard = Callable[[str, list[str]], bool]
+RowRepairer = Callable[[str, list[str], list[list[str]]], list[list[str]]]
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class VendorProfile:
     header_classifier: HeaderClassifier | None = None
     table_matcher: TableMatcher | None = None
     physical_table_guard: PhysicalTableGuard | None = None
+    row_repairer: RowRepairer | None = None
 
     @property
     def canonical_name(self) -> str:
@@ -45,3 +47,8 @@ class VendorProfile:
         if self.physical_table_guard is None:
             return False
         return self.physical_table_guard(title, headers)
+
+    def repair_rows(self, title: str, headers: list[str], rows: list[list[str]]) -> list[list[str]]:
+        if self.row_repairer is None:
+            return rows
+        return self.row_repairer(title, headers, rows)
