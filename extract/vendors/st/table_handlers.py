@@ -15,6 +15,8 @@ from extract.special_table_handlers import (
 def classify_st_header(normalized_header: str) -> tuple[str, int]:
     """Map ST pad-table headers onto the shared pin fields."""
 
+    if _ST_PACKAGE_LABEL_PATTERN.fullmatch(normalized_header):
+        return "pin_no", 5
     if normalized_header in {
         "pad ref",
         "pad ref.",
@@ -44,6 +46,8 @@ def should_keep_st_record(record: dict[str, object]) -> bool:
     pin_no = re.sub(r"\s+", "", str(record.get("pin_no", "")))
     if pin_no and set(pin_no) == {"-"}:
         return False
+    if pin_no.upper() in {"NA", "N/A", "N.A.", "NOTAPPLICABLE"}:
+        return False
     return True
 
 
@@ -54,9 +58,10 @@ def repair_st_table(
 ) -> tuple[list[str], list[list[str]]]:
     """Normalize ST pin definition table structure after PDF table parsing."""
 
+    repaired_headers = _normalize_st_assignment_headers(title, headers)
     repaired_headers, repaired_rows = _repair_st_package_label_header_row(
         title,
-        headers,
+        repaired_headers,
         data_rows,
     )
     repaired_headers, repaired_rows = _normalize_st_package_pin_headers(
@@ -84,9 +89,9 @@ def repair_st_table_rows(
     headers: list[str],
     data_rows: list[list[str]],
 ) -> list[list[str]]:
-    """Repair MinerU row/cell artifacts in ST ball definition tables."""
+    """Repair pin cells in ST physical tables; gate merged-row repair separately."""
 
-    if not _is_st_ball_definition_table(title, headers):
+    if not _is_st_pin_definition_context(title, headers):
         return data_rows
 
     roles = _st_pin_assignment_roles(headers)
@@ -96,6 +101,7 @@ def repair_st_table_rows(
     pin_indexes = roles["pin_no"]
     pin_name_index = roles["pin_name"][0]
     type_index = roles["type"][0]
+    repair_merged_rows = _is_st_ball_definition_table(title, headers)
     repaired_rows: list[list[str]] = []
     changed = False
 
@@ -103,6 +109,14 @@ def repair_st_table_rows(
         normalized_row = list(row)
         for index in pin_indexes:
             if index < len(normalized_row):
+                if re.fullmatch(
+                    r"(?:exposed|thermal)\s+pad",
+                    str(normalized_row[index]).strip(),
+                    flags=re.IGNORECASE,
+                ):
+                    # A named physical pad is one identifier, not a pin list.
+                    normalized_row[index] = "EP"
+                    changed = True
                 fixed = _join_wrapped_pin_number(
                     normalized_row[index],
                     headers,
@@ -125,7 +139,7 @@ def repair_st_table_rows(
             pin_indexes,
             pin_name_index,
             type_index,
-        )
+        ) if repair_merged_rows else None
         if split_rows is None:
             repaired_rows.append(normalized_row)
         else:
@@ -133,6 +147,32 @@ def repair_st_table_rows(
             changed = True
 
     return repaired_rows if changed else data_rows
+
+
+def _normalize_st_header_text(value: str) -> str:
+    text = str(value or "").replace("$", "").replace("\\ ", " ")
+    text = re.sub(r"\^\s*\{\s*(?:\(\s*\d+\s*\)|\d+|[,\s])+\s*\}", "", text)
+    text = re.sub(r"\(\s*\d+(?:\s*[,;]\s*\d+)*\s*\)", "", text)
+    return normalize_header_text(text)
+
+
+def _normalize_st_assignment_headers(title: str, headers: list[str]) -> list[str]:
+    if not re.search(r"\bpin\s+assignment\b", normalize_text(title)):
+        return headers
+    if not is_st_physical_table(title, headers):
+        return headers
+    repaired = []
+    for header in headers:
+        normalized = _normalize_st_header_text(header)
+        if _is_st_package_label(normalized):
+            repaired.append(f"Pin number {_canonicalize_st_package_label(normalized)}")
+        elif normalized == "name":
+            repaired.append("Pin name")
+        elif normalized == "type":
+            repaired.append("Pin type")
+        else:
+            repaired.append(header)
+    return repaired if repaired != headers else headers
 
 
 def _repair_st_package_label_header_row(
@@ -151,7 +191,7 @@ def _repair_st_package_label_header_row(
     generic_pin_headers = sum(
         1
         for header in headers[:package_label_count]
-        if normalize_header_text(header) in {"pin", "pin number", "pin no", "pin no."}
+        if _normalize_st_header_text(header) in {"pin", "pin number", "pin no", "pin no."}
     )
     if generic_pin_headers < 2:
         return headers, data_rows
@@ -344,7 +384,7 @@ def _package_label_from_pin_header(header: str) -> str:
     labels = _split_combined_st_package_labels(normalized)
     if len(labels) == 1:
         return labels[0]
-    if _ST_PACKAGE_LABEL_PATTERN.fullmatch(normalized):
+    if _is_st_package_label(normalized):
         return _canonicalize_st_package_label(normalized)
     return ""
 
@@ -371,12 +411,9 @@ def _looks_like_st_signal_name(value: str) -> bool:
 
 def _is_st_pin_definition_context(title: str, headers: list[str]) -> bool:
     title_text = normalize_text(title)
-    if (
-        "pin assignment" in title_text
-        and "description" in title_text
-    ) or "ball definitions" in title_text:
+    if "pin assignment" in title_text or "ball definitions" in title_text:
         return True
-    normalized_headers = [normalize_header_text(header) for header in headers]
+    normalized_headers = [_normalize_st_header_text(header) for header in headers]
     pin_header_count = sum(
         1
         for header in normalized_headers
@@ -400,7 +437,7 @@ def _leading_st_package_label_count(row: list[str]) -> int:
 
 def _is_st_package_label(value: str) -> bool:
     normalized = normalize_header_text(_canonicalize_st_package_label(value))
-    return bool(_ST_PACKAGE_LABEL_PATTERN.fullmatch(normalized))
+    return bool(_ST_PACKAGE_LABEL_PATTERN.fullmatch(normalized)) or normalized in _ST_PACKAGE_TERMS
 
 
 def _first_header_matching(headers: list[str], prefix: str) -> str:
@@ -431,7 +468,7 @@ def _remove_st_pin_number_role(value: str) -> str:
     return re.sub(
         r"\bpin\s*(?:number|no\.?|#)?\b",
         " ",
-        str(value or ""),
+        _normalize_st_header_text(value),
         flags=re.IGNORECASE,
     )
 
@@ -482,6 +519,17 @@ def _join_wrapped_pin_number(
     text = str(value or "").strip()
     if not text or "\n" not in text:
         return text
+    name_indexes = _st_pin_assignment_roles(headers)["pin_name"]
+    row = data_rows[row_index]
+    pin_parts = [part.strip() for part in text.splitlines() if part.strip()]
+    if name_indexes and name_indexes[0] < len(row):
+        name_parts = [part.strip() for part in str(row[name_indexes[0]]).splitlines() if part.strip()]
+        if (
+            len(pin_parts) == len(name_parts) > 1
+            and all(_looks_like_st_pin_value(part) for part in pin_parts)
+            and all(_looks_like_st_signal_name(part) for part in name_parts)
+        ):
+            return text
     compact = re.sub(r"\s+", "", text)
     if re.fullmatch(r"[A-Z]{1,2}\d{1,2}", compact):
         return compact
@@ -754,7 +802,7 @@ def _split_optional_merged_cell(value: str) -> tuple[str, str]:
 
 def is_st_physical_table(title: str, headers: list[str]) -> bool:
     title_text = normalize_text(title)
-    if "pin assignment" not in title_text or "description" not in title_text:
+    if not re.search(r"\bpin\s+assignment\b", title_text):
         return False
     roles = _st_pin_assignment_roles(headers)
     return bool(roles["pin_no"] and roles["pin_name"])
@@ -859,17 +907,18 @@ def match_st_pin_assignment_table(
 def _st_pin_assignment_roles(headers: list[str]) -> dict[str, list[int]]:
     roles = {"pin_no": [], "pin_name": [], "type": []}
     for index, header in enumerate(headers):
-        normalized = normalize_header_text(header)
-        if _is_st_package_pin_header(normalized):
+        normalized = _normalize_st_header_text(header)
+        if _is_st_package_pin_header(normalized) or _is_st_package_label(normalized):
             roles["pin_no"].append(index)
-        elif normalized.startswith("pin name"):
+        elif normalized.startswith("pin name") or normalized == "name":
             roles["pin_name"].append(index)
-        elif normalized == "pin type":
+        elif normalized in {"pin type", "type"}:
             roles["type"].append(index)
     return roles
 
 
 def _is_st_package_pin_header(normalized: str) -> bool:
+    normalized = _normalize_st_header_text(normalized)
     if not normalized.startswith("pin "):
         return False
     if normalized.startswith("pin name") or normalized == "pin type":
@@ -896,6 +945,7 @@ def _is_st_package_pin_header(normalized: str) -> bool:
 
 
 _ST_PACKAGE_TERMS = (
+    "vfqfpn",
     "ufqfpn",
     "uqfpn",
     "ufqfn",
@@ -915,10 +965,10 @@ _ST_PACKAGE_TERMS_RE = "|".join(_ST_PACKAGE_TERMS)
 
 _ST_PACKAGE_TOKEN_PATTERN = re.compile(
     rf"(?:{_ST_PACKAGE_TERMS_RE})\s*-?\s*\d{{1,3}}"
-    rf"[a-z0-9]*?(?=(?:{_ST_PACKAGE_TERMS_RE})|$|\s)"
+    rf"(?:\+\d{{1,3}})?[a-z0-9]*?(?=(?:{_ST_PACKAGE_TERMS_RE})|$|\s)"
 )
 
 _ST_PACKAGE_LABEL_PATTERN = re.compile(
-    rf"(?:{_ST_PACKAGE_TERMS_RE})\s*-?\s*\d{{1,3}}[a-z0-9]*"
+    rf"(?:{_ST_PACKAGE_TERMS_RE})\s*-?\s*\d{{1,3}}(?:\+\d{{1,3}})?[a-z0-9]*"
     r"(?:\s+[a-z0-9_+-]+)*"
 )

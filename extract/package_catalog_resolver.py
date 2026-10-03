@@ -212,6 +212,7 @@ def resolve_document_package_catalog(
     classifier: PackageCatalogClassifier | None = None,
     document_page_count: int | None = None,
     toc_page_range: tuple[int, int] | None = None,
+    scope_resolver: Callable[..., PackageCatalogResolution | None] | None = None,
 ) -> PackageCatalogResolution:
     """建立封装目录并为每张目标表生成唯一绑定结果。
 
@@ -219,6 +220,12 @@ def resolve_document_package_catalog(
     引脚表，也仍可以成为封装总述候选。``target_tables`` 只包含已经确认要
     提取的物理引脚表，两者职责不能混用。
     """
+
+    # A vendor may prove model/package scopes before any slots or pins exist.
+    if scope_resolver is not None:
+        scoped_resolution = scope_resolver(target_tables, multi_package_plans)
+        if scoped_resolution is not None:
+            return scoped_resolution
 
     diagnostics: list[dict[str, Any]] = []
     entries: list[PackageCatalogEntry] = []

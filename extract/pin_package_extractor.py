@@ -592,6 +592,7 @@ def extract_pin_package_info_from_table_candidates(
         use_semantic_classifier=use_semantic_classifier,
         document_page_count=document_page_count,
         toc_page_range=toc_page_range,
+        scope_resolver=vendor_profile.package_scope_resolver,
     )
     # 在读取任何引脚行之前建立全部外层封装桶。即使某个已确认槽位暂时
     # 没有关联到引脚表，最终 JSON 仍保留正确的封装数量。

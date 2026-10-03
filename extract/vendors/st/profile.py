@@ -7,6 +7,7 @@ should be added here after we identify common ST document patterns.
 from __future__ import annotations
 
 from extract.vendors.base import VendorProfile
+from extract.vendors.st.package_handlers import resolve_st_package_scopes
 from extract.vendors.st.table_handlers import (
     classify_st_header,
     is_st_physical_table,
@@ -27,4 +28,5 @@ PROFILE = VendorProfile(
     table_repairer=repair_st_table,
     row_repairer=repair_st_table_rows,
     record_filterer=should_keep_st_record,
+    package_scope_resolver=resolve_st_package_scopes,
 )
