@@ -1,0 +1,148 @@
+import unittest
+from html import escape
+from unittest.mock import patch
+
+from extract.pin_package_extractor import TableCandidate, extract_pin_package_info_from_table_candidates
+from extract.vendors import get_vendor_profile, supported_vendors
+from extract.vendors.abov.table_handlers import (
+    _numbers, match_abov_table, repair_abov_rows, repair_abov_table,
+)
+
+
+def table(headers, rows, title="Pin descriptions"):
+    html = "<table>" + "".join(
+        "<tr>" + "".join("<td>" + escape(v).replace("\n", "<br>") + "</td>" for v in row) + "</tr>"
+        for row in [headers] + rows
+    ) + "</table>"
+    return TableCandidate(html=html, page_idx=0, title=title)
+
+
+def pins(package):
+    return [p for group in package["group_list"] for p in group["pin_list"]]
+
+
+class ABOVVendorTableTest(unittest.TestCase):
+    def extract(self, headers, rows, title="Pin descriptions"):
+        with patch.dict("os.environ", {"EXTRACT_VENDOR": "ABOV"}):
+            return extract_pin_package_info_from_table_candidates([table(headers, rows, title)])
+
+    def test_registered_without_overriding_ti_or_st(self):
+        self.assertIn("ABOV", supported_vendors())
+        self.assertEqual(get_vendor_profile("abov").canonical_name, "ABOV")
+        self.assertIsNone(get_vendor_profile("TI").row_repairer)
+        self.assertEqual(get_vendor_profile("ST").row_repairer.__module__, "extract.vendors.st.table_handlers")
+
+    def test_variants_keep_distinct_package_columns_and_all_aliases(self):
+        headers = ["Pin number QFN-32(1)", "Pin number QFN-32(2)", "Pin name", "Type", "Description"]
+        rows = [["1", "2", "PA0", "I/O", "GPIO"],
+                ["1", "2", "AN0", "IA", "Analog"],
+                ["-", "1", "VDD", "P", "Supply"]]
+        result = self.extract(headers, rows)
+        self.assertEqual(len(result), 2)
+        self.assertEqual([len(pins(p)) for p in result], [1, 2])
+        self.assertEqual(pins(result[0])[0]["pin_name"], "PA0/AN0")
+        self.assertEqual(pins(result[1])[0]["pin_no"], "2")
+        self.assertNotEqual(result[0]["pkg"], result[1]["pkg"])
+        self.assertIn("Analog", pins(result[0])[0]["description"])
+
+    def test_package_footnote_is_not_invented_as_variant(self):
+        headers = ["Pin number LQFP-32(1)", "Pin name", "Type"]
+        fixed, _ = repair_abov_table("Pins", headers, [["1", "PA0", "I/O"]])
+        self.assertEqual(fixed, headers)
+
+    def test_repeated_rowspan_does_not_repeat_physical_pin(self):
+        result = self.extract(["Pin #", "Pin Name", "I O", "Description"],
+                              [["1", "MODE", "I", "Operating mode"],
+                               ["1", "MODE", "I", "Test mode"],
+                               ["2", "VSS", "P", "Ground"]])
+        self.assertEqual(len(pins(result[0])), 2)
+        self.assertIn("Test mode", pins(result[0])[0]["description"])
+
+    def test_explicit_numeric_range_syntax_and_direction(self):
+        self.assertEqual(_numbers("3 to 5"), ["3", "4", "5"])
+        self.assertEqual(_numbers("3\u20135"), ["3", "4", "5"])
+        self.assertEqual(_numbers("7 - 5"), ["7", "6", "5"])
+        self.assertEqual(_numbers("1,\n4\u20136"), ["1", "4", "5", "6"])
+
+    def test_nested_description_columns_are_preserved_without_duplicate_aliases(self):
+        result = self.extract(["Pin #", "Pin Name", "I O", "Description", "Description"],
+                              [["1", "DATA0/BOOT", "I", "Mode", "Normal"],
+                               ["1", "DATA0/BOOT", "I", "Mode", "Test"],
+                               ["1", "GPIO0", "I/O", "GPIO", "GPIO"],
+                               ["1", "DATA0/BOOT", "I", "Mode", "Normal"]])
+        pin = pins(result[0])[0]
+        self.assertEqual(pin["pin_name"], "DATA0/BOOT/GPIO0")
+        self.assertIn("Normal", pin["description"])
+        self.assertIn("Test", pin["description"])
+
+    def test_unknown_expression_and_oversized_range_not_guessed(self):
+        for value in ["1-5(6)", "1abc", "3 to", "0", "1 to 5000", "2 3"]:
+            self.assertIsNone(_numbers(value))
+
+    def test_to_range_preserves_parallel_signal_aliases(self):
+        result = self.extract(["PIN NAME", "I/O", "DESCRIPTION", "PIN No."],
+                              [["SG1/KS1 to\nSG3/KS3", "O", "Segment", "10 to 12"]])
+        self.assertEqual([(p["pin_no"], p["pin_name"]) for p in pins(result[0])],
+                         [("10", "SG1/KS1"), ("11", "SG2/KS2"), ("12", "SG3/KS3")])
+
+    def test_range_names_only_expand_when_cardinality_agrees(self):
+        result = self.extract(["Pin Name", "Pin No.", "Type"], [["SG1-SG3", "1-2", "O"]])
+        self.assertEqual([p["pin_name"] for p in pins(result[0])], ["SG1-SG3"] * 2)
+
+    def test_multiline_ranges_keep_group_order_and_names(self):
+        result = self.extract(["Pin Names", "I/O", "Pin Description", "Pin No."],
+                              [["SEG1 - SEG2\nSEG3 - SEG5", "O", "Segment", "8 - 9\n1 - 3"],
+                               ["COM1\nCOM2", "O", "Common", "6, 10\n5, 11"],
+                               ["VDD", "-", "Supply", "12,\n13\u201315"]])
+        by_pin = {p["pin_no"]: p["pin_name"] for p in pins(result[0])}
+        self.assertEqual([by_pin[str(i)] for i in [8, 9, 1, 2, 3]], ["SEG1", "SEG2", "SEG3", "SEG4", "SEG5"])
+        self.assertEqual([by_pin[str(i)] for i in [6, 10, 5, 11]], ["COM1", "COM1", "COM2", "COM2"])
+        self.assertTrue(all(by_pin[str(i)] == "VDD" for i in range(12, 16)))
+
+    def test_wrapped_digits_require_adjacent_sequence_evidence(self):
+        headers = ["Pin #", "Pin Name", "Type"]
+        rows = [["22", "DATA0", "I/O"], ["2\n3", "DATA1", "I/O"], ["24", "DATA2", "I/O"]]
+        fixed = repair_abov_rows("Pin List", headers, rows)
+        self.assertEqual([r[0] for r in fixed], ["22", "23", "24"])
+
+    def test_consecutive_wrapped_numbers_use_both_outer_anchors(self):
+        headers = ["Pin #", "Pin Name", "Type"]
+        rows = [["109", "SIG0", "I/O"], ["1\n10", "SIG1", "I/O"],
+                ["1\n11", "SIG2", "I/O"], ["112", "SIG3", "I/O"]]
+        self.assertEqual([r[0] for r in repair_abov_rows("Pin List", headers, rows)], ["109", "110", "111", "112"])
+
+    def test_ambiguous_wrapped_digits_are_not_concatenated(self):
+        headers = ["Pin #", "Pin Name", "Type"]
+        rows = [["2", "GND", "P"], ["3\n6", "GND", "P"], ["7", "GND", "P"]]
+        self.assertNotIn("36", [r[0] for r in repair_abov_rows("Pin List", headers, rows)])
+
+    def test_explicit_parallel_names_prevent_concatenation(self):
+        headers = ["Pin #", "Pin Name", "Type"]
+        rows = [["22", "A0", "I"], ["2\n3", "A1\nA2", "I"], ["24", "A3", "I"]]
+        result = repair_abov_rows("Pin List", headers, rows)
+        self.assertEqual([(r[0], r[1]) for r in result[1:3]], [("2", "A1"), ("3", "A2")])
+
+    def test_parenthesized_permutation_is_two_mappings(self):
+        result = self.extract(["Pin Names", "Pin No.", "I/O", "Pin Description"],
+                              [["S1-S3", "1-3(5,6,1)", "O", "Segment"],
+                               ["COM1-COM2", "5-4(3-2)", "O", "Common"],
+                               ["VDD", "6(4)", "P", "Supply"]])
+        self.assertEqual(len(result), 2)
+        self.assertEqual([len(pins(p)) for p in result], [6, 6])
+        self.assertEqual([(p["pin_no"], p["pin_name"]) for p in pins(result[1])][:3], [("5", "S1"), ("6", "S2"), ("1", "S3")])
+        for package in result:
+            self.assertFalse(any("__PIN_RANGE" in p["pin_no"] for p in pins(package)))
+
+    def test_numeric_parenthesis_footnotes_do_not_create_package(self):
+        headers = ["Pin Names", "Pin No.", "I/O"]
+        rows = [["A", "1(1)", "I"], ["B", "2(1)", "I"], ["C", "3(1)", "I"]]
+        fixed_headers, fixed_rows = repair_abov_table("Pin description", headers, rows)
+        self.assertEqual((fixed_headers, fixed_rows), (headers, rows))
+
+    def test_function_only_and_electrical_tables_do_not_match(self):
+        self.assertIsNone(match_abov_table("Peripheral pins", ["Pin Name", "Type", "Description"], [["TXD", "O", "UART"]]))
+        self.assertIsNone(match_abov_table("Characteristics", ["Symbol", "Min", "Max"], [["VDD", "1", "5"]]))
+
+
+if __name__ == "__main__":
+    unittest.main()
