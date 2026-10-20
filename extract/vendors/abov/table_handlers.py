@@ -241,30 +241,9 @@ def repair_abov_rows(title: str, headers: list[str], rows: list[list[str]]) -> l
                     fixed[i] = cell[offset]
             fixed[name_index] = names[offset]
             expanded_rows.append(fixed)
-    # Rowspan expansion repeats a physical pin for each alternate function or
-    # nested description row. Keep every alias/description in one physical row.
-    by_pins: dict[tuple[str, ...], list[str]] = {}
-    seen_cells: dict[tuple[str, ...], list[set[str]]] = {}
-    result = []
-    for row in expanded_rows:
-        key = tuple(row[i] if i < len(row) else "" for i in roles["pin_no"])
-        if not any(value.isdigit() for value in key):
-            result.append(row)
-            continue
-        if key not in by_pins:
-            by_pins[key] = list(row)
-            seen_cells[key] = [{value} for value in row]
-            result.append(by_pins[key])
-            continue
-        previous = by_pins[key]
-        for i, value in enumerate(row):
-            if i in roles["pin_no"] or not value.strip() or i >= len(previous):
-                continue
-            separator = "/" if i == name_index or i in roles["type"] else "\n"
-            if value not in seen_cells[key][i]:
-                seen_cells[key][i].add(value)
-                previous[i] = separator.join(part for part in (previous[i], value) if part)
-    return result
+    # The same physical number can have separate function/type rows. Preserve
+    # each source row; package binding and shared exact-record dedup stay intact.
+    return expanded_rows
 
 
 def should_keep_abov_record(record: dict[str, object]) -> bool:

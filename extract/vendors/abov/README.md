@@ -7,8 +7,9 @@ in the existing API. TI remains the default; ST rules are not imported here.
 
 - Shared pin tables with multiple physical package columns. Repeated package
   bases carrying distinct `(1)` / `(2)` pinout variants remain separate slots.
-- Repeated physical rows from rowspan expansion. Alternate signal names,
-  types and descriptions are retained in a single physical pin record.
+- Each source function row retains its own pin number, name, type and
+  description. Repeated numbers do not cause ABOV to combine rows or join
+  names/types. Shared exact-record deduplication remains unchanged.
 - Explicit ascending/descending numeric ranges, `to`, and Unicode dashes.
   Parallel signal ranges expand only when their lengths agree with pin ranges.
 - Wrapped numeric digits, only when both outer sequence anchors confirm a

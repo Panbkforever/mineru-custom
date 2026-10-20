@@ -32,25 +32,27 @@ class ABOVVendorTableTest(unittest.TestCase):
         self.assertIsNone(get_vendor_profile("TI").row_repairer)
         self.assertEqual(get_vendor_profile("ST").row_repairer.__module__, "extract.vendors.st.table_handlers")
 
-    def test_variants_keep_distinct_package_columns_and_all_aliases(self):
+    def test_variants_keep_distinct_package_columns_and_separate_functions(self):
         headers = ["Pin number QFN-32(1)", "Pin number QFN-32(2)", "Pin name", "Type", "Description"]
         rows = [["1", "2", "PA0", "I/O", "GPIO"],
                 ["1", "2", "AN0", "IA", "Analog"],
                 ["-", "1", "VDD", "P", "Supply"]]
         result = self.extract(headers, rows)
         self.assertEqual(len(result), 2)
-        self.assertEqual([len(pins(p)) for p in result], [1, 2])
-        self.assertEqual(pins(result[0])[0]["pin_name"], "PA0/AN0")
-        self.assertEqual(pins(result[1])[0]["pin_no"], "2")
+        self.assertEqual([len(pins(p)) for p in result], [2, 3])
+        self.assertEqual([(p["pin_no"], p["pin_name"], p["type"], p["description"])
+                          for p in pins(result[0])],
+                         [("1", "PA0", "I/O", "GPIO"), ("1", "AN0", "IA", "Analog")])
+        self.assertEqual([(p["pin_no"], p["pin_name"]) for p in pins(result[1])],
+                         [("2", "PA0"), ("2", "AN0"), ("1", "VDD")])
         self.assertNotEqual(result[0]["pkg"], result[1]["pkg"])
-        self.assertIn("Analog", pins(result[0])[0]["description"])
 
     def test_package_footnote_is_not_invented_as_variant(self):
         headers = ["Pin number LQFP-32(1)", "Pin name", "Type"]
         fixed, _ = repair_abov_table("Pins", headers, [["1", "PA0", "I/O"]])
         self.assertEqual(fixed, headers)
 
-    def test_repeated_rowspan_does_not_repeat_physical_pin(self):
+    def test_shared_exact_name_dedup_still_preserves_description_supplements(self):
         result = self.extract(["Pin #", "Pin Name", "I O", "Description"],
                               [["1", "MODE", "I", "Operating mode"],
                                ["1", "MODE", "I", "Test mode"],
@@ -64,16 +66,36 @@ class ABOVVendorTableTest(unittest.TestCase):
         self.assertEqual(_numbers("7 - 5"), ["7", "6", "5"])
         self.assertEqual(_numbers("1,\n4\u20136"), ["1", "4", "5", "6"])
 
-    def test_nested_description_columns_are_preserved_without_duplicate_aliases(self):
+    def test_nested_descriptions_do_not_merge_different_function_rows(self):
         result = self.extract(["Pin #", "Pin Name", "I O", "Description", "Description"],
                               [["1", "DATA0/BOOT", "I", "Mode", "Normal"],
                                ["1", "DATA0/BOOT", "I", "Mode", "Test"],
                                ["1", "GPIO0", "I/O", "GPIO", "GPIO"],
                                ["1", "DATA0/BOOT", "I", "Mode", "Normal"]])
-        pin = pins(result[0])[0]
-        self.assertEqual(pin["pin_name"], "DATA0/BOOT/GPIO0")
-        self.assertIn("Normal", pin["description"])
-        self.assertIn("Test", pin["description"])
+        records = pins(result[0])
+        self.assertEqual([(p["pin_no"], p["pin_name"], p["type"]) for p in records],
+                         [("1", "DATA0/BOOT", "I"), ("1", "GPIO0", "I/O")])
+        self.assertIn("Normal", records[0]["description"])
+        self.assertIn("Test", records[0]["description"])
+        self.assertEqual(records[1]["description"], "GPIO")
+
+    def test_same_number_keeps_each_name_type_and_description_as_own_record(self):
+        headers = ["Pin number LQFP-48", "Pin name", "Type", "Description"]
+        rows = [["1", "PA5*", "IOUDS", "PORT A Bit 5 Input/Output"],
+                ["1", "AN5", "IA", "A/D Converter Analog Input 5"],
+                ["1", "T12OUT", "O", "Timer 12 Pulse Output"],
+                ["1", "T12CAP", "I", "Timer 12 Capture Input"]]
+        result = self.extract(headers, rows)
+        self.assertEqual(pins(result[0]), [
+            dict(zip(["pin_no", "pin_name", "type", "description"], row)) for row in rows
+        ])
+
+    def test_row_repair_does_not_aggregate_rows_with_same_number_and_name(self):
+        headers = ["Pin #", "Pin Name", "Type", "Description"]
+        rows = [["1", "SIGNAL", "I", "Input mode"],
+                ["1", "SIGNAL", "O", "Output mode"],
+                ["1", "ALTERNATE", "", "No type specified"]]
+        self.assertEqual(repair_abov_rows("Pin descriptions", headers, rows), rows)
 
     def test_unknown_expression_and_oversized_range_not_guessed(self):
         for value in ["1-5(6)", "1abc", "3 to", "0", "1 to 5000", "2 3"]:
