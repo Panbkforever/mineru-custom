@@ -127,6 +127,7 @@ def main() -> int:
                 source_file,
                 use_semantic_classifier=args.semantic_classify,
                 include_debug=True,
+                source_pdf_path=input_path if input_path.is_file() else None,
             )
         )
 

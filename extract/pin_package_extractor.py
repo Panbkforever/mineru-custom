@@ -240,6 +240,7 @@ def extract_pin_package_info_from_middle_json(
     source_name: str = "",
     include_debug: bool = False,
     use_semantic_classifier: bool = False,
+    source_pdf_path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     """从 MinerU 的 middle_json 找出表格，并交给统一提取流水线。"""
     pdf_info = middle_json.get("pdf_info", [])
@@ -250,6 +251,7 @@ def extract_pin_package_info_from_middle_json(
         use_semantic_classifier=use_semantic_classifier,
         document_page_count=len(pdf_info) if isinstance(pdf_info, list) else None,
         toc_page_range=detect_table_of_contents_page_range(middle_json),
+        source_pdf_path=source_pdf_path,
     )
 
 
@@ -257,6 +259,7 @@ def extract_pin_package_info_from_middle_json_file(
     path: str | Path,
     use_semantic_classifier: bool = False,
     include_debug: bool = False,
+    source_pdf_path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     """读取 middle_json 文件后调用内存对象入口。"""
     path = Path(path)
@@ -265,6 +268,7 @@ def extract_pin_package_info_from_middle_json_file(
         source_name=path.stem,
         use_semantic_classifier=use_semantic_classifier,
         include_debug=include_debug,
+        source_pdf_path=source_pdf_path,
     )
 
 
@@ -272,6 +276,7 @@ def extract_pin_package_info_from_markdown_json_file(
     path: str | Path,
     use_semantic_classifier: bool = False,
     include_debug: bool = False,
+    source_pdf_path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     """从最终的 ``<pdf>.json`` 中提取，确保使用后处理后的表格。"""
 
@@ -322,6 +327,7 @@ def extract_pin_package_info_from_markdown_json_file(
         use_semantic_classifier=use_semantic_classifier,
         document_page_count=document_page_count,
         toc_page_range=toc_page_range,
+        source_pdf_path=source_pdf_path,
     )
 
 
@@ -332,6 +338,7 @@ def extract_pin_package_info_from_table_candidates(
     use_semantic_classifier: bool = False,
     document_page_count: int | None = None,
     toc_page_range: tuple[int, int] | None = None,
+    source_pdf_path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     """按“先判断、后提取”的顺序处理表格。
 
@@ -346,6 +353,8 @@ def extract_pin_package_info_from_table_candidates(
     packages: dict[str, dict[str, Any]] = {}
 
     vendor_profile = get_current_vendor_profile()
+    if vendor_profile.source_table_repairer is not None:
+        candidates = vendor_profile.source_table_repairer(candidates, source_pdf_path)
 
     # 第一阶段：只准备候选表，不创建任何 pin 记录。
     prepared = []

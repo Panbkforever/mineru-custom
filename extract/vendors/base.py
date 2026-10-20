@@ -21,6 +21,7 @@ TableRepairer = Callable[
 RowRepairer = Callable[[str, list[str], list[list[str]]], list[list[str]]]
 RecordFilterer = Callable[[dict[str, Any]], bool]
 PackageScopeResolver = Callable[..., Any]
+SourceTableRepairer = Callable[[list[Any], Any], list[Any]]
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,7 @@ class VendorProfile:
     row_repairer: RowRepairer | None = None
     record_filterer: RecordFilterer | None = None
     package_scope_resolver: PackageScopeResolver | None = None
+    source_table_repairer: SourceTableRepairer | None = None
 
     @property
     def canonical_name(self) -> str:

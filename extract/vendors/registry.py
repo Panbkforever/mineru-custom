@@ -5,12 +5,14 @@ from __future__ import annotations
 import os
 
 from extract.vendors.base import VendorProfile
+from extract.vendors.elan.profile import PROFILE as ELAN_PROFILE
 from extract.vendors.abov.profile import PROFILE as ABOV_PROFILE
 from extract.vendors.st.profile import PROFILE as ST_PROFILE
 from extract.vendors.ti.profile import PROFILE as TI_PROFILE
 
 
 _PROFILES: dict[str, VendorProfile] = {
+    ELAN_PROFILE.canonical_name: ELAN_PROFILE,
     ABOV_PROFILE.canonical_name: ABOV_PROFILE,
     TI_PROFILE.canonical_name: TI_PROFILE,
     ST_PROFILE.canonical_name: ST_PROFILE,
