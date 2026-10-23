@@ -165,6 +165,79 @@ class ABOVVendorTableTest(unittest.TestCase):
         self.assertIsNone(match_abov_table("Peripheral pins", ["Pin Name", "Type", "Description"], [["TXD", "O", "UART"]]))
         self.assertIsNone(match_abov_table("Characteristics", ["Symbol", "Min", "Max"], [["VDD", "1", "5"]]))
 
+    def test_wrapped_number_is_checked_by_physical_groups_not_function_rows(self):
+        headers = ["Pin number LQFP-64", "Pin name", "Type"]
+        rows = [["56", "PREV", "I"], ["56", "PREV_ALT", "O"],
+                ["5\n7", "SIGNAL", "I/O"], ["5\n7", "SIGNAL_ALT", "I"],
+                ["58", "NEXT", "I"], ["58", "NEXT_ALT", "O"]]
+        fixed = repair_abov_rows("Pins", headers, rows)
+        self.assertEqual([r[0] for r in fixed], ["56", "56", "57", "57", "58", "58"])
+        self.assertEqual([r[1:] for r in fixed], [r[1:] for r in rows])
+
+    def test_wrapped_last_group_uses_two_parallel_single_mapping_anchors(self):
+        headers = ["Pin number LQFP-64", "Pin number MQFP-60", "Pin name", "Type"]
+        rows = [["56", "52", "PREV", "I"], ["57", "53", "NEAR", "I/O"],
+                ["57", "53", "NEAR_ALT", "O"], ["5\n8", "54", "LAST", "I/O"],
+                ["5\n8", "54", "LAST_ALT", "I"]]
+        fixed = repair_abov_rows("Pins", headers, rows)
+        self.assertEqual([r[0] for r in fixed], ["56", "57", "57", "58", "58"])
+        self.assertEqual([r[1:] for r in fixed], [r[1:] for r in rows])
+
+    def test_wrapped_first_group_can_use_parallel_mapping_evidence(self):
+        headers = ["Pin number LQFP-64", "Pin number MQFP-60", "Pin name", "Type"]
+        rows = [["5\n6", "52", "FIRST", "I"], ["57", "53", "NEXT", "I"], ["58", "54", "AFTER", "I"]]
+        self.assertEqual([r[0] for r in repair_abov_rows("Pins", headers, rows)], ["56", "57", "58"])
+
+    def test_multi_package_fragment_preserves_function_membership(self):
+        headers = ["Pin number LQFP-64", "Pin number MQFP-60", "Pin name", "Type"]
+        rows = [["56", "52", "PREV", "I"], ["5\n7", "53", "GPIO", "I/O"],
+                ["5\n7", "53", "ADC", "IA"], ["58", "54", "NEXT", "O"]]
+        result = self.extract(headers, rows)
+        self.assertEqual(len(result), 2)
+        self.assertEqual([(p["pin_no"], p["pin_name"], p["type"]) for p in pins(result[0])],
+                         [("56", "PREV", "I"), ("57", "GPIO", "I/O"), ("57", "ADC", "IA"), ("58", "NEXT", "O")])
+        self.assertEqual([(p["pin_no"], p["pin_name"]) for p in pins(result[1])],
+                         [("52", "PREV"), ("53", "GPIO"), ("53", "ADC"), ("54", "NEXT")])
+
+    def test_one_parallel_anchor_is_not_enough_at_boundary(self):
+        headers = ["Pin number LQFP-64", "Pin number MQFP-60", "Pin name", "Type"]
+        rows = [["57", "53", "PREV", "I"], ["5\n8", "54", "LAST", "I"]]
+        self.assertNotIn("58", [r[0] for r in repair_abov_rows("Pins", headers, rows)])
+
+    def test_repeated_function_rows_do_not_count_as_two_mapping_anchors(self):
+        headers = ["Pin number LQFP-64", "Pin number MQFP-60", "Pin name", "Type"]
+        rows = [["57", "53", "PREV", "I"], ["57", "53", "PREV_ALT", "O"],
+                ["5\n8", "54", "LAST", "I"]]
+        self.assertNotIn("58", [r[0] for r in repair_abov_rows("Pins", headers, rows)])
+
+    def test_conflicting_parallel_mapping_does_not_guess_boundary_number(self):
+        headers = ["Pin number LQFP-64", "Pin number MQFP-60", "Pin name", "Type"]
+        rows = [["56", "51", "PREV", "I"], ["57", "53", "NEAR", "I"], ["5\n8", "54", "LAST", "I"]]
+        self.assertNotIn("58", [r[0] for r in repair_abov_rows("Pins", headers, rows)])
+
+    def test_single_column_boundary_without_evidence_is_unchanged(self):
+        headers = ["Pin #", "Pin name", "Type"]
+        rows = [["56", "A", "I"], ["57", "B", "I"], ["5\n8", "C", "I"]]
+        self.assertNotIn("58", [r[0] for r in repair_abov_rows("Pins", headers, rows)])
+
+    def test_genuine_newline_number_list_is_not_blindly_joined(self):
+        headers = ["Pin #", "Pin name", "Type"]
+        rows = [["2", "A", "P"], ["3\n6", "GND", "P"], ["7", "B", "P"]]
+        fixed = repair_abov_rows("Pins", headers, rows)
+        self.assertEqual([(r[0], r[1]) for r in fixed], [("2", "A"), ("3", "GND"), ("6", "GND"), ("7", "B")])
+
+    def test_explicit_name_range_protects_parallel_number_list(self):
+        headers = ["Pin #", "Pin name", "Type"]
+        rows = [["56", "A", "I"], ["5\n7", "SIG0-SIG1", "I"], ["58", "B", "I"]]
+        fixed = repair_abov_rows("Pins", headers, rows)
+        self.assertEqual([(r[0], r[1]) for r in fixed[1:3]], [("5", "SIG0"), ("7", "SIG1")])
+
+    def test_descending_physical_sequence_and_consecutive_wrapped_groups(self):
+        headers = ["Pin #", "Pin name", "Type"]
+        rows = [["59", "A", "I"], ["5\n8", "B", "I"], ["5\n8", "B_ALT", "O"],
+                ["5\n7", "C", "I"], ["56", "D", "I"]]
+        self.assertEqual([r[0] for r in repair_abov_rows("Pins", headers, rows)], ["59", "58", "58", "57", "56"])
+
 
 if __name__ == "__main__":
     unittest.main()

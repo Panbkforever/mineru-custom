@@ -154,27 +154,91 @@ def _merge_descriptions(headers: list[str], rows: list[list[str]]) -> tuple[list
 def _join_wrapped_numbers(rows: list[list[str]], roles: dict[str, list[int]]) -> list[list[str]]:
     fixed = [list(row) for row in rows]
     name_index = roles["pin_name"][0]
+    # 相同编号轴的连续功能行只作为一个校验单位，输出仍保留每条功能记录。
+    groups: list[list[int]] = []
+    signatures = []
+    for index, row in enumerate(rows):
+        signature = tuple(_text(row[c]) if c < len(row) else "" for c in roles["pin_no"])
+        if signatures and signature == signatures[-1]:
+            groups[-1].append(index)
+        else:
+            signatures.append(signature)
+            groups.append([index])
+
+    def single(group: int, column: int) -> int | None:
+        row = rows[groups[group][0]]
+        numbers = _numbers(row[column]) if column < len(row) else None
+        return int(numbers[0]) if numbers and len(numbers) == 1 else None
+
+    def parallel_mapping(group: int, column: int, value: int) -> bool:
+        # 表边界没有双侧锚点时，要求其他封装列至少两个邻近单值映射
+        # 支持同一偏移，且其中至少一个紧邻当前引脚；出现矛盾就不修复。
+        for donor in roles["pin_no"]:
+            if donor == column:
+                continue
+            donor_value = single(group, donor)
+            if donor_value is None:
+                continue
+            offset = value - donor_value
+            supporters = []
+            conflicts = False
+            for neighbor in range(max(0, group - 3), min(len(groups), group + 4)):
+                if neighbor == group:
+                    continue
+                number, donor_number = single(neighbor, column), single(neighbor, donor)
+                if number is None or donor_number is None:
+                    continue
+                if number - donor_number == offset:
+                    supporters.append(neighbor)
+                else:
+                    conflicts = True
+            if not conflicts and len(supporters) >= 2 and any(abs(n - group) == 1 for n in supporters):
+                return True
+        return False
+
     for column in roles["pin_no"]:
         candidates: dict[int, int] = {}
-        for i, row in enumerate(rows):
-            if column >= len(row) or name_index >= len(row):
+        for group, indexes in enumerate(groups):
+            row = rows[indexes[0]]
+            if column >= len(row):
                 continue
             parts = row[column].strip().splitlines()
-            names = [line for line in row[name_index].splitlines() if line.strip()]
-            if len(parts) >= 2 and all(re.fullmatch(r"\d+", p.strip()) for p in parts) and len(names) != len(parts):
-                candidates[i] = int("".join(p.strip() for p in parts))
-        for i, value in candidates.items():
-            left, right = i - 1, i + 1
-            while left in candidates and candidates[left] + (i - left) == value:
-                left -= 1
-            while right in candidates and candidates[right] - (right - i) == value:
-                right += 1
-            if left < 0 or right >= len(rows):
+            if len(parts) < 2 or not all(re.fullmatch(r"\d+", p.strip()) for p in parts):
                 continue
-            before = _numbers(rows[left][column]) if column < len(rows[left]) else None
-            after = _numbers(rows[right][column]) if column < len(rows[right]) else None
-            if before == [str(value - (i - left))] and after == [str(value + (right - i))]:
-                fixed[i][column] = str(value)
+            if parts[0].strip().startswith("0"):
+                continue
+            parallel_names = False
+            for index in indexes:
+                name = rows[index][name_index] if name_index < len(rows[index]) else ""
+                names = [line for line in name.splitlines() if line.strip()]
+                expanded = _name_range(name)
+                if len(names) == len(parts) or (expanded and len(expanded) == len(parts)):
+                    parallel_names = True
+                    break
+            if not parallel_names:
+                candidates[group] = int("".join(p.strip() for p in parts))
+        for i, value in candidates.items():
+            # 不能把修复值分给另一组已明确占用该编号的物理引脚。
+            if any(g != i and single(g, column) == value for g in range(len(groups))):
+                continue
+            sequence = False
+            contradiction = False
+            for direction in (1, -1):
+                left, right = i - 1, i + 1
+                while left in candidates and candidates[left] == value + direction * (left - i):
+                    left -= 1
+                while right in candidates and candidates[right] == value + direction * (right - i):
+                    right += 1
+                before = single(left, column) if left >= 0 else None
+                after = single(right, column) if right < len(groups) else None
+                if (before == value + direction * (left - i)
+                        and after == value + direction * (right - i)):
+                    sequence = True
+                    break
+                contradiction = before is not None and after is not None
+            if sequence or (not contradiction and parallel_mapping(i, column, value)):
+                for index in groups[i]:
+                    fixed[index][column] = str(value)
     return fixed
 
 
