@@ -22,6 +22,7 @@ RowRepairer = Callable[[str, list[str], list[list[str]]], list[list[str]]]
 RecordFilterer = Callable[[dict[str, Any]], bool]
 PackageScopeResolver = Callable[..., Any]
 SourceTableRepairer = Callable[[list[Any], Any], list[Any]]
+RecordFinalizer = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ class VendorProfile:
     record_filterer: RecordFilterer | None = None
     package_scope_resolver: PackageScopeResolver | None = None
     source_table_repairer: SourceTableRepairer | None = None
+    record_finalizer: RecordFinalizer | None = None
 
     @property
     def canonical_name(self) -> str:

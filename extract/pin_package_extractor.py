@@ -1803,7 +1803,9 @@ def normalize_pin_record(record: dict[str, Any]) -> dict[str, Any]:
     result = dict(record)
     result["pin_no"] = plain_text(str(result.get("pin_no", ""))).strip()
     result["pin_name"] = clean_pin_name(result.get("pin_name", ""))
-    return result
+    # 厂家可在原始字段确实缺省时整理输出；未配置时保持原有清洗行为。
+    finalizer = get_current_vendor_profile().record_finalizer
+    return finalizer(result, record) if finalizer is not None else result
 
 
 def clean_pin_name(value: Any) -> str:
