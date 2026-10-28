@@ -507,7 +507,7 @@ def doc_analyze(
                 f"processing-window infer finished, cost: {infer_time}, "
                 f"speed: {round(len(results) / infer_time, 3)} page/s"
             )
-        finalize_middle_json(middle_json["pdf_info"])
+        finalize_middle_json(middle_json["pdf_info"], pdf_doc=pdf_doc)
         close_pdfium_document(pdf_doc)
         doc_closed = True
         return middle_json, results
@@ -602,7 +602,7 @@ async def aio_doc_analyze(
                 f"processing-window infer finished, cost: {infer_time}, "
                 f"speed: {round(len(results) / infer_time, 3)} page/s"
             )
-        await asyncio.to_thread(finalize_middle_json, middle_json["pdf_info"])
+        await asyncio.to_thread(finalize_middle_json, middle_json["pdf_info"], pdf_doc=pdf_doc)
         close_pdfium_document(pdf_doc)
         doc_closed = True
         return middle_json, results

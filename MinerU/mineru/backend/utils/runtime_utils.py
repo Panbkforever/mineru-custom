@@ -7,7 +7,7 @@ from loguru import logger
 from mineru.utils.table_merge import merge_table
 
 
-def cross_page_table_merge(pdf_info: list[dict]):
+def cross_page_table_merge(pdf_info: list[dict], pdf_doc=None):
     """Merge tables that span across multiple pages in a PDF document.
 
     Args:
@@ -18,7 +18,7 @@ def cross_page_table_merge(pdf_info: list[dict]):
     """
     is_merge_table = os.getenv('MINERU_TABLE_MERGE_ENABLE', 'true')
     if is_merge_table.lower() in ['true', '1', 'yes']:
-        merge_table(pdf_info)
+        merge_table(pdf_info, pdf_doc=pdf_doc)
     elif is_merge_table.lower() in ['false', '0', 'no']:
         pass
     else:

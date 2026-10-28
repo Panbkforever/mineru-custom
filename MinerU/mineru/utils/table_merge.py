@@ -1007,6 +1007,7 @@ def perform_table_merge(
     current_state: TableMergeState,
     previous_table_block,
     wait_merge_table_footnotes,
+    visual_independent=False,
 ):
     """执行表格合并操作."""
     header_count, _, _ = detect_table_headers(previous_state, current_state)
@@ -1063,7 +1064,8 @@ def perform_table_merge(
     if previous_adjusted:
         _refresh_table_state_metrics(previous_state)
 
-    _apply_cell_merge(previous_state, current_state, header_count)
+    if not visual_independent:
+        _apply_cell_merge(previous_state, current_state, header_count)
 
     appended_rows = rows2[header_count:]
     append_start_idx = len(previous_state.rows)
@@ -1105,10 +1107,14 @@ def perform_table_merge(
     previous_state.dirty = True
 
 
-def merge_table(page_info_list):
+def merge_table(page_info_list, pdf_doc=None):
     """合并跨页表格."""
     state_cache: dict[int, TableMergeState] = {}
     merged_away_blocks: set[int] = set()
+    visual_verifier = None
+    if pdf_doc is not None:
+        from mineru.utils.table_boundary_visual import TableBoundaryVisualVerifier
+        visual_verifier = TableBoundaryVisualVerifier(pdf_doc)
 
     for page_idx in range(len(page_info_list) - 1, -1, -1):
         if page_idx == 0:
@@ -1142,11 +1148,20 @@ def merge_table(page_info_list):
         if not can_merge_tables(current_state, previous_state):
             continue
 
+        visual_independent = False
+        if visual_verifier is not None:
+            header_count, _, _ = detect_table_headers(previous_state, current_state)
+            header_count = _expand_header_count_by_rowspan(current_state.rows, header_count)
+            visual_independent = visual_verifier.independent_rows(
+                previous_page_info, page_info, previous_state, current_state,
+                header_count, current_state.owner_block.get("cell_merge"),
+            )
         perform_table_merge(
             previous_state,
             current_state,
             previous_table_block,
             wait_merge_table_footnotes,
+            visual_independent=visual_independent,
         )
         _restore_post_table_captions_as_text(
             page_info,
