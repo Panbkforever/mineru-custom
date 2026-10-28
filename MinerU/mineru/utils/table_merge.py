@@ -1,6 +1,7 @@
 # Copyright (c) Opendatalab. All rights reserved.
 from copy import deepcopy
 from dataclasses import dataclass
+import re
 from typing import Any
 
 from bs4 import BeautifulSoup
@@ -870,6 +871,53 @@ def _clip_overlapped_blank_rowspan_cells(
     return True
 
 
+def _independent_pin_rows_at_boundary(previous_state, current_state, header_count, cell_merge):
+    """只在表头、编号序列和名称均提供证据时否定整行续接标记。"""
+    if not cell_merge or any(flag != 1 for flag in cell_merge):
+        return False
+    if previous_state.tail_occupied or header_count < 1:
+        return False
+    if not previous_state.rows or header_count + 1 >= len(current_state.rows):
+        return False
+
+    name_columns = set()
+    for row_idx in range(header_count):
+        row = current_state.rows[row_idx]
+        cells = row.find_all(["td", "th"])
+        for cell, column in zip(cells, build_visual_col_mapping(current_state.rows, row_idx)):
+            label = _normalize_cell_text(cell).lower()
+            if ("pin" in label or "ball" in label) and "name" in label:
+                if int(cell.get("colspan", 1)) == 1:
+                    name_columns.add(column)
+    if len(name_columns) != 1:
+        return False
+
+    boundary_rows = [previous_state.rows[-1], *current_state.rows[header_count:header_count + 2]]
+    cell_rows = [row.find_all(["td", "th"]) for row in boundary_rows]
+    if any(len(cells) != len(cell_merge) for cells in cell_rows):
+        return False
+    if any(int(cell.get("colspan", 1)) != 1 or int(cell.get("rowspan", 1)) != 1
+           for cells in cell_rows for cell in cells):
+        return False
+
+    values = [[_normalize_cell_text(cell) for cell in cells] for cells in cell_rows]
+    name_column = next(iter(name_columns))
+    if name_column >= len(cell_merge):
+        return False
+    names = [row[name_column] for row in values]
+    if len(set(names)) != 3 or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) for name in names):
+        return False
+
+    # 三个相邻编号及三个独立名称共同佐证，避免仅凭两段数字推断。
+    for column in range(name_column):
+        numbers = [row[column] for row in values]
+        if all(value.isascii() and value.isdigit() for value in numbers):
+            first, second, third = map(int, numbers)
+            if second == first + 1 and third == second + 1:
+                return True
+    return False
+
+
 def _apply_cell_merge(
     previous_state: TableMergeState,
     current_state: TableMergeState,
@@ -886,6 +934,8 @@ def _apply_cell_merge(
     """
     cell_merge = current_state.owner_block.get("cell_merge")
     if not cell_merge:
+        return
+    if _independent_pin_rows_at_boundary(previous_state, current_state, header_count, cell_merge):
         return
 
     rows2 = current_state.rows
