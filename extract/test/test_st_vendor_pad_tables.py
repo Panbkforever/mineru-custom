@@ -6,7 +6,7 @@ from extract.pin_package_extractor import (
     extract_pin_package_info_from_table_candidates,
 )
 from extract.vendors.st.table_handlers import repair_st_table, repair_st_table_rows
-from extract.vendors.st.table_handlers import should_keep_st_record
+from extract.vendors import get_vendor_profile
 
 
 class STVendorPadTableTest(unittest.TestCase):
@@ -127,7 +127,7 @@ class STVendorPadTableTest(unittest.TestCase):
         self.assertIn({"pin_no": "C6", "pin_name": "VDD", "type": "S"}, by_pkg["TFBGA289"])
         self.assertNotIn("U", {pin["pin_no"] for pin in by_pkg["TFBGA289"]})
         self.assertNotIn("2", {pin["pin_no"] for pin in by_pkg["TFBGA289"]})
-        self.assertNotIn("-", {pin["pin_no"] for pin in by_pkg["TFBGA289"]})
+        self.assertIn("-", {pin["pin_no"] for pin in by_pkg["TFBGA289"]})
 
     def test_st_ball_definition_repairs_wrapped_numeric_pin_with_sequence_evidence(self):
         headers = ["Pin number LQFP64", "Pin name(function after reset)", "Pin type"]
@@ -352,10 +352,11 @@ class STVendorPadTableTest(unittest.TestCase):
         self.assertTrue(repaired_headers[2].startswith("Pin name"))
         self.assertEqual(repaired_rows[0][2], "PB7")
 
-    def test_st_record_filter_drops_dash_pin_placeholders(self):
-        self.assertFalse(should_keep_st_record({"pin_no": "-"}))
-        self.assertFalse(should_keep_st_record({"pin_no": "--"}))
-        self.assertTrue(should_keep_st_record({"pin_no": "A1"}))
+    def test_st_record_retention_inherits_shared_policy(self):
+        profile = get_vendor_profile("ST")
+        self.assertIsNone(profile.record_filterer)
+        for value in ["-", "--", "A1"]:
+            self.assertTrue(profile.should_keep_record({"pin_no": value}))
 
 
 if __name__ == "__main__":

@@ -95,7 +95,8 @@ def match_abov_table(title: str, headers: list[str], rows: list[list[str]]) -> S
         handler_name="abov_physical_pin_table",
         columns=tuple(SpecialColumnMapping(i, headers[i], field)
                       for field, indexes in roles.items() for i in indexes),
-        included_row_indexes=included,
+        # 数字证据仅用于识别表格；有效表中的所有行交给公共流程处理。
+        included_row_indexes=frozenset(range(len(rows))),
     )
 
 
@@ -308,8 +309,3 @@ def repair_abov_rows(title: str, headers: list[str], rows: list[list[str]]) -> l
     # The same physical number can have separate function/type rows. Preserve
     # each source row; package binding and shared exact-record dedup stay intact.
     return expanded_rows
-
-
-def should_keep_abov_record(record: dict[str, object]) -> bool:
-    value = _text(str(record.get("pin_no", ""))).upper()
-    return bool(value) and not (set(value) == {"-"} or value in {"NA", "N/A", "N.A."})

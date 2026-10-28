@@ -42,15 +42,6 @@ def match_st_table(
     )
 
 
-def should_keep_st_record(record: dict[str, object]) -> bool:
-    pin_no = re.sub(r"\s+", "", str(record.get("pin_no", "")))
-    if pin_no and set(pin_no) == {"-"}:
-        return False
-    if pin_no.upper() in {"NA", "N/A", "N.A.", "NOTAPPLICABLE"}:
-        return False
-    return True
-
-
 def repair_st_table(
     title: str,
     headers: list[str],

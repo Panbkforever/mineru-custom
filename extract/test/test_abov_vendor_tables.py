@@ -39,10 +39,11 @@ class ABOVVendorTableTest(unittest.TestCase):
                 ["-", "1", "VDD", "P", "Supply"]]
         result = self.extract(headers, rows)
         self.assertEqual(len(result), 2)
-        self.assertEqual([len(pins(p)) for p in result], [2, 3])
+        self.assertEqual([len(pins(p)) for p in result], [3, 3])
         self.assertEqual([(p["pin_no"], p["pin_name"], p["type"], p["description"])
                           for p in pins(result[0])],
-                         [("1", "PA0", "I/O", "GPIO"), ("1", "AN0", "IA", "Analog")])
+                         [("1", "PA0", "I/O", "GPIO"), ("1", "AN0", "IA", "Analog"),
+                          ("-", "VDD", "P", "Supply")])
         self.assertEqual([(p["pin_no"], p["pin_name"]) for p in pins(result[1])],
                          [("2", "PA0"), ("2", "AN0"), ("1", "VDD")])
         self.assertNotEqual(result[0]["pkg"], result[1]["pkg"])

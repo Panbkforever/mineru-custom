@@ -8,7 +8,7 @@ from unittest.mock import patch
 from extract.pin_package_extractor import TableCandidate, extract_pin_package_info_from_table_candidates
 from extract.vendors import get_vendor_profile
 from extract.vendors.giga.package_handlers import resolve_giga_scopes, title_package
-from extract.vendors.giga.table_handlers import match_giga_table, repair_giga_table, should_keep_giga_record
+from extract.vendors.giga.table_handlers import match_giga_table, repair_giga_table
 
 
 def table(title, headers, rows, page=0):
@@ -46,7 +46,7 @@ class GigaVendorTableTest(unittest.TestCase):
         self.assertEqual(len(result), 4)
         self.assertEqual([pins(pkg)[0]["pin_name"] for pkg in result], ["SIGNAL_A", "SIGNAL_B", "SIGNAL_C", "SIGNAL_D"])
 
-    def test_pin_and_ball_tables_do_not_merge_and_multiple_nc_is_not_a_ball(self):
+    def test_pin_and_ball_tables_stay_separate_and_keep_source_multiple_nc(self):
         result = self.extract([
             table("Table 1. Pin Description for SOP8/USON8/WSON8 Package", self.headers,
                   [["1", "CS#", "I", "Select"], ["8", "VCC", "", "Supply"]]),
@@ -54,22 +54,24 @@ class GigaVendorTableTest(unittest.TestCase):
                   ["Ball No.", "Ball Name", "I/O", "Description"],
                   [["B3", "CS#", "I", "Select"], ["B1", "VCC", "", "Supply"], ["Multiple", "NC", "", "No Connection"]]),
         ])
-        self.assertEqual([len(pins(pkg)) for pkg in result], [2, 2])
+        self.assertEqual([len(pins(pkg)) for pkg in result], [2, 3])
         self.assertEqual([p["pin_no"] for p in pins(result[0])], ["1", "8"])
-        self.assertEqual([p["pin_no"] for p in pins(result[1])], ["B3", "B1"])
+        self.assertEqual([p["pin_no"] for p in pins(result[1])], ["B3", "B1", "Multiple"])
 
-    def test_wlcsp_dnu_is_kept_but_unnumbered_nc_summary_is_not(self):
+    def test_wlcsp_keeps_dnu_and_source_multiple_nc(self):
         result = self.extract([table("Table 4. Pin Description for WLCSP (4-4 ball array) Package", self.headers,
                                      [["A3", "CS#", "I", "Select"], ["B1", "DNU", "", "Must be left floating"],
                                       ["Multiple", "NC", "", "No Connection"]])])
-        self.assertEqual([(p["pin_no"], p["pin_name"]) for p in pins(result[0])], [("A3", "CS#"), ("B1", "DNU")])
+        self.assertEqual([(p["pin_no"], p["pin_name"]) for p in pins(result[0])], [("A3", "CS#"), ("B1", "DNU"), ("Multiple", "NC")])
 
     def test_explicit_nc_pad_and_other_multiple_name_are_not_globally_removed(self):
+        profile = get_vendor_profile("GIGA")
+        self.assertIsNone(profile.record_filterer)
         for record in [{"pin_no": "A1", "pin_name": "NC"}, {"pin_no": "EPAD", "pin_name": "EPAD"},
                        {"pin_no": "B1", "pin_name": "DNU"}, {"pin_no": "Multiple", "pin_name": "SIGNAL"}]:
-            self.assertTrue(should_keep_giga_record(record))
-        self.assertFalse(should_keep_giga_record({"pin_no": "Multiple", "pin_name": "N.C."}))
-        self.assertFalse(should_keep_giga_record({"pin_no": "-", "pin_name": "EPAD"}))
+            self.assertTrue(profile.should_keep_record(record))
+        self.assertTrue(profile.should_keep_record({"pin_no": "Multiple", "pin_name": "N.C."}))
+        self.assertTrue(profile.should_keep_record({"pin_no": "-", "pin_name": "EPAD"}))
 
     def test_ambiguous_ball_name_uses_coordinate_values_and_pin_name_anchor(self):
         result = self.extract([table("PIN DESCRIPTION", ["Pin Name", "Ball Name", "I/O", "Description"],
@@ -97,7 +99,7 @@ class GigaVendorTableTest(unittest.TestCase):
                                       ["-", "-", "EPAD", "EPAD", "Thermal pad"]])])
         self.assertEqual(len(result), 3)
         self.assertEqual([pkg["pkg"] for pkg in result], ["CSP4", "SOT23-5", "XDFN4"])
-        self.assertEqual([[p["pin_no"] for p in pins(pkg)] for pkg in result], [["A1", "B1"], ["1", "3"], ["4", "3", "EPAD"]])
+        self.assertEqual([[p["pin_no"] for p in pins(pkg)] for pkg in result], [["A1", "B1", "-"], ["1", "3", "-"], ["4", "3", "EPAD"]])
 
     def test_repeated_pin_functions_are_not_aggregated(self):
         result = self.extract([table("Table 1. Pin Description for SOP8 package", self.headers,

@@ -60,8 +60,8 @@ def match_giga_table(title: str, headers: list[str], rows: list[list[str]]) -> S
         return None
     if not fields["type"] and not fields["description"]:
         return None
-    indexes = frozenset(i for i, row in enumerate(rows)
-                        if any(index < len(row) and row[index].strip() for index in fields["pin_no"]))
+    # 不因编号为空或为占位符而排除数据行，统一继承公共流程。
+    indexes = frozenset(range(len(rows)))
     if not indexes:
         return None
     return SpecialTableMatch(
@@ -70,12 +70,3 @@ def match_giga_table(title: str, headers: list[str], rows: list[list[str]]) -> S
                       for field, columns in fields.items() for i in columns),
         included_row_indexes=indexes,
     )
-
-
-def should_keep_giga_record(record: dict[str, object]) -> bool:
-    number = str(record.get("pin_no", "")).strip()
-    if not number or re.fullmatch(r"[-\u2010-\u2014\u2212\s]+", number):
-        return False
-    # Multiple/NC 是无具体球位的汇总说明；明确写出 A1/NC、B1/DNU 等记录仍保留。
-    name = re.sub(r"[.\s]+", "", str(record.get("pin_name", ""))).upper()
-    return not (number.casefold() == "multiple" and name == "NC")

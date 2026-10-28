@@ -14,7 +14,6 @@ from extract.vendors.st.table_handlers import (
     match_st_table,
     repair_st_table,
     repair_st_table_rows,
-    should_keep_st_record,
 )
 
 
@@ -27,6 +26,5 @@ PROFILE = VendorProfile(
     physical_table_guard=is_st_physical_table,
     table_repairer=repair_st_table,
     row_repairer=repair_st_table_rows,
-    record_filterer=should_keep_st_record,
     package_scope_resolver=resolve_st_package_scopes,
 )

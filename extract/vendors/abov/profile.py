@@ -6,7 +6,6 @@ from extract.vendors.abov.table_handlers import (
     match_abov_table,
     repair_abov_table,
     repair_abov_rows,
-    should_keep_abov_record,
 )
 
 
@@ -18,5 +17,4 @@ PROFILE = VendorProfile(
     table_matcher=match_abov_table,
     table_repairer=repair_abov_table,
     row_repairer=repair_abov_rows,
-    record_filterer=should_keep_abov_record,
 )

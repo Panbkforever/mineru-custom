@@ -13,7 +13,6 @@ from extract.vendors.st.table_handlers import (
     _package_label_from_pin_header,
     repair_st_table,
     repair_st_table_rows,
-    should_keep_st_record,
 )
 
 
@@ -42,7 +41,8 @@ class STPinTableRepairTest(unittest.TestCase):
             [["1", "A1", "SIGNAL", "I/O", "Signal"],
              ["Exposed pad", "-", "GND", "S", "Ground"]],
         )])
-        self.assertEqual([len(pins(pkg)) for pkg in result], [2, 1])
+        self.assertEqual([len(pins(pkg)) for pkg in result], [2, 2])
+        self.assertEqual(pins(result[1])[-1]["pin_no"], "-")
         self.assertEqual(pins(result[0])[-1], {"pin_no": "EP", "pin_name": "GND", "type": "S", "description": "Ground"})
 
     def test_pad_repair_does_not_join_explicit_pin_lists(self):
@@ -53,11 +53,13 @@ class STPinTableRepairTest(unittest.TestCase):
         self.assertEqual(split_pin_numbers(fixed[0][0]), ["3", "6"])
         self.assertEqual(fixed[1][0], "EP")
 
-    def test_na_filter_preserves_real_thermal_pad_and_unknown_name(self):
+    def test_st_inherits_shared_record_retention(self):
+        profile = get_vendor_profile("ST")
+        self.assertIsNone(profile.record_filterer)
         for value in ["NA", "N/A", "N.A.", "-", "--"]:
-            self.assertFalse(should_keep_st_record({"pin_no": value, "pin_name": "GND"}))
-        self.assertTrue(should_keep_st_record({"pin_no": "33", "pin_name": "NA"}))
-        self.assertTrue(should_keep_st_record({"pin_no": "N1", "pin_name": "NA"}))
+            self.assertTrue(profile.should_keep_record({"pin_no": value, "pin_name": "GND"}))
+        self.assertTrue(profile.should_keep_record({"pin_no": "33", "pin_name": "NA"}))
+        self.assertTrue(profile.should_keep_record({"pin_no": "N1", "pin_name": "NA"}))
 
     def test_plain_assignment_headers_pass_initial_candidate_filter(self):
         result = self.extract([table(
@@ -81,7 +83,7 @@ class STPinTableRepairTest(unittest.TestCase):
                   ["VFQFPN32", "Name", "Type(1)", "Description"],
                   [["33", "NA", "P", "Thermal pad (GND)"]], 2),
         ])
-        self.assertEqual([len(pins(pkg)) for pkg in result], [2, 2, 1])
+        self.assertEqual([len(pins(pkg)) for pkg in result], [2, 2, 2])
         self.assertEqual(pins(result[0])[0]["pin_name"], "SIGNAL_A")
         self.assertEqual(pins(result[1])[0]["pin_name"], "SIGNAL_B")
         self.assertEqual(pins(result[2])[0]["pin_no"], "A1")
