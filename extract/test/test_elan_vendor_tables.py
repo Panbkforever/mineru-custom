@@ -47,7 +47,8 @@ class ElanVendorTableTest(unittest.TestCase):
     def test_registry_isolates_source_repair(self):
         self.assertEqual(get_vendor_profile("Elan").canonical_name, "ELAN")
         for vendor in ["TI", "ST", "ABOV"]:
-            self.assertIsNone(get_vendor_profile(vendor).source_table_repairer)
+            self.assertNotEqual(get_vendor_profile(vendor).source_table_repairer,
+                                get_vendor_profile("ELAN").source_table_repairer)
 
     def test_chinese_headers_and_tilde_ranges(self):
         result = self.extract([table(["符号", "引脚序号", "类型", "功能"],

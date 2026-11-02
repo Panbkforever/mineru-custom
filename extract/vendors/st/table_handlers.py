@@ -39,7 +39,27 @@ def match_st_table(
     return (
         match_st_pad_description_table(title, headers, data_rows)
         or match_st_pin_assignment_table(title, headers, data_rows)
+        or match_st_definition_table(title, headers, data_rows)
     )
+
+
+def match_st_definition_table(title, headers, data_rows):
+    """识别明确的 ST 引脚定义表，并保留全部数据行。"""
+    if not re.search(r"\bpin\s*(?:/\s*ball\s*)?(?:description|definition)", title, re.I):
+        return None
+    normalized = [_normalize_st_header_text(header) for header in headers]
+    numbers = [i for i, value in enumerate(normalized) if value.startswith("pin number")]
+    names = [i for i, value in enumerate(normalized) if value.startswith("pin name")]
+    if not numbers or len(names) != 1:
+        return None
+    mappings = [SpecialColumnMapping(i, headers[i], "pin_no") for i in numbers]
+    mappings.append(SpecialColumnMapping(names[0], headers[names[0]], "pin_name"))
+    for i, value in enumerate(normalized):
+        if value == "pin type":
+            mappings.append(SpecialColumnMapping(i, headers[i], "type"))
+        elif value == "description":
+            mappings.append(SpecialColumnMapping(i, headers[i], "description"))
+    return SpecialTableMatch("st_pin_definition_table_handler", tuple(mappings), frozenset(range(len(data_rows))))
 
 
 def repair_st_table(
