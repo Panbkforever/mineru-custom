@@ -4,7 +4,7 @@ from unittest.mock import patch
 from bs4 import BeautifulSoup
 
 from extract.pin_package_extractor import TableCandidate, extract_pin_package_info_from_table_candidates
-from extract.vendors.st.source_tables import _compatible, prepare_st_tables
+from extract.vendors.st.source_tables import _compatible, prepare_st_tables, _split_ball_header_sections
 from extract.vendors.registry import get_vendor_profile
 
 
@@ -66,3 +66,32 @@ class StSourceHeaderTest(unittest.TestCase):
         self.assertIsNone(get_vendor_profile('TI').source_table_repairer)
         self.assertIsNot(get_vendor_profile('ST').source_table_repairer,
                          get_vendor_profile('ELAN').source_table_repairer)
+
+    def test_embedded_repeated_header_keeps_every_data_row(self):
+        title = 'Table 7. Pin/ball definition'
+        head1 = ['Pin/ball name(1)', 'Pin/ball name(1)', 'Pin name', 'Pin type']
+        head2 = ['LQFP32', 'TFBGA36', 'Pin name', 'Pin type']
+        data = [['1', 'A1', 'PA0', 'I/O'], ['-', '', 'NC', 'S'],
+                ['', 'A2', 'Reserved', ''], ['Pin/ball name', '3', 'TEST', 'I/O']]
+        original = table(title, [head1, head2, *data[:2], head1, head2, *data[2:]])
+        sections = _split_ball_header_sections(original)
+        self.assertEqual(len(sections), 2)
+        self.assertEqual([row for section in sections for row in data_rows(section, 2)], data)
+        repaired = prepare_st_tables([original])
+        self.assertEqual([row for section in repaired for row in data_rows(section, 1)], data)
+
+    def test_latex_header_uses_same_table_reference(self):
+        title = 'Table 7. Pin/ball definition'
+        complete = table(title, [['Pin/ball name', 'Pin/ball name', 'Pin name', 'Pin type'],
+                                 ['LQFP32', 'TFBGA36', 'Pin name', 'Pin type'],
+                                 ['1', 'A1', 'PA0', 'I/O'], ['-', 'A2', 'NC', 'S']])
+        continued = table(title, [['$Pin/ball name^{(1)}$ (2)', '$Pin/ball name^{(1)}$ (2)', 'Pin name', 'Pin type'],
+                                  ['LQFP32', 'TFBGA36', 'Pin type', ''],
+                                  ['2', 'A3', 'PA1', 'I/O']])
+        repaired = prepare_st_tables([complete, continued])
+        self.assertNotEqual(repaired[1].html, continued.html)
+        self.assertEqual(data_rows(continued, 2), data_rows(repaired[1], 1))
+        with patch.dict('os.environ', {'EXTRACT_VENDOR': 'ST'}):
+            result = extract_pin_package_info_from_table_candidates([complete, continued], use_semantic_classifier=False)
+        self.assertTrue(any(pin.get('pin_name') == 'PA1' for package in result
+                            for group in package['group_list'] for pin in group['pin_list']))

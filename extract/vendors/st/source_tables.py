@@ -1,6 +1,7 @@
 """ST 物理引脚表的源表头修复，不改写数据行。"""
 
 from collections import Counter, defaultdict
+from copy import deepcopy
 from dataclasses import replace
 import re
 
@@ -33,7 +34,7 @@ def _ball_header(candidate):
     first, second = _cells(rows[0]), _cells(rows[1])
     top_count = 0
     for cell in first:
-        if not re.match(r"pin\s*/\s*ball\s+name\b", _text(cell), re.I):
+        if not _key(_text(cell)).startswith("pinballname"):
             break
         top_count += 1
     labels = []
@@ -71,7 +72,51 @@ def _aligned(rows, count):
     return hits >= min(2, len(rows) - 2)
 
 
+def _split_ball_header_sections(candidate):
+    parsed = _ball_header(candidate)
+    if parsed is None:
+        return [candidate]
+    soup, rows, _, _, original_labels, _ = parsed
+    # 有跨行单元格时无法仅靠行边界无损切分，保留原表交给原流程。
+    if any(int(cell.get("rowspan", 1) or 1) > 1
+           for row in rows for cell in _cells(row)
+           if str(cell.get("rowspan", 1) or 1).isdigit()):
+        return [candidate]
+    boundaries = [0]
+    for index in range(2, len(rows) - 1):
+        top = _cells(rows[index])
+        second = _cells(rows[index + 1])
+        count = 0
+        for cell in top:
+            if not _key(_text(cell)).startswith("pinballname"):
+                break
+            count += 1
+        labels = []
+        for cell in second:
+            label = _text(cell)
+            if not _package(label):
+                break
+            labels.append(label)
+        if (count >= 2 and len(labels) >= 2
+                and abs(len(labels) - len(original_labels)) <= 1
+                and all(_compatible(a, b) for a, b in zip(labels, original_labels))):
+            boundaries.append(index)
+    if len(boundaries) == 1:
+        return [candidate]
+    sections = []
+    for start, end in zip(boundaries, boundaries[1:] + [len(rows)]):
+        fragment = deepcopy(soup)
+        for index, row in reversed(list(enumerate(fragment.find_all("tr")))):
+            if not start <= index < end:
+                row.decompose()
+        sections.append(replace(candidate, html=str(fragment)))
+    return sections
+
+
 def prepare_st_tables(candidates, source_pdf_path=None):
+    # 先按完整重复表头划分片段；数据行只迁移，不删除也不改值。
+    candidates = [section for candidate in candidates
+                  for section in _split_ball_header_sections(candidate)]
     parsed = [_ball_header(candidate) for candidate in candidates]
     references = defaultdict(list)
     for candidate, result in zip(candidates, parsed):
@@ -93,7 +138,10 @@ def prepare_st_tables(candidates, source_pdf_path=None):
                     if len(labels) <= len(names)
                     and len(names) - len(labels) <= 1
                     and all(_compatible(a, b) for a, b in zip(labels, names))
-                    and _aligned(rows, len(names))]
+                    and (_aligned(rows, len(names))
+                         or (len(labels) == len(names) and top_count >= len(names)
+                             and len(second) > len(names)
+                             and re.match(r"pin\s*name", _text(second[len(names)]), re.I)))]
             if refs:
                 width = max(len(names) for names, _ in refs)
                 refs = [(names, tail) for names, tail in refs if len(names) == width]
