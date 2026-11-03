@@ -90,3 +90,38 @@ def test_pdf_text_must_match_the_candidate_row():
         assert not TableBoundaryVisualVerifier(doc).independent_rows(*pages, previous, current, 1, [1, 1, 1])
     finally:
         doc.close()
+
+
+def test_visual_grid_confirms_previous_row_with_only_dash_identifiers():
+    before = [("4", "GPIO", "IO"), ("-", "VDD", "S")]
+    after = [("11", "PB6", "I/O"), ("13", "RESET", "I")]
+    assert _verify(before, after)
+
+
+def test_unassigned_previous_row_without_matching_type_is_not_confirmed():
+    doc = _pdf([[('4', 'GPIO', 'IO'), ('-', 'VDD', 'S')],
+                [('11', 'PB6', 'I/O'), ('13', 'RESET', 'I')]])
+    previous, current = _states([('4', 'GPIO', 'IO'), ('-', 'VDD', 'I')],
+                                [('11', 'PB6', 'I/O'), ('13', 'RESET', 'I')])
+    pages = [{'page_idx': i, 'page_size': [300, 300]} for i in (0, 1)]
+    try:
+        assert not TableBoundaryVisualVerifier(doc).independent_rows(*pages, previous, current, 1, [1, 1, 1])
+    finally:
+        doc.close()
+
+
+def test_text_coordinates_can_confirm_boundary_without_grid():
+    before = [('4', 'GPIO', 'IO'), ('7', 'VSS', 'S')]
+    after = [('11', 'PI8', 'I/O'), ('13', 'RESET', 'I')]
+    doc = _pdf([before, after], grid=False)
+    previous, current = _states(before, after)
+    previous.body_span = {'bbox': [20, 20, 280, 185]}
+    current.body_span = {'bbox': [20, 90, 280, 200]}
+    pages = [{'page_idx': i, 'page_size': [300, 300]} for i in (0, 1)]
+    try:
+        verifier = TableBoundaryVisualVerifier(doc)
+        assert verifier.independent_rows(*pages, previous, current, 1, [1, 1, 1])
+        current.rows[1].find_all('td')[0].string = '99'
+        assert not verifier.independent_rows(*pages, previous, current, 1, [1, 1, 1])
+    finally:
+        doc.close()

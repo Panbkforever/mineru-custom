@@ -93,16 +93,22 @@ class TableBoundaryVisualVerifier:
             self._cache.popitem(last=False)
         return result
 
-    def _find_row(self, page_info, state, row, name_col, expected_columns):
+    def _find_row(self, page_info, state, row, name_col, expected_columns, allow_unassigned=False):
         cells = row.find_all(["td", "th"])
         if len(cells) != expected_columns or name_col >= len(cells):
             return None
         if any(int(cell.get("rowspan", 1)) != 1 or int(cell.get("colspan", 1)) != 1 for cell in cells):
             return None
         name = _normalized(cells[name_col].get_text())
+        raw_numbers = [cell.get_text().strip() for cell in cells[:name_col]]
         identifiers = [(index, _normalized(cell.get_text())) for index, cell in enumerate(cells[:name_col])]
         identifiers = [(index, value) for index, value in identifiers if re.fullmatch(r"[a-z]*\d+[a-z0-9]*", value)]
-        if len(name) < 2 or not identifiers:
+        # 无编号的上一页末行也可能是独立物理行，必须有类型列及空编号证据。
+        unassigned = (allow_unassigned and not identifiers and raw_numbers
+                      and all(value in {"", "-"} for value in raw_numbers)
+                      and name_col + 1 < len(cells)
+                      and _normalized(cells[name_col + 1].get_text()) in {"s", "i", "o", "io", "a", "ana"})
+        if len(name) < 2 or (not identifiers and not unassigned):
             return None
         grid = self._grid(page_info, state.body_span, expected_columns)
         if grid is None:
@@ -116,10 +122,62 @@ class TableBoundaryVisualVerifier:
                 return _normalized("".join(item[0] for item in selected))
             if text_at(name_col) != name:
                 continue
-            if not any(text_at(col) == value for col, value in identifiers):
+            if identifiers and not any(text_at(col) == value for col, value in identifiers):
+                continue
+            if unassigned and (text_at(name_col + 1) != _normalized(cells[name_col + 1].get_text())
+                               or any(text_at(col) for col in range(name_col))):
                 continue
             matches.append(row_idx)
         return (matches[0], len(ys) - 1) if len(matches) == 1 else None
+
+    def _find_boundary_by_text(self, page_info, state, row, name_col, at_end):
+        cells = row.find_all(["td", "th"])
+        if len(cells) <= name_col + 1 or any(
+                int(c.get("rowspan", 1)) != 1 or int(c.get("colspan", 1)) != 1 for c in cells):
+            return False
+        name = cells[name_col].get_text().strip()
+        kind = cells[name_col + 1].get_text().strip()
+        ids = [c.get_text().strip() for c in cells[:name_col]]
+        ids = [x for x in ids if re.fullmatch(r"[A-Za-z]*\d+[A-Za-z0-9]*", x)]
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or not ids:
+            return False
+        if not re.fullmatch(r"I/O|I|O|S|A|ANA", kind, re.I):
+            return False
+        bbox, size = state.body_span.get("bbox"), page_info.get("page_size")
+        if not bbox or not size:
+            return False
+        with pdfium_guard():
+            page = self.pdf_doc[int(page_info["page_idx"])]
+            width, height = page.get_size()
+            x0, y0, x1, y1 = (bbox[0] * width / size[0], bbox[1] * height / size[1],
+                              bbox[2] * width / size[0], bbox[3] * height / size[1])
+            text_page = page.get_textpage()
+            try:
+                text = text_page.get_text_range(0, text_page.count_chars())
+                def positions(value):
+                    pattern = r"(?<![A-Za-z0-9_])" + re.escape(value) + r"(?![A-Za-z0-9_])"
+                    result = []
+                    for match in re.finditer(pattern, text, re.I):
+                        try:
+                            boxes = [text_page.get_charbox(i) for i in range(match.start(), match.end())]
+                        except Exception:
+                            continue
+                        x = sum((b[0] + b[2]) / 2 for b in boxes) / len(boxes)
+                        y = height - sum((b[1] + b[3]) / 2 for b in boxes) / len(boxes)
+                        if x0 <= x <= x1 and y0 <= y <= y1:
+                            result.append((x, y))
+                    return result
+                names, kinds = positions(name), positions(kind)
+                identifiers = [pos for value in set(ids) for pos in positions(value)]
+                matches = []
+                for x, y in names:
+                    edge_ok = y >= y1 - (y1 - y0) * .15 if at_end else y <= y0 + (y1 - y0) * .30
+                    if (edge_ok and any(ix < x and abs(iy - y) < 3 for ix, iy in identifiers)
+                            and any(kx > x and abs(ky - y) < 3 for kx, ky in kinds)):
+                        matches.append((x, y))
+                return len(matches) == 1
+            finally:
+                text_page.close()
 
     def independent_rows(self, previous_info, current_info, previous, current, header_count, flags):
         if not flags or any(flag != 1 for flag in flags) or previous.tail_occupied:
@@ -132,7 +190,9 @@ class TableBoundaryVisualVerifier:
         for index in range(header_count):
             for cell, col in zip(current.rows[index].find_all(["td", "th"]), build_visual_col_mapping(current.rows, index)):
                 label = _normalized(cell.get_text())
-                if ("pin" in label or "ball" in label) and "name" in label and int(cell.get("colspan", 1)) == 1:
+                if (("pin" in label or "ball" in label) and "name" in label
+                        and not label.startswith("pinballname")
+                        and int(cell.get("colspan", 1)) == 1):
                     name_cols.add(col)
         if len(name_cols) != 1:
             return False
@@ -147,9 +207,27 @@ class TableBoundaryVisualVerifier:
             if first == second and re.fullmatch(r"[a-z]*\d+[a-z0-9]*", first):
                 return False
         try:
-            before = self._find_row(previous_info, previous, previous.rows[-1], name_col, len(flags))
+            before = self._find_row(previous_info, previous, previous.rows[-1], name_col, len(flags), allow_unassigned=True)
             after = self._find_row(current_info, current, current.rows[header_count], name_col, len(flags))
         except Exception as exc:
             logger.warning("跨页表格视觉证据不可用，保留原有处理: {}", exc)
             return False
-        return bool(before and after and before[0] == before[1] - 1 and 0 < after[0] <= 4)
+        if before and after:
+            return before[0] == before[1] - 1 and 0 < after[0] <= 4
+        # 无完整网格时，必须两页分别以编号、名称、类型和坐标唯一定位。
+        try:
+            if (self._grid(previous_info, previous.body_span, len(flags)) is not None
+                    or self._grid(current_info, current.body_span, len(flags)) is not None):
+                return False
+        except Exception:
+            return False
+        before_name = _normalized(previous_cells[name_col].get_text())
+        after_name = _normalized(current_cells[name_col].get_text())
+        if not before_name or not after_name or before_name == after_name:
+            return False
+        try:
+            return (self._find_boundary_by_text(previous_info, previous, previous.rows[-1], name_col, True)
+                    and self._find_boundary_by_text(current_info, current, current.rows[header_count], name_col, False))
+        except Exception as exc:
+            logger.warning("跨页表格文字坐标证据不可用，保留原有处理: {}", exc)
+            return False
