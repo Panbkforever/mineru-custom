@@ -3,6 +3,7 @@
 from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import replace
+from difflib import SequenceMatcher
 import re
 
 from bs4 import BeautifulSoup
@@ -72,6 +73,147 @@ def _aligned(rows, count):
     return hits >= min(2, len(rows) - 2)
 
 
+def _table_key(title):
+    return _key(title).replace('continued', '')
+
+
+def _generic_pin_header(candidate):
+    soup = BeautifulSoup(candidate.html, 'html.parser')
+    rows = soup.find_all('tr')
+    if len(rows) < 4 or any(cell.has_attr('rowspan') or cell.has_attr('colspan')
+                            for row in rows[:3] for cell in _cells(row)):
+        return None
+    top = [_text(cell) for cell in _cells(rows[0])]
+    n = 0
+    for value in top:
+        if not _key(value).startswith(('pinnumber', 'pinno')):
+            break
+        n += 1
+    if n < 2 or n >= len(top) or not _key(top[n]).startswith('pinname'):
+        return None
+    for level in (1, 2):
+        if len(rows) <= level + 1:
+            continue
+        labels = [_text(cell) for cell in _cells(rows[level])]
+        if sum(_package(value) for value in labels[:max(n, 2)]) < 2:
+            continue
+        end = next((i for i, value in enumerate(labels)
+                    if _key(value).startswith(('pinname', 'pintype'))), len(labels))
+        return soup, rows, n, level, labels[:end]
+    return None
+
+
+def _data_aligned(rows, start, n):
+    data = rows[start:start + 12]
+    hits = 0
+    for row in data:
+        cells = _cells(row)
+        if len(cells) > n + 1 and _text(cells[n]) and re.fullmatch(
+                r'I/O|I|O|S|A|ANA|P|Power|Supply', _text(cells[n + 1]), re.I):
+            hits += 1
+    return hits >= min(2, len(data)) and bool(data)
+
+
+def _sequence_similarity(first, second):
+    return SequenceMatcher(None, [_key(x) for x in first],
+                           [_key(x) for x in second], autojunk=False).ratio()
+
+
+def _repair_generic_pin_headers(candidates):
+    parsed = [_generic_pin_header(candidate) for candidate in candidates]
+    references = defaultdict(list)
+    for index, (candidate, item) in enumerate(zip(candidates, parsed)):
+        if item is None:
+            continue
+        _, rows, n, level, labels = item
+        if (len(labels) == n and sum(_package(x) for x in labels) >= max(2, n * .7)
+                and _data_aligned(rows, level + 1, n)):
+            references[(_table_key(candidate.title), level, n)].append((index, item))
+    result = list(candidates)
+    for index, (candidate, item) in enumerate(zip(candidates, parsed)):
+        if item is None:
+            continue
+        soup, rows, original_n, level, labels = item
+        choices = []
+        for (title, reference_level, n), entries in references.items():
+            if title != _table_key(candidate.title) or reference_level != level:
+                continue
+            before = [entry for entry in entries if entry[0] < index]
+            after = [entry for entry in entries if entry[0] > index]
+            if not before or not after or not _data_aligned(rows, level + 1, n):
+                continue
+            for _, left in reversed(before[-3:]):
+                for _, right in after[:3]:
+                    if level == 2:
+                        current_models = [_text(c) for c in _cells(rows[1])[:original_n]]
+                        left_models = [_text(c) for c in _cells(left[1][1])[:n]]
+                        right_models = [_text(c) for c in _cells(right[1][1])[:n]]
+                        if (_sequence_similarity(left_models, right_models) < .9
+                                or _sequence_similarity(current_models, left_models) < .75
+                                or _sequence_similarity(current_models, right_models) < .75):
+                            continue
+                    if (_sequence_similarity(left[4], right[4]) >= .85
+                            and _sequence_similarity(labels, left[4]) >= .75
+                            and _sequence_similarity(labels, right[4]) >= .75):
+                        choices.append((n, left, right))
+                        break
+                if choices and choices[-1][0] == n:
+                    break
+        if len(choices) != 1:
+            continue
+        n, left, right = choices[0]
+        if original_n == n and len(labels) == n and _data_aligned(rows, level + 1, original_n):
+            continue
+        # 仅修复列结构有明确异常的续表，保留全部数据行与单元格。
+        ref_rows = left[1]
+        ref_labels = left[4]
+        model = [_text(c) for c in _cells(ref_rows[1])] if level == 2 else []
+        new_row = soup.new_tag('tr')
+        for i, label in enumerate(ref_labels):
+            cell = soup.new_tag('th')
+            cell.string = 'Pin number ' + ((model[i] + ' ') if level == 2 else '') + label
+            new_row.append(cell)
+        for value in ['Pin name', 'Pin type']:
+            cell = soup.new_tag('th')
+            cell.string = value
+            new_row.append(cell)
+        for cell in _cells(ref_rows[level])[n + 2:]:
+            new_row.append(deepcopy(cell))
+        rows[0].replace_with(new_row)
+        for row in rows[1:level + 1]:
+            row.decompose()
+        result[index] = replace(candidate, html=str(soup))
+    return result
+
+
+def _preserve_shared_package_columns(candidate):
+    # 复合表头可能使同一封装名跨多个物理列出现，不能按名称合并列。
+    from extract.vendors.st.table_handlers import _split_combined_st_package_labels
+
+    item = _generic_pin_header(candidate)
+    if item is None:
+        return candidate
+    soup, rows, n, level, labels = item
+    if level != 1 or len(labels) != n or n > 26 or not _data_aligned(rows, 2, n):
+        return candidate
+    expanded = [_split_combined_st_package_labels(re.sub(r'-(?=[A-Za-z])', ' - ', value)) or [value]
+                for value in labels]
+    flattened = [_key(value) for group in expanded for value in group]
+    if not any(len(group) > 1 for group in expanded) or len(flattened) == len(set(flattened)):
+        return candidate
+    header = soup.new_tag('tr')
+    for index, original in enumerate(labels):
+        cell = soup.new_tag('th')
+        cell['data-st-source-header'] = original
+        cell.string = 'Pin number Package ' + chr(ord('A') + index)
+        header.append(cell)
+    for value in _cells(rows[0])[n:]:
+        header.append(deepcopy(value))
+    rows[0].replace_with(header)
+    rows[1].decompose()
+    return replace(candidate, html=str(soup))
+
+
 def _split_ball_header_sections(candidate):
     parsed = _ball_header(candidate)
     if parsed is None:
@@ -114,6 +256,8 @@ def _split_ball_header_sections(candidate):
 
 
 def prepare_st_tables(candidates, source_pdf_path=None):
+    candidates = _repair_generic_pin_headers(candidates)
+    candidates = [_preserve_shared_package_columns(candidate) for candidate in candidates]
     # 先按完整重复表头划分片段；数据行只迁移，不删除也不改值。
     candidates = [section for candidate in candidates
                   for section in _split_ball_header_sections(candidate)]

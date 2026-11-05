@@ -4,7 +4,7 @@ from unittest.mock import patch
 from bs4 import BeautifulSoup
 
 from extract.pin_package_extractor import TableCandidate, extract_pin_package_info_from_table_candidates
-from extract.vendors.st.source_tables import _compatible, prepare_st_tables, _split_ball_header_sections
+from extract.vendors.st.source_tables import _compatible, prepare_st_tables, _split_ball_header_sections, _repair_generic_pin_headers
 from extract.vendors.registry import get_vendor_profile
 
 
@@ -95,3 +95,41 @@ class StSourceHeaderTest(unittest.TestCase):
             result = extract_pin_package_info_from_table_candidates([complete, continued], use_semantic_classifier=False)
         self.assertTrue(any(pin.get('pin_name') == 'PA1' for package in result
                             for group in package['group_list'] for pin in group['pin_list']))
+
+    def test_recover_missing_multilayer_header_without_changing_data(self):
+        title = 'Table 7. Pin definitions (continued)'
+        labels = ['LQFP32', 'LQFP48', 'LQFP64', 'LQFP100', 'TFBGA132', 'TFBGA169']
+        top = ['Pin number'] * 6 + ['Pin name', 'Pin type']
+        data = [['1', '-', '', 'NC', 'A1', 'B1', 'PA0', 'I/O'],
+                ['2', '3', '4', '5', 'A2', 'B2', 'PA1', 'I/O']]
+        complete = table(title, [top, labels + ['Pin name', 'Pin type'], *data])
+        damaged = table(title, [top[:-3] + top[-2:] + [''], labels[:-1] + ['Pin name', 'Pin type', ''], *data])
+        result = _repair_generic_pin_headers([complete, damaged, complete])
+        self.assertNotEqual(result[1].html, damaged.html)
+        self.assertEqual(data_rows(result[1], 1), data)
+        self.assertEqual(data_rows(complete, 2), data)
+
+    def test_different_table_never_supplies_missing_header(self):
+        labels = ['LQFP32', 'LQFP48', 'LQFP64', 'LQFP100', 'TFBGA132', 'TFBGA169']
+        data = [['1', '-', '', 'NC', 'A1', 'B1', 'PA0', 'I/O'],
+                ['2', '3', '4', '5', 'A2', 'B2', 'PA1', 'I/O']]
+        top = ['Pin number'] * 6 + ['Pin name', 'Pin type']
+        reference = table('Table 1. Pin definition', [top, labels + ['Pin name', 'Pin type'], *data])
+        damaged = table('Table 2. Pin definition', [top[:-3] + top[-2:] + [''], labels[:-1] + ['Pin name', 'Pin type', ''], *data])
+        self.assertEqual(_repair_generic_pin_headers([reference, damaged, reference])[1].html, damaged.html)
+
+    def test_shared_physical_columns_are_kept_distinct(self):
+        headers = ['LQFP32 / UFQFPN32-GP', 'LQFP32 / UFQFPN32-N', 'LQFP48']
+        rows = [['Pin number'] * 3 + ['Pin name', 'Pin type'], headers + ['Pin name', 'Pin type'],
+                ['17', '-', '21', 'PB2', 'I/O'], ['-', '17', '27', 'PB15', 'I/O']]
+        original = table('Table 1. Pin assignment', rows)
+        repaired = prepare_st_tables([original])[0]
+        self.assertEqual(data_rows(repaired, 1), rows[2:])
+        self.assertIn('data-st-source-header', repaired.html)
+        with patch.dict('os.environ', {'EXTRACT_VENDOR': 'ST'}):
+            result = extract_pin_package_info_from_table_candidates([original], use_semantic_classifier=False)
+        self.assertEqual(len(result), 3)
+        records = [[p for g in x['group_list'] for p in g['pin_list']] for x in result]
+        self.assertIn({'pin_no': '17', 'pin_name': 'PB2', 'type': 'I/O'}, records[0])
+        self.assertIn({'pin_no': '-', 'pin_name': 'PB2', 'type': 'I/O'}, records[1])
+        self.assertIn({'pin_no': '17', 'pin_name': 'PB15', 'type': 'I/O'}, records[1])
