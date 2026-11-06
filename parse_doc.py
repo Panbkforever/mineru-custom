@@ -148,6 +148,11 @@ def apply_header_footer_filter(
                     source_pdf_path,
                 )
 
+                # 仅 ST 分支使用原 PDF 同行坐标恢复缺失的封装单元格。
+                if os.environ.get("EXTRACT_VENDOR", "").strip().upper() == "ST":
+                    from extract.vendors.st.pdf_table_cells import restore_st_pin_cells
+                    restore_st_pin_cells(middle_json, source_pdf_path)
+
                 md_path = output_subdir / f"{middle_path.name[:-len('_middle.json')]}.md"
                 image_dir = "images"
                 md_content = make_func(pdf_info, MakeMode.MM_MD, image_dir)

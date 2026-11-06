@@ -9,11 +9,9 @@ MinerU/VLM 有时会把同一单元格内原本分开的多条视觉文本行直
 * 只在原 HTML 内容中插入 ``<br>``，不使用 PDF 文字覆盖 MinerU 识别结果。
 * 行列边界可靠时，只在当前物理单元格范围内寻找视觉行，禁止借用其他行。
 * 若当前文本在 PDF 中存在完整单行，保留原样，不再尝试拆成多个视觉行。
-* 无法恢复物理单元格范围时，仅接受位置唯一且中间没有跳行的多行匹配。
-* 一个 HTML 表跨 PDF 续表页时，各页独立参与换行恢复；绝不把上一页
-  末尾和下一页开头拼成同一个多行单元格。
-* 同时检查相关页面的完整单行证据，避免当前页中的零散字符把 ``35``、
-  ``57`` 等正常值错误拆开。
+* 无法恢复物理单元格范围时保留原文，不借用整列、示意图或整页文字。
+* 跨页合并表按完整行顺序对应回逐页原始表，每页使用自己的坐标和网格。
+* 重复行、重复来源或续表对应不唯一时保留原文，不猜测所属单元格。
 
 MinerU 的 ``page_size`` 和表格 ``bbox`` 可能使用渲染像素坐标，而 PDFium
 字符坐标使用 PDF 点坐标。读取字符前必须先把表格范围换算到 PDF 坐标系。
@@ -88,172 +86,169 @@ def restore_cell_line_breaks_in_middle_json(
     except Exception:
         return stats
 
-    cache: dict[tuple[int, tuple[float, ...], str], tuple[str, int, int]] = {}
-    page_text_cache: dict[int, str] = {}
-    for page_info in pdf_info:
-        declared_page_index = int(page_info.get("page_idx", 0))
-        if declared_page_index < 0 or declared_page_index >= len(pdf_doc):
-            continue
-
-        source_width, source_height = _page_size(page_info)
-        for span in _iter_html_spans(page_info):
-            table_html = span.get("html")
-            bbox = span.get("bbox")
-            if not isinstance(table_html, str) or not _valid_bbox(bbox):
+    try:
+        # 在修改任何 HTML 前保存逐页物理表，续表不能复用合并表首页的坐标。
+        physical_tables = _physical_table_sources(pdf_info)
+        cell_cache: dict[tuple, list[list[list[TextRun]]] | None] = {}
+        scoped_cache: dict[tuple, tuple[str, int, int]] = {}
+        for page_info in pdf_info:
+            page_index = int(page_info.get("page_idx", 0))
+            if not 0 <= page_index < len(pdf_doc):
                 continue
-
-            # 个别 MinerU 输出的 page_idx 与原 PDF 实际页码存在一页偏移。
-            # 使用当前表格自身的文本锚点在相邻页面中校正，不依赖文档标题、
-            # 表格业务类型或任何抽取字段。
-            page_index = _resolve_pdf_page_index(
-                pdf_doc,
-                declared_page_index,
-                table_html,
-                page_text_cache,
-            )
-            page = pdf_doc[page_index]
-            pdf_width, pdf_height = _pdf_page_size(page)
-            if pdf_width <= 0 or pdf_height <= 0:
-                continue
-
-            effective_source_width = source_width or pdf_width
-            effective_source_height = source_height or pdf_height
-            # middle_json 的 bbox 与 PDFium 字符框不一定处于同一尺度。
-            # 统一转换为 PDF 点坐标，并继续使用左上角为原点的方向。
-            pdf_bbox = _scale_bbox_to_pdf(
-                [float(value) for value in bbox],
-                effective_source_width,
-                effective_source_height,
-                pdf_width,
-                pdf_height,
-            )
-            stats["tables_checked"] += 1
-            cache_key = (
-                page_index,
-                tuple(round(value, 3) for value in pdf_bbox),
-                table_html,
-            )
-            cached = cache.get(cache_key)
-            if cached is None:
-                text_page = page.get_textpage()
-                table_characters = _extract_pdf_characters(
-                    text_page,
-                    pdf_bbox,
-                    pdf_height,
-                )
-                runs_by_line = _visual_runs_from_characters(table_characters)
-                # MinerU 可能把多个 PDF 续表页合并成一个 HTML <table>，
-                # 但只保留其中一页的 page_idx/bbox。每个相关页面独立保存
-                # 视觉行：既能恢复其他页的单元格换行，也不会跨页拼接文本。
-                known_single_line_texts = _single_line_texts(runs_by_line)
-                fallback_runs_by_page: list[list[list[TextRun]]] = []
-                for related_page_index in _related_pdf_page_indexes(
-                    pdf_doc,
-                    declared_page_index,
-                    table_html,
-                    page_text_cache,
-                ):
-                    if related_page_index == page_index:
-                        continue
-                    related_page = pdf_doc[related_page_index]
-                    related_width, related_height = _pdf_page_size(
-                        related_page
+            for span in _iter_html_spans(page_info):
+                table_html = span.get("html")
+                bbox = span.get("bbox")
+                if not isinstance(table_html, str) or not _valid_bbox(bbox):
+                    continue
+                stats["tables_checked"] += 1
+                key = (page_index, tuple(bbox), table_html)
+                if key not in scoped_cache:
+                    cell_runs = _map_physical_cell_runs(
+                        table_html, page_info, bbox, physical_tables, pdf_doc, cell_cache,
                     )
-                    if related_width <= 0 or related_height <= 0:
-                        continue
-                    # 合并后的 HTML 只保留一个 bbox，不能把这个纵向范围
-                    # 直接套到另一页。相关页使用整页字符作为保守回退，
-                    # 后续仍要求文本完整、视觉行连续、横向位置一致且匹配唯一。
-                    related_bbox = [
-                        0.0,
-                        0.0,
-                        related_width,
-                        related_height,
-                    ]
-                    related_characters = _extract_pdf_characters(
-                        related_page.get_textpage(),
-                        related_bbox,
-                        related_height,
+                    scoped_cache[key] = _restore_table_cells(
+                        table_html, [], runs_by_cell=cell_runs,
                     )
-                    related_runs = _visual_runs_from_characters(
-                        related_characters
-                    )
-                    known_single_line_texts.update(
-                        _single_line_texts(related_runs)
-                    )
-                    fallback_runs_by_page.append(related_runs)
-                logical_cells, row_count, column_count = _logical_cell_layout(
-                    table_html
-                )
-                column_boundaries = _detect_table_column_boundaries(
-                    page,
-                    pdf_bbox,
-                    pdf_height,
-                    column_count,
-                )
-                runs_by_column = None
-                if column_boundaries is not None:
-                    runs_by_column = []
-                    for left, right in zip(
-                        column_boundaries,
-                        column_boundaries[1:],
-                    ):
-                        column_characters = _characters_in_bbox(
-                            table_characters,
-                            [left, pdf_bbox[1], right, pdf_bbox[3]],
-                        )
-                        runs_by_column.append(
-                            _visual_runs_from_characters(column_characters)
-                        )
-
-                # 只有行、列边界都能可靠恢复时，才生成当前单元格专属的
-                # 视觉文本行。边界不足时不猜测单元格位置，后面使用保守的
-                # 唯一匹配回退逻辑。
-                row_boundaries = _detect_table_row_boundaries(
-                    page,
-                    pdf_bbox,
-                    pdf_height,
-                    row_count,
-                )
-                runs_by_cell = None
-                if (
-                    column_boundaries is not None
-                    and row_boundaries is not None
-                ):
-                    runs_by_cell = []
-                    for logical_cell in logical_cells:
-                        cell_bbox = [
-                            column_boundaries[logical_cell.column_start],
-                            row_boundaries[logical_cell.row_start],
-                            column_boundaries[logical_cell.column_end],
-                            row_boundaries[logical_cell.row_end],
-                        ]
-                        cell_characters = _characters_in_bbox(
-                            table_characters,
-                            cell_bbox,
-                        )
-                        runs_by_cell.append(
-                            _visual_runs_from_characters(cell_characters)
-                        )
-                cached = _restore_table_cells(
-                    table_html,
-                    runs_by_line,
-                    logical_cells=logical_cells,
-                    runs_by_column=runs_by_column,
-                    runs_by_cell=runs_by_cell,
-                    fallback_runs_by_page=fallback_runs_by_page,
-                    known_single_line_texts=known_single_line_texts,
-                )
-                cache[cache_key] = cached
-
-            corrected_html, changed_cells, added_breaks = cached
-            span["html"] = corrected_html
-            if changed_cells:
-                stats["tables_changed"] += 1
-                stats["cells_changed"] += changed_cells
-                stats["breaks_added"] += added_breaks
-
+                corrected, cells, breaks = scoped_cache[key]
+                span["html"] = corrected
+                if cells:
+                    stats["tables_changed"] += 1
+                    stats["cells_changed"] += cells
+                    stats["breaks_added"] += breaks
+    finally:
+        pdf_doc.close()
     return stats
+
+
+@dataclass(frozen=True)
+class PhysicalTable:
+    """逐页表格快照；页码、页面尺寸和坐标始终作为同一个定位依据。"""
+
+    page_index: int
+    page_size: tuple[float, float]
+    bbox: tuple[float, ...]
+    html: str
+
+
+def _physical_table_sources(pdf_info: list[dict[str, Any]]) -> list[PhysicalTable]:
+    """优先读取未合并的 preproc_blocks，不从删除区或整页文字推断续表。"""
+
+    sources = {}
+    for page in pdf_info:
+        blocks = page.get("preproc_blocks")
+        if not isinstance(blocks, list) or not blocks:
+            blocks = page.get("para_blocks", [])
+        for span in _iter_html_spans(blocks):
+            if not _valid_bbox(span.get("bbox")):
+                continue
+            source = PhysicalTable(
+                int(page.get("page_idx", 0)), _page_size(page),
+                tuple(float(v) for v in span["bbox"]), span["html"],
+            )
+            sources[(source.page_index, source.bbox, source.html)] = source
+    return list(sources.values())
+
+
+def _row_cell_keys(table_html: str) -> list[tuple]:
+    """用整行文本、逻辑列和跨行范围匹配，不以单个编号或名称认领单元格。"""
+
+    layout, _, columns = _logical_cell_layout(table_html)
+    keys = []
+    offset = 0
+    for row in TR_RE.finditer(table_html):
+        parts = []
+        for match in CELL_RE.finditer(row.group(1)):
+            cell = layout[offset]
+            offset += 1
+            parts.append((cell.column_start, cell.column_end,
+                          cell.row_end - cell.row_start,
+                          re.sub(r"\s+", "", _plain_text(match.group(2)))))
+        keys.append((columns, tuple(parts)))
+    return keys
+
+
+def _source_cell_runs(
+    source: PhysicalTable, pdf_doc: Any,
+) -> list[list[list[TextRun]]] | None:
+    """仅在当前页网格与逐页 HTML 完全一致时读取物理单元格字符。"""
+
+    if not 0 <= source.page_index < len(pdf_doc):
+        return None
+    page = pdf_doc[source.page_index]
+    width, height = _pdf_page_size(page)
+    if width <= 0 or height <= 0:
+        return None
+    sw, sh = source.page_size
+    bbox = _scale_bbox_to_pdf(list(source.bbox), sw or width, sh or height, width, height)
+    layout, rows, columns = _logical_cell_layout(source.html)
+    xs = _detect_table_column_boundaries(page, bbox, height, columns)
+    ys = _detect_table_row_boundaries(page, bbox, height, rows)
+    if xs is None or ys is None:
+        return None
+    text_page = page.get_textpage()
+    try:
+        characters = _extract_pdf_characters(text_page, bbox, height)
+    finally:
+        text_page.close()
+    return [
+        _visual_runs_from_characters(_characters_in_bbox(
+            characters, [xs[c.column_start], ys[c.row_start],
+                         xs[c.column_end], ys[c.row_end]],
+        )) for c in layout
+    ]
+
+
+def _map_physical_cell_runs(
+    table_html: str, page_info: dict[str, Any], bbox: list[float],
+    sources: list[PhysicalTable], pdf_doc: Any, cache: dict,
+) -> list[list[list[TextRun]]]:
+    """将合并表完整行唯一对应到逐页表；缺失或歧义证据不修改。"""
+
+    target = _row_cell_keys(table_html)
+    counts: dict[tuple, int] = {}
+    positions: dict[tuple, int] = {}
+    for index, key in enumerate(target):
+        counts[key] = counts.get(key, 0) + 1
+        positions[key] = index
+    local = [s for s in sources
+             if s.page_index == int(page_info.get("page_idx", 0))
+             and s.bbox == tuple(float(v) for v in bbox)
+             and _row_cell_keys(s.html) == target]
+    # 精确的同页表优先，不能让别页同名表替代当前表。
+    candidates = local if local else sources
+    evidence: dict[tuple, list[list[list[list[TextRun]]]]] = {}
+    for source in candidates:
+        keys = _row_cell_keys(source.html)
+        if not keys or not target or keys[0] != target[0]:
+            continue
+        if not local:
+            # 连续表至少要有两条完整数据行，并且整段顺序都能对应。
+            data = keys[1:]
+            if len(data) < 2 or any(counts.get(k) != 1 for k in data):
+                continue
+            indexes = [positions[k] for k in data]
+            if any(b != a + 1 for a, b in zip(indexes, indexes[1:])):
+                continue
+        cache_key = (source.page_index, source.page_size, source.bbox, source.html)
+        if cache_key not in cache:
+            cache[cache_key] = _source_cell_runs(source, pdf_doc)
+        runs = cache[cache_key]
+        if runs is None:
+            # 无法定位的重复来源同样构成歧义，不能因此选中另一张同名表。
+            runs = [[] for _ in _logical_cell_layout(source.html)[0]]
+        offset = 0
+        for key in keys:
+            size = len(key[1])
+            evidence.setdefault(key, []).append(runs[offset:offset + size])
+            offset += size
+    mapped = []
+    for key in target:
+        matches = evidence.get(key, [])
+        if counts[key] == 1 and len(matches) == 1:
+            mapped.extend(matches[0])
+        else:
+            mapped.extend([] for _ in key[1])
+    return mapped
 
 
 def _restore_table_cells(
@@ -288,48 +283,16 @@ def _restore_table_cells(
             runs_by_cell is not None
             and current_index < len(runs_by_cell)
         )
-        candidate_runs = (
-            runs_by_cell[current_index]
-            if using_cell_scope
-            else runs_by_line
-        )
-        if (
-            runs_by_cell is None
-            and runs_by_column is not None
-            and logical_cells is not None
-            and current_index < len(logical_cells)
-        ):
-            logical_cell = logical_cells[current_index]
-            if isinstance(logical_cell, LogicalCell):
-                column_start = logical_cell.column_start
-                column_end = logical_cell.column_end
-            else:
-                column_start, column_end = logical_cell
-            if (
-                column_end == column_start + 1
-                and column_start < len(runs_by_column)
-            ):
-                candidate_runs = runs_by_column[column_start]
+        # 整页、整列的唯一文字匹配不能证明属于当前单元格。
+        # 保留旧参数兼容调用方，但只有明确的物理单元格证据才允许改写。
+        if not using_cell_scope:
+            return match.group(0)
+        candidate_runs = runs_by_cell[current_index]
 
         parts = _match_visual_lines(
             plain,
             candidate_runs,
-            # 单元格物理边界可靠时，只相信当前单元格；只有退回整列或
-            # 整表搜索时，才用续表页的完整单行证据阻止误拆。
-            known_single_line_texts=(
-                None
-                if using_cell_scope
-                else known_single_line_texts
-            ),
         )
-        if len(parts) < 2 and fallback_runs_by_page:
-            # 当前页的表格 bbox 无法覆盖合并 HTML 中其他续表页的行。
-            # 逐页寻找唯一匹配，不允许跨页面连接视觉行。
-            parts = _match_visual_lines_across_pages(
-                plain,
-                fallback_runs_by_page,
-                known_single_line_texts=known_single_line_texts,
-            )
         if len(parts) < 2:
             return match.group(0)
 
@@ -482,6 +445,15 @@ def _line_run_variants(runs: list[TextRun]) -> list[TextRun]:
     for start in range(len(runs)):
         for end in range(start + 2, min(len(runs), start + 3) + 1):
             group = runs[start:end]
+            # 不得把横跨多个列的文字拼成一个宽片段以通过同列判断。
+            if any(
+                b.x0 - a.x1 > max(2.5, min(
+                    (a.x1 - a.x0) / max(1, len(a.text)),
+                    (b.x1 - b.x0) / max(1, len(b.text)),
+                ) * 1.5)
+                for a, b in zip(group, group[1:])
+            ):
+                continue
             variants.append(TextRun(
                 text=" ".join(run.text for run in group),
                 x0=min(run.x0 for run in group),
@@ -507,6 +479,13 @@ def _single_line_texts(
 
 
 def _same_cell_column(previous: TextRun, current: TextRun) -> bool:
+    # 当前单元格内仍需排除退化字符框和不合理的视觉行间距。
+    if min(previous.x1 - previous.x0, current.x1 - current.x0,
+           previous.y1 - previous.y0, current.y1 - current.y0) <= 0:
+        return False
+    height = max(previous.y1 - previous.y0, current.y1 - current.y0)
+    if current.y0 - previous.y1 > height * 2.5:
+        return False
     overlap = max(0.0, min(previous.x1, current.x1) - max(previous.x0, current.x0))
     narrower = max(1.0, min(previous.x1 - previous.x0, current.x1 - current.x0))
     previous_center = (previous.x0 + previous.x1) / 2.0
@@ -769,138 +748,6 @@ def _page_size(page_info: dict[str, Any]) -> tuple[float, float]:
     if isinstance(page_size, (list, tuple)) and len(page_size) >= 2:
         return float(page_size[0]), float(page_size[1])
     return 0.0, 0.0
-
-
-def _resolve_pdf_page_index(
-    pdf_doc: Any,
-    declared_page_index: int,
-    table_html: str,
-    page_text_cache: dict[int, str],
-) -> int:
-    """用表格文本锚点在相邻页面中校正 middle_json 页码。
-
-    只比较解析文本是否出现在候选 PDF 页，不读取表格字段语义。若没有
-    足够证据证明其他页面更匹配，则保留 middle_json 原页码。
-    """
-
-    anchors = _table_text_anchors(table_html)
-    if not anchors:
-        return declared_page_index
-
-    candidate_indexes = range(
-        max(0, declared_page_index - 2),
-        min(len(pdf_doc), declared_page_index + 3),
-    )
-    scores: dict[int, int] = {}
-    for candidate_index in candidate_indexes:
-        normalized_page = page_text_cache.get(candidate_index)
-        if normalized_page is None:
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", UserWarning)
-                    page_text = (
-                        pdf_doc[candidate_index]
-                        .get_textpage()
-                        .get_text_range()
-                    )
-            except Exception:
-                page_text = ""
-            normalized_page = _normalize(page_text)
-            page_text_cache[candidate_index] = normalized_page
-        scores[candidate_index] = sum(
-            min(len(anchor), 24)
-            for anchor in anchors
-            if anchor in normalized_page
-        )
-
-    declared_score = scores.get(declared_page_index, 0)
-    best_index = max(scores, key=scores.get)
-    best_score = scores[best_index]
-    if best_score >= 24 and best_score > declared_score:
-        return best_index
-    return declared_page_index
-
-
-def _related_pdf_page_indexes(
-    pdf_doc: Any,
-    declared_page_index: int,
-    table_html: str,
-    page_text_cache: dict[int, str],
-) -> list[int]:
-    """找出同一个 HTML 表覆盖的相邻 PDF 续表页。
-
-    这里只把包含足够长表格文本锚点的相邻页面视为相关页。普通相邻页面
-    不参与保护，避免无关页面中的偶然同名文本干扰当前表格。
-    """
-
-    anchors = _table_text_anchors(table_html)
-    if not anchors:
-        return [declared_page_index]
-
-    related = []
-    for candidate_index in range(
-        max(0, declared_page_index - 2),
-        min(len(pdf_doc), declared_page_index + 3),
-    ):
-        normalized_page = page_text_cache.get(candidate_index)
-        if normalized_page is None:
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", UserWarning)
-                    page_text = (
-                        pdf_doc[candidate_index]
-                        .get_textpage()
-                        .get_text_range()
-                    )
-            except Exception:
-                page_text = ""
-            normalized_page = _normalize(page_text)
-            page_text_cache[candidate_index] = normalized_page
-
-        score = sum(
-            min(len(anchor), 24)
-            for anchor in anchors
-            if anchor in normalized_page
-        )
-        if score >= 24:
-            related.append(candidate_index)
-
-    if declared_page_index not in related:
-        related.append(declared_page_index)
-    return sorted(set(related))
-
-
-def _table_text_anchors(table_html: str) -> list[str]:
-    """从表格原文提取用于页码校正的非业务文本片段。"""
-
-    plain = _plain_text(table_html)
-    candidates = re.findall(
-        r"[A-Za-z0-9][A-Za-z0-9_:\[\].+\-/]{4,}",
-        plain,
-    )
-    generic = {
-        "table",
-        "signal",
-        "name",
-        "type",
-        "description",
-        "number",
-    }
-    anchors = []
-    seen = set()
-    for candidate in sorted(candidates, key=len, reverse=True):
-        normalized = _normalize(candidate)
-        if (
-            len(normalized) < 5
-            or normalized in generic
-            or normalized in seen
-        ):
-            continue
-        seen.add(normalized)
-        anchors.append(normalized)
-        if len(anchors) >= 40:
-            break
-    return anchors
 
 
 def _logical_cell_columns(

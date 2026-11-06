@@ -44,6 +44,29 @@ pdfs/
 
 # env files
 .env
+
+# 只跟踪项目根目录文件及指定源码目录。
+/*/
+!/post_table/
+!/extract/
+!/modify/
+!/MinerU/
+!/mineru_image_export/
+/.env*
+
+# 这些 data 目录是 MinerU 的 Python 源码，不是运行数据。
+!/MinerU/mineru/data/
+!/MinerU/mineru/data/**/
+!/MinerU/mineru/data/**/*.py
+!/MinerU/mineru/model/utils/pytorchocr/data/
+!/MinerU/mineru/model/utils/pytorchocr/data/**/
+!/MinerU/mineru/model/utils/pytorchocr/data/**/*.py
+
+# 保留 MinerU 自带的演示和单元测试 PDF，不跟踪用户输入 PDF。
+!/MinerU/demo/pdfs/
+!/MinerU/demo/pdfs/*.pdf
+!/MinerU/tests/unittest/pdfs/
+!/MinerU/tests/unittest/pdfs/*.pdf
 *.ckpt
 *.safetensors
 *.onnx

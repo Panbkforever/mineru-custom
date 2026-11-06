@@ -1,0 +1,1 @@
+"""Isolated Elan manufacturer rules."""

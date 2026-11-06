@@ -46,6 +46,11 @@ def test_each_cell_restores_its_own_visual_lines_independently():
     corrected, changed_cells, added_breaks = _restore_table_cells(
         html,
         runs_by_line,
+        runs_by_cell=[
+            [[runs_by_line[i][0]] for i in range(3)],
+            [[runs_by_line[0][1]]],
+            [[runs_by_line[0][2]], [runs_by_line[1][1]]],
+        ],
     )
 
     assert "<td>A1<br>A2<br>A3</td>" in corrected
@@ -65,6 +70,7 @@ def test_short_cell_is_not_excluded_by_arbitrary_length_limit():
     corrected, changed_cells, added_breaks = _restore_table_cells(
         html,
         runs_by_line,
+        runs_by_cell=[runs_by_line],
     )
 
     assert corrected == "<table><tr><td>A1<br>A2</td></tr></table>"
@@ -113,7 +119,7 @@ def test_logical_columns_preserve_source_colspan_structure():
     assert column_count == 3
 
 
-def test_column_runs_prevent_adjacent_cells_from_becoming_one_text_run():
+def test_physical_cells_prevent_adjacent_cells_from_becoming_one_text_run():
     html = "<table><tr><td>A1A2</td><td>N1N2</td></tr></table>"
     whole_table_runs = [
         [_run("A1 N1", 0, 80, 0)],
@@ -135,6 +141,7 @@ def test_column_runs_prevent_adjacent_cells_from_becoming_one_text_run():
         whole_table_runs,
         logical_cells=[(0, 1), (1, 2)],
         runs_by_column=runs_by_column,
+        runs_by_cell=runs_by_column,
     )
 
     assert corrected == (
@@ -180,7 +187,7 @@ def test_related_continuation_page_single_line_prevents_wrong_split():
     assert added_breaks == 0
 
 
-def test_related_page_can_restore_breaks_missing_from_merged_html_table():
+def test_related_page_requires_mapped_physical_cells_to_restore_breaks():
     html = (
         "<table><tr>"
         "<td>DMD_LS0_CLK_PDMD_LS0_CLK_N</td>"
@@ -206,6 +213,15 @@ def test_related_page_can_restore_breaks_missing_from_merged_html_table():
         html,
         current_page_runs,
         fallback_runs_by_page=[continuation_page_runs],
+    )
+
+    assert (corrected, changed_cells, added_breaks) == (html, 0, 0)
+    corrected, changed_cells, added_breaks = _restore_table_cells(
+        html, current_page_runs,
+        runs_by_cell=[
+            [[row[index]] for row in continuation_page_runs]
+            for index in range(3)
+        ],
     )
 
     assert "<td>DMD_LS0_CLK_P<br>DMD_LS0_CLK_N</td>" in corrected

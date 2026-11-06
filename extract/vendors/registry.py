@@ -5,11 +5,21 @@ from __future__ import annotations
 import os
 
 from extract.vendors.base import VendorProfile
+from extract.vendors.nexperia.profile import PROFILE as NEXPERIA_PROFILE
+from extract.vendors.infineon.profile import PROFILE as INFINEON_PROFILE
+from extract.vendors.giga.profile import PROFILE as GIGA_PROFILE
+from extract.vendors.elan.profile import PROFILE as ELAN_PROFILE
+from extract.vendors.abov.profile import PROFILE as ABOV_PROFILE
 from extract.vendors.st.profile import PROFILE as ST_PROFILE
 from extract.vendors.ti.profile import PROFILE as TI_PROFILE
 
 
 _PROFILES: dict[str, VendorProfile] = {
+    NEXPERIA_PROFILE.canonical_name: NEXPERIA_PROFILE,
+    INFINEON_PROFILE.canonical_name: INFINEON_PROFILE,
+    GIGA_PROFILE.canonical_name: GIGA_PROFILE,
+    ELAN_PROFILE.canonical_name: ELAN_PROFILE,
+    ABOV_PROFILE.canonical_name: ABOV_PROFILE,
     TI_PROFILE.canonical_name: TI_PROFILE,
     ST_PROFILE.canonical_name: ST_PROFILE,
 }
@@ -22,6 +32,10 @@ def normalize_vendor_name(value: str | None) -> str:
     if not normalized:
         return "TI"
     aliases = {
+        "GIGADEVICE": "GIGA",
+        "GIGA DEVICE": "GIGA",
+        "GIGA_DEVICE": "GIGA",
+        "GIGA-DEVICE": "GIGA",
         "TEXAS_INSTRUMENTS": "TI",
         "TEXAS-INSTRUMENTS": "TI",
         "TEXAS INSTRUMENTS": "TI",

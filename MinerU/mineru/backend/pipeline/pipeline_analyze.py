@@ -117,6 +117,7 @@ def _finalize_processing_window_context(context, on_doc_ready):
         context['middle_json']['pdf_info'],
         lang=context['lang'],
         ocr_enable=context['ocr_enable'],
+        pdf_doc=context['pdf_doc'],
     )
     logger.debug(
         f"Pipeline doc ready: doc{context['doc_index']} pages={context['page_count']}"

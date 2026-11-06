@@ -262,12 +262,12 @@ def _post_block_process(pdf_info_list):
                     block["type"] = BlockType.TEXT
 
 
-def finalize_middle_json(pdf_info_list, lang=None, ocr_enable=False):
+def finalize_middle_json(pdf_info_list, lang=None, ocr_enable=False, pdf_doc=None):
     """Apply document-level post processing once all page_info entries are ready."""
     _apply_post_ocr(pdf_info_list, lang=lang)
     _optimize_formula_number_blocks(pdf_info_list)
     para_split(pdf_info_list)
-    cross_page_table_merge(pdf_info_list)
+    cross_page_table_merge(pdf_info_list, pdf_doc=pdf_doc)
 
     llm_aided_config = get_llm_aided_config()
     if llm_aided_config is not None:
@@ -300,7 +300,7 @@ def result_to_middle_json(model_list, images_list, pdf_doc, image_writer, lang=N
             progress_bar=progress_bar,
         )
 
-    finalize_middle_json(middle_json["pdf_info"], lang=lang, ocr_enable=ocr_enable)
+    finalize_middle_json(middle_json["pdf_info"], lang=lang, ocr_enable=ocr_enable, pdf_doc=pdf_doc)
     close_pdfium_document(pdf_doc)
     return middle_json
 

@@ -235,7 +235,7 @@ def append_page_model_list_to_middle_json(
     )
 
 
-def finalize_middle_json(pdf_info_list, hybrid_pipeline_model, _ocr_enable, _vlm_ocr_enable):
+def finalize_middle_json(pdf_info_list, hybrid_pipeline_model, _ocr_enable, _vlm_ocr_enable, pdf_doc=None):
     if not (_vlm_ocr_enable or _ocr_enable):
         _apply_post_ocr(pdf_info_list, hybrid_pipeline_model)
 
@@ -248,7 +248,7 @@ def finalize_middle_json(pdf_info_list, hybrid_pipeline_model, _ocr_enable, _vlm
 
     table_enable = get_table_enable(os.getenv('MINERU_VLM_TABLE_ENABLE', 'True').lower() == 'true')
     if table_enable:
-        cross_page_table_merge(pdf_info_list)
+        cross_page_table_merge(pdf_info_list, pdf_doc=pdf_doc)
 
     if title_aided_enable:
         llm_aided_title_start_time = time.time()
@@ -339,6 +339,7 @@ def result_to_middle_json(
         hybrid_pipeline_model,
         _ocr_enable,
         _vlm_ocr_enable,
+        pdf_doc=pdf_doc,
     )
     close_pdfium_document(pdf_doc)
     return middle_json

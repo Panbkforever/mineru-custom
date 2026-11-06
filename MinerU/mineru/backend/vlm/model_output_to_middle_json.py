@@ -129,13 +129,13 @@ def append_page_blocks_to_middle_json(
             progress_bar.update(1)
 
 
-def finalize_middle_json(pdf_info_list):
+def finalize_middle_json(pdf_info_list, pdf_doc=None):
     build_para_blocks_from_preproc(pdf_info_list)
     merge_para_text_blocks(pdf_info_list, allow_cross_page=False)
 
     table_enable = get_table_enable(os.getenv('MINERU_VLM_TABLE_ENABLE', 'True').lower() == 'true')
     if table_enable:
-        cross_page_table_merge(pdf_info_list)
+        cross_page_table_merge(pdf_info_list, pdf_doc=pdf_doc)
 
     if heading_level_import_success:
         llm_aided_title_start_time = time.time()
@@ -157,6 +157,6 @@ def result_to_middle_json(model_output_blocks_list, images_list, pdf_doc, image_
             progress_bar=progress_bar,
         )
 
-    finalize_middle_json(middle_json["pdf_info"])
+    finalize_middle_json(middle_json["pdf_info"], pdf_doc=pdf_doc)
     close_pdfium_document(pdf_doc)
     return middle_json
