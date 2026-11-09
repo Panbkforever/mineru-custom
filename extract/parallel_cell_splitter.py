@@ -38,6 +38,10 @@ _EMBEDDED_NUMERIC_RANGE_RE = re.compile(
     r"^(?P<prefix>.*?)\[\s*(?P<start>\d+)\s*:\s*(?P<end>\d+)\s*\](?P<suffix>.*)$"
 )
 _NUMERIC_RANGE_TOKEN_RE = re.compile(r"\[\s*\d+\s*:\s*\d+\s*\]")
+_TILDE_NUMERIC_RANGE_RE = re.compile(
+    r"^(?P<prefix>.*?)(?P<start>\d+)\s*[~～]\s*(?P<end>\d+)(?P<suffix>.*)$"
+)
+_TILDE_RANGE_TOKEN_RE = re.compile(r"\d+\s*[~～]\s*\d+")
 
 
 # 主提取器已经集中实现 pin_no 的列表和范围规则。通过回调复用该函数，
@@ -75,11 +79,11 @@ def split_explicit_cell_lines(value: str) -> list[str]:
 
 
 def expand_embedded_pin_name_range(value: str) -> list[str]:
-    """展开 pin_name 中唯一的数字方括号范围，未命中时返回原值。
+    """展开 pin_name 中唯一的数字范围，未命中时返回原值。
 
     范围可以位于名称中间，并允许升序或降序。例如
-    ``LED[4:0]_3`` 展开为 ``LED4_3`` 至 ``LED0_3``。函数只处理一个
-    明确的 ``[数字:数字]``；其他括号表达式保持原样。
+    ``LED[4:0]_3`` 展开为 ``LED4_3`` 至 ``LED0_3``，
+    ``OVCUR1~4#`` 展开为 ``OVCUR1#`` 至 ``OVCUR4#``。
     """
 
     text = str(value or "").strip()
@@ -87,10 +91,16 @@ def expand_embedded_pin_name_range(value: str) -> list[str]:
         return []
 
     # 同一名称出现多个范围时对应关系不唯一，禁止只展开其中一个。
-    if len(_NUMERIC_RANGE_TOKEN_RE.findall(text)) != 1:
+    bracket_count = len(_NUMERIC_RANGE_TOKEN_RE.findall(text))
+    tilde_count = len(_TILDE_RANGE_TOKEN_RE.findall(text))
+    if bracket_count + tilde_count != 1:
         return [text]
 
-    match = _EMBEDDED_NUMERIC_RANGE_RE.fullmatch(text)
+    match = (
+        _EMBEDDED_NUMERIC_RANGE_RE.fullmatch(text)
+        if bracket_count
+        else _TILDE_NUMERIC_RANGE_RE.fullmatch(text)
+    )
     if not match:
         return [text]
 

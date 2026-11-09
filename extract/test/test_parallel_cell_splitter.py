@@ -85,3 +85,33 @@ def test_existing_one_to_one_br_pairing_is_unchanged() -> None:
     )
 
     assert result == ["MDINT_0", "MDINT_1"]
+
+
+def test_tilde_name_range_pairs_with_equal_pin_count() -> None:
+    """半角及全角波浪线范围按编号位置展开，保留名称后缀。"""
+    for name in ("OVCUR1~4#", "OVCUR1 ～ 4#"):
+        assert split_parallel_pin_names(
+            name, "42,40,30,28", 4, split_pin_numbers=_split_test_pin_numbers
+        ) == ["OVCUR1#", "OVCUR2#", "OVCUR3#", "OVCUR4#"]
+
+
+def test_tilde_range_count_mismatch_is_not_guessed() -> None:
+    """名称范围与编号数量不一致时，不推测缺失的对应关系。"""
+    assert split_parallel_pin_names(
+        "OVCUR1~4#", "21,19", 2, split_pin_numbers=_split_test_pin_numbers
+    ) == []
+
+
+def test_tilde_name_range_descending_and_leading_zeros() -> None:
+    """保留原有升降序、前导零和前后缀语义。"""
+    assert split_parallel_pin_names(
+        "GPIO03~01_A", "1,2,3", 3, split_pin_numbers=_split_test_pin_numbers
+    ) == ["GPIO03_A", "GPIO02_A", "GPIO01_A"]
+
+
+def test_mixed_multiple_ranges_are_not_partially_expanded() -> None:
+    """出现多个名称范围时不部分展开。"""
+    for name in ("BUS1~2_LANE3~4", "BUS[1:2]_LANE3~4"):
+        assert split_parallel_pin_names(
+            name, "1,2,3,4", 4, split_pin_numbers=_split_test_pin_numbers
+        ) == []
