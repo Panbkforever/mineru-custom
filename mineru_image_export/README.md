@@ -87,7 +87,7 @@ python -m unittest discover -s tests -v
 ```bash
 cd /root/autodl-tmp
 source MinerU/.venv/bin/activate
-export IMAGE_API_PORT=5003
+export IMAGE_API_PORT=5004
 export IMAGE_API_WORKERS=1
 python image_export_api.py
 ```
@@ -95,7 +95,7 @@ python image_export_api.py
 在另一个终端上传：
 
 ```bash
-curl --fail-with-body -X POST http://127.0.0.1:5003/api/extract-pdf-images-zip \
+curl --fail-with-body -X POST http://127.0.0.1:5004/api/extract-pdf-images-zip \
   -F "files=@/root/autodl-tmp/pdf_Elan/EM78P134N_10.pdf" \
   -o EM78P134N_10_images.zip
 ```
@@ -124,7 +124,7 @@ ZIP 生成失败不会返回不完整结果；传输结束或断开连接后清�
 | 变量 | 默认值 | 含义 |
 | --- | --- | --- |
 | `IMAGE_API_HOST` | `0.0.0.0` | 监听地址 |
-| `IMAGE_API_PORT` | `5003` | 监听端口 |
+| `IMAGE_API_PORT` | `5004` | 监听端口 |
 | `IMAGE_API_WORKERS` | `1` | 本接口允许的并行解析数 |
 | `IMAGE_API_TIMEOUT` | `3600` | 单次解析超时秒数 |
 | `IMAGE_API_QUEUE_TIMEOUT` | `300` | 排队超时秒数 |

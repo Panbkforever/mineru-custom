@@ -261,4 +261,4 @@ def extract_images():
 
 if __name__ == "__main__":
     app.run(host=os.environ.get("IMAGE_API_HOST", "0.0.0.0"),
-            port=positive_env("IMAGE_API_PORT", 5003), debug=False, threaded=True)
+            port=positive_env("IMAGE_API_PORT", 5004), debug=False, threaded=True)
