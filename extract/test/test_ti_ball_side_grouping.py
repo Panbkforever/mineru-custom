@@ -1,17 +1,14 @@
-"""TI 同一封装的上下层编号应保留来源。"""
+"""TI 上下层编号保持项目原有的外层封装拆分行为。"""
 from unittest.mock import patch
 import extract.pin_package_extractor as extractor
 from extract.vendors.ti.profile import PROFILE
-from extract.vendors.base import VendorProfile
 from extract.multi_package_extractor import MultiPackagePlan, PackageBinding
 from extract.pin_package_extractor import ball_side_suffix_for_local_slot
 from extract.pin_package_extractor import TableCandidate, TableDecision, ColumnDecision
 from extract.package_catalog_resolver import PackageAssignment, PackageCatalogEntry, PackageCatalogResolution
 
 
-def test_only_ti_changes_ball_side_package_policy():
-    assert not PROFILE.split_ball_side_packages
-    assert VendorProfile(name='OTHER', display_name='Other').split_ball_side_packages
+def test_ti_detects_ball_sides():
     plan = MultiPackagePlan(True, 'package_columns', (
         PackageBinding('BOTTOM', 0, 2, None),
         PackageBinding('TOP', 1, 2, None),
@@ -21,8 +18,8 @@ def test_only_ti_changes_ball_side_package_policy():
     assert ball_side_suffix_for_local_slot(plan, 1, headers) == 'top'
 
 
-def test_ti_ball_sides_share_one_package_and_keep_both_groups():
-    """两列属于同一封装时保留各自来源及数据。"""
+def test_ti_ball_sides_keep_separate_packages():
+    """上下层继续输出到两个独立结果。"""
     table = TableCandidate(
         html='<table><tr><td>BALL BOTTOM</td><td>BALL TOP</td><td>PIN NAME</td></tr>'
              '<tr><td>A1</td><td>B1</td><td>VDD</td></tr></table>',
@@ -38,6 +35,7 @@ def test_ti_ball_sides_share_one_package_and_keep_both_groups():
          patch.object(extractor, 'decide_all_tables', return_value={0: TableDecision(True, columns=columns)}), \
          patch.object(extractor, 'resolve_document_package_catalog', return_value=resolution):
         result = extractor.extract_pin_package_info_from_table_candidates([table])
-    assert len(result) == 1 and result[0]['pkg'] == 'FCCSP'
-    groups = {g['group']: [x['pin_no'] for x in g['pin_list']] for g in result[0]['group_list']}
-    assert groups == {'Ball Characteristics (BOTTOM)': ['A1'], 'Ball Characteristics (TOP)': ['B1']}
+    packages = {p['pkg']: p for p in result if p['group_list']}
+    assert set(packages) == {'FCCSP_bottom', 'FCCSP_top'}
+    assert packages['FCCSP_bottom']['group_list'][0]['pin_list'][0]['pin_no'] == 'A1'
+    assert packages['FCCSP_top']['group_list'][0]['pin_list'][0]['pin_no'] == 'B1'

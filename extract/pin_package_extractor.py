@@ -111,8 +111,8 @@
   型号、没有 package_type/drawing/pin_count 的弱目录项不能把 N 个槽位扩成
   更多 pkg；有物理封装信息的独立目录项仍保留，不能因名称相同而合并。
 * 同一张表中同时存在 ``BALL BOTTOM`` 和 ``BALL TOP`` 两个编号列时，它们是
-  同一物理封装的上下两面映射空间。默认拆为 ``pkg_bottom`` 与 ``pkg_top``；
-  厂家配置也可保留同一外层封装，并通过分组名称区分两个面。
+  同一物理封装的上下两面映射空间，最终输出必须拆成 ``pkg_bottom`` 与
+  ``pkg_top`` 两个 symbol，不能继续合并到同一个 pkg。
 * 器件型号只参与槽位关联，不能写入 pkg。pkg 只使用物理封装类型；名称
   不明确时按固定槽位顺序使用 a、b、c……，但槽位数量保持不变。
 * 一个 pkg 只能是一个名称字符串，禁止使用 ``|`` 拼接多个名称；真实名称
@@ -717,16 +717,9 @@ def extract_pin_package_info_from_table_candidates(
                 local_slot = local_package_index_for_bound_row(plan, bound_row)
                 package_assignment = package_assignments[local_slot]
                 row_group_name = group_name
-                if vendor_profile.split_ball_side_packages:
-                    output_assignment = derive_ball_side_package_assignment(
-                        package_assignment, plan, local_slot, item["headers"],
-                    )
-                else:
-                    output_assignment = package_assignment
-                    side = ball_side_suffix_for_local_slot(plan, local_slot, item["headers"])
-                    if side:
-                        # 同一物理封装内按来源面分组，保留原始编号及侧面信息。
-                        row_group_name = f"{group_name} ({side.upper()})"
+                output_assignment = derive_ball_side_package_assignment(
+                    package_assignment, plan, local_slot, item["headers"],
+                )
                 if vendor_profile.binding_group_resolver is not None:
                     binding = plan.bindings[local_slot]
                     row_group_name = vendor_profile.binding_group_resolver(

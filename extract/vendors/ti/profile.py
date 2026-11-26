@@ -19,6 +19,5 @@ PROFILE = VendorProfile(
     table_matcher=match_ti_table,
     source_table_repairer=prepare_ti_tables,
     row_repairer=repair_ti_rows,
-    split_ball_side_packages=False,
     binding_group_resolver=ti_binding_group,
 )
