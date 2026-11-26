@@ -1635,6 +1635,7 @@ def split_pin_numbers(value: str) -> list[str]:
 
     例如 ``A1-A5`` 会展开为 A1、A2、A3、A4、A5；
     ``1-5`` 会展开为 1、2、3、4、5；
+    ``1A-1C`` 会展开为 1A、1B、1C；
     ``L[7:12]`` 会展开为 L7、L8、L9、L10、L11、L12；
     ``A1-C3`` 前后字母前缀不同，不满足范围规则，会保留原值。
     """
@@ -1663,6 +1664,7 @@ def split_pin_numbers(value: str) -> list[str]:
             r"(?<![A-Za-z0-9_])(?:"
             r"\d+\s*-\s*\d+"
             r"|[A-Za-z]+\s*\d+\s*-\s*[A-Za-z]+\s*\d+"
+            r"|\d+\s*[A-Za-z]\s*-\s*\d+\s*[A-Za-z]"
             r"|[A-Za-z]+\s*\[\s*\d+\s*:\s*\d+\s*\]"
             r")(?![A-Za-z0-9_])"
         ),
@@ -1690,9 +1692,28 @@ def split_pin_numbers(value: str) -> list[str]:
             expanded.extend(expand_bracketed_pin_range(original_part))
         elif re.fullmatch(r"\d+\s*-\s*\d+", original_part):
             expanded.extend(expand_numeric_pin_range(original_part))
+        elif re.fullmatch(r"\d+\s*[A-Za-z]\s*-\s*\d+\s*[A-Za-z]", original_part):
+            expanded.extend(expand_number_first_letter_range(original_part))
         else:
             expanded.extend(expand_same_prefix_pin_range(original_part))
     return expanded
+
+
+def expand_number_first_letter_range(value: str) -> list[str]:
+    """展开同一数字位置的单字母范围；无法确认时保留原值。"""
+    match = re.fullmatch(r"(\d+)\s*([A-Za-z])\s*-\s*(\d+)\s*([A-Za-z])", value.strip())
+    if not match:
+        return [value]
+    start_number, start_letter, end_number, end_letter = match.groups()
+    if start_number != end_number or start_letter.islower() != end_letter.islower():
+        return [value]
+    if ord(end_letter) < ord(start_letter):
+        return [value]
+    # BGA 字母坐标可能跳过易混淆字母；跨越这些字母时不能推测。
+    ambiguous = set("IOQSXZ")
+    if any(chr(letter).upper() in ambiguous for letter in range(ord(start_letter) + 1, ord(end_letter))):
+        return [value]
+    return [f"{start_number}{chr(letter)}" for letter in range(ord(start_letter), ord(end_letter) + 1)]
 
 
 def expand_bracketed_pin_range(value: str) -> list[str]:

@@ -30,3 +30,12 @@ def test_existing_prefixed_and_bracketed_ranges_are_unchanged() -> None:
     assert split_pin_numbers("A1-A5") == ["A1", "A2", "A3", "A4", "A5"]
     assert split_pin_numbers("L[7:12]") == ["L7", "L8", "L9", "L10", "L11", "L12"]
     assert split_pin_numbers("A1-C3") == ["A1-C3"]
+
+
+def test_number_first_letter_range_expands_only_same_numeric_axis() -> None:
+    """同一数字轴范围展开，不推测跨轴或倒序范围。"""
+    assert split_pin_numbers("1A-1C, 2A - 2C") == ["1A", "1B", "1C", "2A", "2B", "2C"]
+    assert split_pin_numbers("1A-2C") == ["1A-2C"]
+    assert split_pin_numbers("1C-1A") == ["1C-1A"]
+    assert split_pin_numbers("01A-01C") == ["01A", "01B", "01C"]
+    assert split_pin_numbers("1H-1K") == ["1H-1K"]
