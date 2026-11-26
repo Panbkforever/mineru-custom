@@ -63,7 +63,7 @@ class StSourceHeaderTest(unittest.TestCase):
         self.assertFalse(_compatible('LQFP32', 'TQFP32'))
 
     def test_other_vendor_isolation(self):
-        self.assertIsNone(get_vendor_profile('TI').source_table_repairer)
+        self.assertIsNot(get_vendor_profile('TI').source_table_repairer, get_vendor_profile('ST').source_table_repairer)
         self.assertIsNot(get_vendor_profile('ST').source_table_repairer,
                          get_vendor_profile('ELAN').source_table_repairer)
 

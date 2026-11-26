@@ -41,6 +41,8 @@ class VendorProfile:
     package_scope_resolver: PackageScopeResolver | None = None
     source_table_repairer: SourceTableRepairer | None = None
     record_finalizer: RecordFinalizer | None = None
+    split_ball_side_packages: bool = True
+    binding_group_resolver: Callable[..., str] | None = None
 
     @property
     def canonical_name(self) -> str:

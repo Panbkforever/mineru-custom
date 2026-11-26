@@ -111,8 +111,8 @@
   型号、没有 package_type/drawing/pin_count 的弱目录项不能把 N 个槽位扩成
   更多 pkg；有物理封装信息的独立目录项仍保留，不能因名称相同而合并。
 * 同一张表中同时存在 ``BALL BOTTOM`` 和 ``BALL TOP`` 两个编号列时，它们是
-  同一物理封装的上下两面映射空间，最终输出必须拆成 ``pkg_bottom`` 与
-  ``pkg_top`` 两个 symbol，不能继续合并到同一个 pkg。
+  同一物理封装的上下两面映射空间。默认拆为 ``pkg_bottom`` 与 ``pkg_top``；
+  厂家配置也可保留同一外层封装，并通过分组名称区分两个面。
 * 器件型号只参与槽位关联，不能写入 pkg。pkg 只使用物理封装类型；名称
   不明确时按固定槽位顺序使用 a、b、c……，但槽位数量保持不变。
 * 一个 pkg 只能是一个名称字符串，禁止使用 ``|`` 拼接多个名称；真实名称
@@ -716,12 +716,23 @@ def extract_pin_package_info_from_table_candidates(
                 # 封装目录的唯一绑定。表内标签不能直接绕过目录写入输出。
                 local_slot = local_package_index_for_bound_row(plan, bound_row)
                 package_assignment = package_assignments[local_slot]
-                output_assignment = derive_ball_side_package_assignment(
-                    package_assignment,
-                    plan,
-                    local_slot,
-                    item["headers"],
-                )
+                row_group_name = group_name
+                if vendor_profile.split_ball_side_packages:
+                    output_assignment = derive_ball_side_package_assignment(
+                        package_assignment, plan, local_slot, item["headers"],
+                    )
+                else:
+                    output_assignment = package_assignment
+                    side = ball_side_suffix_for_local_slot(plan, local_slot, item["headers"])
+                    if side:
+                        # 同一物理封装内按来源面分组，保留原始编号及侧面信息。
+                        row_group_name = f"{group_name} ({side.upper()})"
+                if vendor_profile.binding_group_resolver is not None:
+                    binding = plan.bindings[local_slot]
+                    row_group_name = vendor_profile.binding_group_resolver(
+                        row_group_name, binding.package,
+                        safe_header(item["headers"], binding.pin_no_column),
+                    )
                 for record in extract_records_from_bound_package_row(bound_row):
                     # 多封装绑定对象只保存 pin_no/pin_name/type。description
                     # 必须使用 row_index 回到同一原始数据行读取，不能从相邻
@@ -740,7 +751,7 @@ def extract_pin_package_info_from_table_candidates(
                     if include_debug and item["table"].page_idx is not None:
                         record["source_page"] = item["table"].page_idx + 1
                     bucket = get_package_bucket(packages, output_assignment)
-                    group = get_or_create_group(bucket, group_name)
+                    group = get_or_create_group(bucket, row_group_name)
                     add_pin_record_to_group(group, record)
                     extracted_count += 1
 

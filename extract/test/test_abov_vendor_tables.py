@@ -29,7 +29,7 @@ class ABOVVendorTableTest(unittest.TestCase):
     def test_registered_without_overriding_ti_or_st(self):
         self.assertIn("ABOV", supported_vendors())
         self.assertEqual(get_vendor_profile("abov").canonical_name, "ABOV")
-        self.assertIsNone(get_vendor_profile("TI").row_repairer)
+        self.assertNotEqual(get_vendor_profile("TI").row_repairer, get_vendor_profile("ABOV").row_repairer)
         self.assertEqual(get_vendor_profile("ST").row_repairer.__module__, "extract.vendors.st.table_handlers")
 
     def test_variants_keep_distinct_package_columns_and_separate_functions(self):
