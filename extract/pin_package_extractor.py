@@ -524,6 +524,9 @@ def extract_pin_package_info_from_table_candidates(
     for item in prepared:
         decision = decisions[item["table_id"]]
         if decision.should_extract:
+            if vendor_profile.type_column_selector is not None:
+                decision.columns = vendor_profile.type_column_selector(
+                    decision.columns, item["data_rows"])
             decision.columns = reconcile_name_column_decisions(
                 decision.columns,
                 item["headers"],
@@ -726,7 +729,10 @@ def extract_pin_package_info_from_table_candidates(
                         row_group_name, binding.package,
                         safe_header(item["headers"], binding.pin_no_column),
                     )
-                for record in extract_records_from_bound_package_row(bound_row):
+                for record in extract_records_from_bound_package_row(
+                    bound_row, source_row=item["data_rows"][bound_row.row_index],
+                    columns=table_decision.columns,
+                ):
                     # 多封装绑定对象只保存 pin_no/pin_name/type。description
                     # 必须使用 row_index 回到同一原始数据行读取，不能从相邻
                     # 绑定或已经生成的记录继承。
@@ -1438,6 +1444,9 @@ def read_optional_mapped_field(
 
 def keep_primary_type_decision(columns: list[ColumnDecision], rows: list[list[str]]) -> list[ColumnDecision]:
     """多个 type 列时只保留最接近 signal/pin 语义的那一列。"""
+    selector = get_current_vendor_profile().type_column_selector
+    if selector is not None:
+        return selector(columns, rows)
 
     types = [c for c in columns if normalize_field_name(c.field_name) == "type"]
     if len(types) <= 1:
@@ -1536,6 +1545,8 @@ def classify_values(values: list[str]) -> tuple[str, int]:
 
 def extract_records_from_bound_package_row(
     bound_row: BoundPackageRow,
+    source_row: list[str] | None = None,
+    columns: list[ColumnDecision] | None = None,
 ) -> list[dict[str, Any]]:
     """把多封装模块绑定的一行转换为项目统一的 pin 记录。
 
@@ -1559,6 +1570,11 @@ def extract_records_from_bound_package_row(
         }
         if bound_row.pin_type:
             record["type"] = bound_row.pin_type
+        resolver = get_current_vendor_profile().type_value_resolver
+        if resolver is not None and source_row is not None and columns is not None:
+            resolved_type = resolver(source_row, columns)
+            if resolved_type is not None:
+                record["type"] = resolved_type
         records.append(record)
     return records
 
@@ -1590,6 +1606,12 @@ def extract_records_from_row(row: list[str], columns: list[ColumnDecision]) -> l
                 continue
             # 同一个字段有多个列时保留原始信息，不在这里合并 pin 记录。
             fields[field_name] = merge_field_value(fields.get(field_name, ""), value)
+
+    resolver = get_current_vendor_profile().type_value_resolver
+    if resolver is not None:
+        resolved_type = resolver(row, columns)
+        if resolved_type is not None:
+            fields["type"] = resolved_type
 
     records = []
     if package_columns:
@@ -1904,7 +1926,10 @@ def apply_empty_output_default_pkg_fallback(
         extracted_count = 0
         if plan.is_multi_package:
             for bound_row in iter_bound_package_rows(plan, item["data_rows"]):
-                for record in extract_records_from_bound_package_row(bound_row):
+                for record in extract_records_from_bound_package_row(
+                    bound_row, source_row=item["data_rows"][bound_row.row_index],
+                    columns=table_decision.columns,
+                ):
                     description = read_optional_mapped_field(
                         item["data_rows"][bound_row.row_index],
                         table_decision.columns,

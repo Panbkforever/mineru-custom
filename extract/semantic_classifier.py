@@ -255,6 +255,11 @@ def build_schema_prompt_payload(
     sampling: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """构造第一次模型调用请求；表头完整，超长数据区由上游采样。"""
+    from extract.vendors import get_current_vendor_profile
+    # 厂家仅覆盖 type 列选择策略，其余模型任务与返回协议保持一致。
+    type_rule = get_current_vendor_profile().schema_type_rule or (
+        "For multiple type-like columns, select only the type most directly describing the pin/signal, such as SIGNAL TYPE rather than BUFFER TYPE."
+    )
 
     return {
         "task": (
@@ -274,7 +279,7 @@ def build_schema_prompt_payload(
             "When mode=parallel_name_branches, also return one pin_name column for every listed operating-mode branch; these branches are not packages.",
             "Rows may be a deterministic sample from a large table. Use them only to validate column semantics; never assume omitted rows or packages do not exist.",
             "Structural branch labels identify parallel object/package branches, but they are not final public package names.",
-            "For multiple type-like columns, select only the type most directly describing the pin/signal, such as SIGNAL TYPE rather than BUFFER TYPE.",
+            type_rule,
             "Do not select description, conditions, min/typ/max, unit, reset state, power source, notes, ordering, or other auxiliary columns.",
             "Do not return package names, group names, table roles, confidence scores, reasons, or extracted row values.",
         ],

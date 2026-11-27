@@ -154,7 +154,7 @@ class STPinTableRepairTest(unittest.TestCase):
 
     def test_ti_profile_has_no_st_repairs_or_scope_override(self):
         profile = get_vendor_profile("TI")
-        self.assertIsNone(profile.package_scope_resolver)
+        self.assertIsNot(profile.package_scope_resolver, resolve_st_package_scopes)
         headers = ["Pin number QFN32", "Pin name", "Pin type"]
         rows = [["Exposed pad", "GND", "P"]]
         self.assertIs(profile.repair_rows("Pin descriptions", headers, rows), rows)

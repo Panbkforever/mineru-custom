@@ -14,6 +14,8 @@ from extract.special_table_handlers import (
 
 def classify_st_header(normalized_header: str) -> tuple[str, int]:
     """Map ST pad-table headers onto the shared pin fields."""
+    if _normalize_st_header_text(normalized_header) in {"pin type", "type", "i o structure", "i/o structure", "io structure"}:
+        return "type", 5
 
     if _ST_PACKAGE_LABEL_PATTERN.fullmatch(normalized_header):
         return "pin_no", 5
@@ -55,7 +57,7 @@ def match_st_definition_table(title, headers, data_rows):
     mappings = [SpecialColumnMapping(i, headers[i], "pin_no") for i in numbers]
     mappings.append(SpecialColumnMapping(names[0], headers[names[0]], "pin_name"))
     for i, value in enumerate(normalized):
-        if value == "pin type":
+        if value in {"pin type", "type", "i o structure", "i/o structure", "io structure"}:
             mappings.append(SpecialColumnMapping(i, headers[i], "type"))
         elif value == "description":
             mappings.append(SpecialColumnMapping(i, headers[i], "description"))
@@ -858,6 +860,10 @@ def match_st_pad_description_table(
         SpecialColumnMapping(ref_index, headers[ref_index], "pin_no"),
         SpecialColumnMapping(name_index, headers[name_index], "pin_name"),
     ]
+    type_indexes = [i for i, header in enumerate(headers)
+                    if _normalize_st_header_text(header) in {"pin type", "type", "i o structure", "i/o structure", "io structure"}]
+    for type_index in type_indexes[:2]:
+        mappings.append(SpecialColumnMapping(type_index, headers[type_index], "type"))
     if description_index is not None:
         mappings.append(
             SpecialColumnMapping(
@@ -899,8 +905,8 @@ def match_st_pin_assignment_table(
     for index in roles["pin_no"]:
         mappings.append(SpecialColumnMapping(index, headers[index], "pin_no"))
     mappings.append(SpecialColumnMapping(roles["pin_name"][0], headers[roles["pin_name"][0]], "pin_name"))
-    if roles["type"]:
-        mappings.append(SpecialColumnMapping(roles["type"][0], headers[roles["type"][0]], "type"))
+    for type_index in roles["type"][:2]:
+        mappings.append(SpecialColumnMapping(type_index, headers[type_index], "type"))
 
     if not any(
         any(_has_data_cell(row, index) for index in roles["pin_no"])
@@ -923,7 +929,7 @@ def _st_pin_assignment_roles(headers: list[str]) -> dict[str, list[int]]:
             roles["pin_no"].append(index)
         elif normalized.startswith("pin name") or normalized == "name":
             roles["pin_name"].append(index)
-        elif normalized in {"pin type", "type"}:
+        elif normalized in {"pin type", "type", "i o structure", "i/o structure", "io structure"}:
             roles["type"].append(index)
     return roles
 

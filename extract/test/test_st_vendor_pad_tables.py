@@ -121,10 +121,10 @@ class STVendorPadTableTest(unittest.TestCase):
             for item in result
         }
         self.assertEqual(set(by_pkg), {"LFBGA289", "TFBGA289", "TFBGA320"})
-        self.assertIn({"pin_no": "U2", "pin_name": "PG3", "type": "I/O"}, by_pkg["TFBGA289"])
-        self.assertIn({"pin_no": "N9", "pin_name": "VSS", "type": "S"}, by_pkg["TFBGA289"])
-        self.assertIn({"pin_no": "D9", "pin_name": "PH9", "type": "I/O"}, by_pkg["TFBGA289"])
-        self.assertIn({"pin_no": "C6", "pin_name": "VDD", "type": "S"}, by_pkg["TFBGA289"])
+        self.assertIn({"pin_no": "U2", "pin_name": "PG3", "type": "I/O_FT"}, by_pkg["TFBGA289"])
+        self.assertIn({"pin_no": "N9", "pin_name": "VSS", "type": "S_-"}, by_pkg["TFBGA289"])
+        self.assertIn({"pin_no": "D9", "pin_name": "PH9", "type": "I/O_FT_h"}, by_pkg["TFBGA289"])
+        self.assertIn({"pin_no": "C6", "pin_name": "VDD", "type": "S_-"}, by_pkg["TFBGA289"])
         self.assertNotIn("U", {pin["pin_no"] for pin in by_pkg["TFBGA289"]})
         self.assertNotIn("2", {pin["pin_no"] for pin in by_pkg["TFBGA289"]})
         self.assertIn("-", {pin["pin_no"] for pin in by_pkg["TFBGA289"]})

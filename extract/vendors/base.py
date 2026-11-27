@@ -42,6 +42,9 @@ class VendorProfile:
     source_table_repairer: SourceTableRepairer | None = None
     record_finalizer: RecordFinalizer | None = None
     binding_group_resolver: Callable[..., str] | None = None
+    type_column_selector: Callable[..., Any] | None = None
+    type_value_resolver: Callable[..., str | None] | None = None
+    schema_type_rule: str | None = None
 
     @property
     def canonical_name(self) -> str:
