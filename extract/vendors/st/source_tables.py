@@ -372,6 +372,33 @@ def _repair_simple_header(candidate):
     cells = _cells(rows[0])
     labels = [_key(_text(cell)) for cell in cells]
     replacements = {}
+    if (labels == ["bump", "bumpname", "description"]
+            and str(cells[0].get("colspan", 1)) == "2"
+            and str(cells[1].get("colspan", 1)) == "1"):
+        # Bump 跨类别、名称两列，Bump name 实际列出球坐标；只重写表头。
+        cells[0]["colspan"] = "1"
+        cells[0].clear()
+        cells[0].append("Group")
+        name_cell = soup.new_tag("th")
+        name_cell.string = "Pin name"
+        cells[0].insert_after(name_cell)
+        cells[1].clear()
+        cells[1].append("Pin number")
+        return replace(candidate, html=str(soup))
+    if (len(labels) >= 4 and labels[:3] == ["bump", "bump", "bumpname"]
+            and all(label == "description" for label in labels[3:])):
+        # 导出后的 HTML 也可能已展开 colspan，重复 Bump 对应类别和名称。
+        replacements = {0: "Group", 1: "Pin name", 2: "Pin number"}
+    if "symbol" in labels and labels[-1:] in (["note"], ["description"]):
+        name_index = labels.index("symbol")
+        numbered = [re.fullmatch(r"pin\s+n[°º]\s*(.+)", _text(cell), re.I)
+                    for cell in cells[:name_index]]
+        if (numbered and all(numbered)
+                and all(_package(match.group(1)) or re.match(r"DFN\s*\d", match.group(1), re.I)
+                        for match in numbered)):
+            # n° 是编号字段而非封装名的一部分，保留后面的原始封装标签。
+            replacements = {i: "Pin number " + match.group(1) for i, match in enumerate(numbered)}
+            replacements.update({name_index: "Pin name", len(cells) - 1: "Description"})
     if len(labels) >= 3 and labels[:3] in (["pin", "symbol", "function"], ["pin", "symbol", "functions"]):
         replacements = {0: "Pin number", 1: "Pin name", 2: "Description"}
     elif len(labels) >= 4 and labels[0] == "symbol" and labels[-1] == "description" and all(_package(_text(cell)) for cell in cells[1:-1]):

@@ -17,6 +17,10 @@ def classify_st_header(normalized_header: str) -> tuple[str, int]:
     if _normalize_st_header_text(normalized_header) in {"pin type", "type", "i o structure", "i/o structure", "io structure"}:
         return "type", 5
 
+    # 多层表头合并后的 Pins LQFP64 等仍是物理封装编号列。
+    if (_normalize_st_header_text(normalized_header).startswith("pins ")
+            and _is_st_package_pin_header(normalized_header)):
+        return "pin_no", 5
     if _ST_PACKAGE_LABEL_PATTERN.fullmatch(normalized_header):
         return "pin_no", 5
     if normalized_header in {
@@ -50,7 +54,9 @@ def match_st_definition_table(title, headers, data_rows):
     if not re.search(r"\bpin\s*(?:/\s*ball\s*)?(?:description|definition)", title, re.I):
         return None
     normalized = [_normalize_st_header_text(header) for header in headers]
-    numbers = [i for i, value in enumerate(normalized) if value.startswith("pin number")]
+    numbers = [i for i, value in enumerate(normalized)
+               if (value.startswith("pin number")
+                   or (value.startswith("pins ") and _is_st_package_pin_header(value)))]
     names = [i for i, value in enumerate(normalized) if value.startswith("pin name")]
     if not numbers or len(names) != 1:
         return None
@@ -108,12 +114,12 @@ def repair_st_table_rows(
         return data_rows
 
     roles = _st_pin_assignment_roles(headers)
-    if not roles["pin_no"] or not roles["pin_name"] or not roles["type"]:
+    if not roles["pin_no"] or not roles["pin_name"]:
         return data_rows
 
     pin_indexes = roles["pin_no"]
     pin_name_index = roles["pin_name"][0]
-    type_index = roles["type"][0]
+    type_index = roles["type"][0] if roles["type"] else None
     repair_merged_rows = _is_st_ball_definition_table(title, headers)
     repaired_rows: list[list[str]] = []
     changed = False
@@ -152,7 +158,7 @@ def repair_st_table_rows(
             pin_indexes,
             pin_name_index,
             type_index,
-        ) if repair_merged_rows else None
+        ) if repair_merged_rows and type_index is not None else None
         if split_rows is None:
             repaired_rows.append(normalized_row)
         else:
@@ -430,7 +436,9 @@ def _is_st_pin_definition_context(title: str, headers: list[str]) -> bool:
     pin_header_count = sum(
         1
         for header in normalized_headers
-        if header.startswith("pin number") or header in {"pin", "pin no", "pin no."}
+        if (header.startswith("pin number")
+            or (header.startswith("pins ") and _is_st_package_pin_header(header))
+            or header in {"pin", "pin no", "pin no."})
     )
     has_name_or_type = any(
         header.startswith("pin name") or header == "pin type"
@@ -479,7 +487,7 @@ def _split_combined_st_package_labels(header: str) -> list[str]:
 
 def _remove_st_pin_number_role(value: str) -> str:
     return re.sub(
-        r"\bpin\s*(?:number|no\.?|#)?\b",
+        r"\bpins?\s*(?:number|no\.?|#)?\b",
         " ",
         _normalize_st_header_text(value),
         flags=re.IGNORECASE,
@@ -925,7 +933,8 @@ def _st_pin_assignment_roles(headers: list[str]) -> dict[str, list[int]]:
     roles = {"pin_no": [], "pin_name": [], "type": []}
     for index, header in enumerate(headers):
         normalized = _normalize_st_header_text(header)
-        if _is_st_package_pin_header(normalized) or _is_st_package_label(normalized):
+        if (normalized.startswith("pin number") or _is_st_package_pin_header(normalized)
+                or _is_st_package_label(normalized)):
             roles["pin_no"].append(index)
         elif normalized.startswith("pin name") or normalized == "name":
             roles["pin_name"].append(index)
@@ -936,7 +945,10 @@ def _st_pin_assignment_roles(headers: list[str]) -> dict[str, list[int]]:
 
 def _is_st_package_pin_header(normalized: str) -> bool:
     normalized = _normalize_st_header_text(normalized)
-    if not normalized.startswith("pin "):
+    if not re.match(r"^pins?\s+", normalized):
+        return False
+    # 新增的复数写法必须带明确封装标签，不能把 Pins source 等普通词当编号。
+    if normalized.startswith("pins ") and not _package_label_from_pin_header(normalized):
         return False
     if normalized.startswith("pin name") or normalized == "pin type":
         return False
